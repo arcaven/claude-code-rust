@@ -37,6 +37,13 @@ pub struct AvailableCommand {
     pub input_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableAgent {
+    pub name: String,
+    pub description: String,
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[allow(clippy::struct_field_names)]
 pub struct UsageUpdate {
@@ -48,6 +55,35 @@ pub struct UsageUpdate {
     pub turn_cost_usd: Option<f64>,
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastModeState {
+    Off,
+    Cooldown,
+    On,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitStatus {
+    Allowed,
+    AllowedWarning,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitUpdate {
+    pub status: RateLimitStatus,
+    pub resets_at: Option<f64>,
+    pub utilization: Option<f64>,
+    pub rate_limit_type: Option<String>,
+    pub overage_status: Option<RateLimitStatus>,
+    pub overage_resets_at: Option<f64>,
+    pub overage_disabled_reason: Option<String>,
+    pub is_using_overage: Option<bool>,
+    pub surpassed_threshold: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,18 +162,61 @@ pub struct PlanEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionUpdate {
-    AgentMessageChunk { content: ContentBlock },
-    UserMessageChunk { content: ContentBlock },
-    AgentThoughtChunk { content: ContentBlock },
-    ToolCall { tool_call: ToolCall },
-    ToolCallUpdate { tool_call_update: ToolCallUpdate },
-    Plan { entries: Vec<PlanEntry> },
-    AvailableCommandsUpdate { commands: Vec<AvailableCommand> },
-    CurrentModeUpdate { current_mode_id: String },
-    ConfigOptionUpdate { option_id: String, value: serde_json::Value },
-    UsageUpdate { usage: UsageUpdate },
-    SessionStatusUpdate { status: SessionStatus },
-    CompactionBoundary { trigger: CompactionTrigger, pre_tokens: u64 },
+    AgentMessageChunk {
+        content: ContentBlock,
+    },
+    UserMessageChunk {
+        content: ContentBlock,
+    },
+    AgentThoughtChunk {
+        content: ContentBlock,
+    },
+    ToolCall {
+        tool_call: ToolCall,
+    },
+    ToolCallUpdate {
+        tool_call_update: ToolCallUpdate,
+    },
+    Plan {
+        entries: Vec<PlanEntry>,
+    },
+    AvailableCommandsUpdate {
+        commands: Vec<AvailableCommand>,
+    },
+    AvailableAgentsUpdate {
+        agents: Vec<AvailableAgent>,
+    },
+    CurrentModeUpdate {
+        current_mode_id: String,
+    },
+    ConfigOptionUpdate {
+        option_id: String,
+        value: serde_json::Value,
+    },
+    UsageUpdate {
+        usage: UsageUpdate,
+    },
+    FastModeUpdate {
+        fast_mode_state: FastModeState,
+    },
+    RateLimitUpdate {
+        status: RateLimitStatus,
+        resets_at: Option<f64>,
+        utilization: Option<f64>,
+        rate_limit_type: Option<String>,
+        overage_status: Option<RateLimitStatus>,
+        overage_resets_at: Option<f64>,
+        overage_disabled_reason: Option<String>,
+        is_using_overage: Option<bool>,
+        surpassed_threshold: Option<f64>,
+    },
+    SessionStatusUpdate {
+        status: SessionStatus,
+    },
+    CompactionBoundary {
+        trigger: CompactionTrigger,
+        pre_tokens: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,9 +252,8 @@ pub struct AuthMethod {
 pub struct AgentCapabilities {
     pub prompt_image: bool,
     pub prompt_embedded_context: bool,
-    pub load_session: bool,
-    pub supports_list_sessions: bool,
-    pub supports_resume: bool,
+    pub supports_session_listing: bool,
+    pub supports_resume_session: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,9 +267,13 @@ pub struct InitializeResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionListEntry {
     pub session_id: String,
-    pub cwd: String,
-    pub title: Option<String>,
-    pub updated_at: Option<String>,
+    pub summary: String,
+    pub last_modified_ms: u64,
+    pub file_size_bytes: u64,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub custom_title: Option<String>,
+    pub first_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

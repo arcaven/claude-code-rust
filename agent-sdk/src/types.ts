@@ -23,6 +23,12 @@ export interface AvailableCommand {
   input_hint?: string;
 }
 
+export interface AvailableAgent {
+  name: string;
+  description: string;
+  model?: string;
+}
+
 export interface UsageUpdate {
   input_tokens?: number;
   output_tokens?: number;
@@ -32,6 +38,21 @@ export interface UsageUpdate {
   turn_cost_usd?: number;
   context_window?: number;
   max_output_tokens?: number;
+}
+
+export type FastModeState = "off" | "cooldown" | "on";
+export type RateLimitStatus = "allowed" | "allowed_warning" | "rejected";
+
+export interface RateLimitUpdate {
+  status: RateLimitStatus;
+  resets_at?: number;
+  utilization?: number;
+  rate_limit_type?: string;
+  overage_status?: RateLimitStatus;
+  overage_resets_at?: number;
+  overage_disabled_reason?: string;
+  is_using_overage?: boolean;
+  surpassed_threshold?: number;
 }
 
 export type ContentBlock =
@@ -89,9 +110,12 @@ export type SessionUpdate =
   | { type: "tool_call_update"; tool_call_update: ToolCallUpdate }
   | { type: "plan"; entries: PlanEntry[] }
   | { type: "available_commands_update"; commands: AvailableCommand[] }
+  | { type: "available_agents_update"; agents: AvailableAgent[] }
   | { type: "current_mode_update"; current_mode_id: string }
   | { type: "config_option_update"; option_id: string; value: Json }
   | { type: "usage_update"; usage: UsageUpdate }
+  | { type: "fast_mode_update"; fast_mode_state: FastModeState }
+  | ({ type: "rate_limit_update" } & RateLimitUpdate)
   | { type: "session_status_update"; status: "compacting" | "idle" }
   | { type: "compaction_boundary"; trigger: "manual" | "auto"; pre_tokens: number };
 
@@ -107,9 +131,34 @@ export interface PermissionRequest {
   options: PermissionOption[];
 }
 
+export type ElicitationMode = "form" | "url";
+
+export type ElicitationAction = "accept" | "decline" | "cancel";
+
+export interface ElicitationRequest {
+  request_id: string;
+  server_name: string;
+  message: string;
+  mode: ElicitationMode;
+  url?: string;
+  elicitation_id?: string;
+  requested_schema?: Record<string, Json>;
+}
+
 export type PermissionOutcome =
   | { outcome: "selected"; option_id: string }
   | { outcome: "cancelled" };
+
+export interface SessionListEntry {
+  session_id: string;
+  summary: string;
+  last_modified_ms: number;
+  file_size_bytes: number;
+  cwd?: string;
+  git_branch?: string;
+  custom_title?: string;
+  first_prompt?: string;
+}
 
 export interface BridgeCommandEnvelope {
   request_id?: string;
@@ -132,7 +181,7 @@ export type BridgeCommand =
       metadata?: Record<string, Json>;
     }
   | {
-      command: "load_session";
+      command: "resume_session";
       session_id: string;
       metadata?: Record<string, Json>;
     }
@@ -168,6 +217,13 @@ export type BridgeCommand =
       outcome: PermissionOutcome;
     }
   | {
+      command: "elicitation_response";
+      session_id: string;
+      elicitation_request_id: string;
+      action: ElicitationAction;
+      content?: Record<string, Json>;
+    }
+  | {
       command: "shutdown";
     };
 
@@ -184,9 +240,8 @@ export interface InitializeResult {
   capabilities: {
     prompt_image: boolean;
     prompt_embedded_context: boolean;
-    load_session: boolean;
-    supports_list_sessions: boolean;
-    supports_resume: boolean;
+    supports_session_listing: boolean;
+    supports_resume_session: boolean;
   };
 }
 
@@ -205,6 +260,7 @@ export type BridgeEvent =
   | { event: "connection_failed"; message: string }
   | { event: "session_update"; session_id: string; update: SessionUpdate }
   | { event: "permission_request"; session_id: string; request: PermissionRequest }
+  | { event: "elicitation_request"; session_id: string; request: ElicitationRequest }
   | { event: "turn_complete"; session_id: string }
   | {
       event: "turn_error";
@@ -224,4 +280,4 @@ export type BridgeEvent =
       history_updates?: SessionUpdate[];
     }
   | { event: "initialized"; result: InitializeResult }
-  | { event: "sessions_listed"; sessions: Array<{ session_id: string; cwd: string; title?: string; updated_at?: string }>; next_cursor?: string };
+  | { event: "sessions_listed"; sessions: SessionListEntry[] };

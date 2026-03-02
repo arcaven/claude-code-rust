@@ -27,6 +27,7 @@ use super::focus::{FocusContext, FocusManager, FocusOwner, FocusTarget};
 use super::input::InputState;
 use super::mention;
 use super::slash;
+use super::subagent;
 
 #[derive(Debug)]
 pub struct ModeInfo {
@@ -46,6 +47,7 @@ pub enum HelpView {
     #[default]
     Keys,
     SlashCommands,
+    Subagents,
 }
 
 /// Login hint displayed when authentication is required during connection.
@@ -73,9 +75,13 @@ pub enum TodoStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentSessionInfo {
     pub session_id: String,
-    pub cwd: String,
-    pub title: Option<String>,
-    pub updated_at: Option<String>,
+    pub summary: String,
+    pub last_modified_ms: u64,
+    pub file_size_bytes: u64,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub custom_title: Option<String>,
+    pub first_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -259,12 +265,12 @@ pub struct App {
     /// Session-level default for tool call collapsed state.
     /// Toggled by Ctrl+O - new tool calls inherit this value.
     pub tools_collapsed: bool,
-    /// IDs of Task tool calls currently `InProgress` -- their children get hidden.
+    /// IDs of Task/Agent tool calls currently `InProgress` -- their children get hidden.
     /// Use `insert_active_task()`, `remove_active_task()`.
     pub active_task_ids: HashSet<String>,
     /// Tool scope keyed by tool call ID; used to distinguish main-agent from subagent tools.
     pub tool_call_scopes: HashMap<String, ToolCallScope>,
-    /// IDs of non-Task subagent tool calls currently `InProgress`/`Pending`.
+    /// IDs of non Task/Agent subagent tool calls currently `InProgress`/`Pending`.
     pub active_subagent_tool_ids: HashSet<String>,
     /// Timestamp when subagent entered an idle gap (no active child tool calls).
     pub subagent_idle_since: Option<Instant>,
@@ -291,6 +297,8 @@ pub struct App {
     pub focus: FocusManager,
     /// Commands advertised by the agent via `AvailableCommandsUpdate`.
     pub available_commands: Vec<model::AvailableCommand>,
+    /// Subagents advertised by the agent via `AvailableAgentsUpdate`.
+    pub available_agents: Vec<model::AvailableAgent>,
     /// Recently persisted session IDs discovered at startup.
     pub recent_sessions: Vec<RecentSessionInfo>,
     /// Last known frame area (for mouse selection mapping).
@@ -311,6 +319,8 @@ pub struct App {
     pub mention: Option<mention::MentionState>,
     /// Active slash-command autocomplete state.
     pub slash: Option<slash::SlashState>,
+    /// Active subagent autocomplete state (`&name`).
+    pub subagent: Option<subagent::SubagentState>,
     /// Deferred submit: set `true` when Enter is pressed. If another key event
     /// arrives during the same drain cycle (paste), this is cleared and the Enter
     /// becomes a newline. After the drain, the main loop checks: if still `true`,
@@ -349,6 +359,10 @@ pub struct App {
     pub update_check_hint: Option<String>,
     /// Session-wide usage and cost telemetry from the bridge.
     pub session_usage: SessionUsageState,
+    /// Fast mode state telemetry from the SDK.
+    pub fast_mode_state: model::FastModeState,
+    /// Latest rate-limit telemetry from the SDK.
+    pub last_rate_limit_update: Option<model::RateLimitUpdate>,
     /// True while the SDK reports active compaction.
     pub is_compacting: bool,
 
@@ -442,12 +456,12 @@ impl App {
         self.mark_message_layout_dirty(0);
     }
 
-    /// Track a Task tool call as active (in-progress subagent).
+    /// Track a Task/Agent tool call as active (in-progress subagent).
     pub fn insert_active_task(&mut self, id: String) {
         self.active_task_ids.insert(id);
     }
 
-    /// Remove a Task tool call from the active set (completed/failed).
+    /// Remove a Task/Agent tool call from the active set (completed/failed).
     pub fn remove_active_task(&mut self, id: &str) {
         self.active_task_ids.remove(id);
     }
@@ -567,7 +581,7 @@ impl App {
 
     #[must_use]
     fn is_history_hidden_marker_message(msg: &ChatMessage) -> bool {
-        if !matches!(msg.role, MessageRole::System) {
+        if !matches!(msg.role, MessageRole::System(_)) {
             return false;
         }
         let Some(MessageBlock::Text(text, _, _)) = msg.blocks.first() else {
@@ -673,9 +687,11 @@ impl App {
                     for session in &welcome.recent_sessions {
                         total = total
                             .saturating_add(session.session_id.len())
-                            .saturating_add(session.cwd.len())
-                            .saturating_add(session.title.as_ref().map_or(0, String::len))
-                            .saturating_add(session.updated_at.as_ref().map_or(0, String::len));
+                            .saturating_add(session.summary.len())
+                            .saturating_add(session.cwd.as_ref().map_or(0, String::len))
+                            .saturating_add(session.git_branch.as_ref().map_or(0, String::len))
+                            .saturating_add(session.custom_title.as_ref().map_or(0, String::len))
+                            .saturating_add(session.first_prompt.as_ref().map_or(0, String::len));
                     }
                 }
             }
@@ -786,7 +802,7 @@ impl App {
         self.messages.insert(
             insert_idx,
             ChatMessage {
-                role: MessageRole::System,
+                role: MessageRole::System(None),
                 blocks: vec![MessageBlock::Text(
                     marker_text.clone(),
                     BlockCache::default(),
@@ -1022,6 +1038,7 @@ impl App {
             todo_selected: 0,
             focus: FocusManager::default(),
             available_commands: Vec::new(),
+            available_agents: Vec::new(),
             recent_sessions: Vec::new(),
             cached_frame_area: ratatui::layout::Rect::default(),
             selection: None,
@@ -1032,6 +1049,7 @@ impl App {
             rendered_input_area: ratatui::layout::Rect::default(),
             mention: None,
             slash: None,
+            subagent: None,
             pending_submit: false,
             drain_key_count: 0,
             paste_burst: super::paste_burst::PasteBurstDetector::new(),
@@ -1047,6 +1065,8 @@ impl App {
             cached_footer_line: None,
             update_check_hint: None,
             session_usage: SessionUsageState::default(),
+            fast_mode_state: model::FastModeState::Off,
+            last_rate_limit_update: None,
             is_compacting: false,
             terminal_tool_calls: Vec::new(),
             needs_redraw: true,
@@ -1114,7 +1134,7 @@ impl App {
     fn focus_context(&self) -> FocusContext {
         FocusContext::new(
             self.show_todo_panel && !self.todos.is_empty(),
-            self.mention.is_some() || self.slash.is_some(),
+            self.mention.is_some() || self.slash.is_some() || self.subagent.is_some(),
             !self.pending_permission_ids.is_empty(),
         )
         .with_help(self.is_help_active())
@@ -1693,8 +1713,15 @@ pub enum MessageBlock {
 pub enum MessageRole {
     User,
     Assistant,
-    System,
+    System(Option<SystemSeverity>),
     Welcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemSeverity {
+    Info,
+    Warning,
+    Error,
 }
 
 pub struct WelcomeBlock {

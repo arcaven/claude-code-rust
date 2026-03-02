@@ -5,6 +5,8 @@ import { createRequire } from "node:module";
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import {
+  getSessionMessages,
+  listSessions,
   query,
   type CanUseTool,
   type PermissionMode,
@@ -15,15 +17,18 @@ import {
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type {
+  AvailableAgent,
   AvailableCommand,
   BridgeCommand,
   BridgeEvent,
   BridgeEventEnvelope,
+  FastModeState,
   Json,
   PermissionOutcome,
   PermissionOption,
   PermissionRequest,
   PlanEntry,
+  RateLimitStatus,
   SessionUpdate,
   ToolCall,
   ToolCallUpdate,
@@ -50,9 +55,8 @@ import {
   permissionResultFromOutcome,
 } from "./bridge/permissions.js";
 import {
-  extractSessionHistoryUpdatesFromJsonl,
-  listRecentPersistedSessions,
-  resolvePersistedSessionEntry,
+  mapSdkSessions,
+  mapSessionMessagesToUpdates,
 } from "./bridge/history.js";
 
 export {
@@ -60,7 +64,8 @@ export {
   buildToolResultFields,
   buildUsageUpdateFromResult,
   createToolCall,
-  extractSessionHistoryUpdatesFromJsonl,
+  mapSessionMessagesToUpdates,
+  mapSdkSessions,
   looksLikeAuthRequired,
   normalizeToolKind,
   normalizeToolResultText,
@@ -86,6 +91,7 @@ type SessionState = {
   cwd: string;
   model: string;
   mode: PermissionMode;
+  fastModeState: FastModeState;
   yolo: boolean;
   query: Query;
   input: AsyncQueue<SDKUserMessage>;
@@ -96,6 +102,7 @@ type SessionState = {
   taskToolUseIds: Map<string, string>;
   pendingPermissions: Map<string, PendingPermission>;
   authHintSent: boolean;
+  lastAvailableAgentsSignature?: string;
   lastAssistantError?: string;
   lastTotalCostUsd?: number;
   sessionsToCloseAfterConnect?: SessionState[];
@@ -103,7 +110,8 @@ type SessionState = {
 };
 
 const sessions = new Map<string, SessionState>();
-const EXPECTED_AGENT_SDK_VERSION = "0.2.52";
+const EXPECTED_AGENT_SDK_VERSION = "0.2.63";
+const SESSION_LIST_LIMIT = 50;
 const require = createRequire(import.meta.url);
 const permissionDebugEnabled =
   process.env.CLAUDE_RS_SDK_PERMISSION_DEBUG === "1" || process.env.CLAUDE_RS_SDK_DEBUG === "1";
@@ -236,6 +244,7 @@ function emitConnectEvent(session: SessionState): void {
   const staleSessions = session.sessionsToCloseAfterConnect;
   session.sessionsToCloseAfterConnect = undefined;
   if (!staleSessions || staleSessions.length === 0) {
+    refreshSessionsList();
     return;
   }
   void (async () => {
@@ -248,7 +257,25 @@ function emitConnectEvent(session: SessionState): void {
       }
       await closeSession(stale);
     }
+    refreshSessionsList();
   })();
+}
+
+async function emitSessionsList(requestId?: string): Promise<void> {
+  try {
+    const sdkSessions = await listSessions({ limit: SESSION_LIST_LIMIT });
+    writeEvent({ event: "sessions_listed", sessions: mapSdkSessions(sdkSessions, SESSION_LIST_LIMIT) }, requestId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[sdk warn] listSessions failed: ${message}`);
+    writeEvent({ event: "sessions_listed", sessions: [] }, requestId);
+  }
+}
+
+function refreshSessionsList(): void {
+  void emitSessionsList().catch(() => {
+    // Defensive no-op.
+  });
 }
 
 function textFromPrompt(command: Extract<BridgeCommand, { command: "prompt" }>): string {
@@ -489,7 +516,7 @@ function handleTaskSystemMessage(
     return;
   }
 
-  const toolCall = ensureToolCallVisible(session, toolUseId, "Task", {});
+  const toolCall = ensureToolCallVisible(session, toolUseId, "Agent", {});
   if (toolCall.status === "pending") {
     toolCall.status = "in_progress";
     emitSessionUpdate(session.sessionId, {
@@ -749,11 +776,175 @@ function numberField(record: Record<string, unknown>, ...keys: string[]): number
   return undefined;
 }
 
+export function parseFastModeState(value: unknown): FastModeState | null {
+  if (value === "off" || value === "cooldown" || value === "on") {
+    return value;
+  }
+  return null;
+}
+
+export function parseRateLimitStatus(value: unknown): RateLimitStatus | null {
+  if (value === "allowed" || value === "allowed_warning" || value === "rejected") {
+    return value;
+  }
+  return null;
+}
+
+export function buildRateLimitUpdate(
+  rateLimitInfo: unknown,
+): Extract<SessionUpdate, { type: "rate_limit_update" }> | null {
+  const info = asRecordOrNull(rateLimitInfo);
+  if (!info) {
+    return null;
+  }
+
+  const status = parseRateLimitStatus(info.status);
+  if (!status) {
+    return null;
+  }
+
+  const update: Extract<SessionUpdate, { type: "rate_limit_update" }> = {
+    type: "rate_limit_update",
+    status,
+  };
+
+  const resetsAt = numberField(info, "resetsAt");
+  if (resetsAt !== undefined) {
+    update.resets_at = resetsAt;
+  }
+
+  const utilization = numberField(info, "utilization");
+  if (utilization !== undefined) {
+    update.utilization = utilization;
+  }
+
+  if (typeof info.rateLimitType === "string" && info.rateLimitType.length > 0) {
+    update.rate_limit_type = info.rateLimitType;
+  }
+
+  const overageStatus = parseRateLimitStatus(info.overageStatus);
+  if (overageStatus) {
+    update.overage_status = overageStatus;
+  }
+
+  const overageResetsAt = numberField(info, "overageResetsAt");
+  if (overageResetsAt !== undefined) {
+    update.overage_resets_at = overageResetsAt;
+  }
+
+  if (typeof info.overageDisabledReason === "string" && info.overageDisabledReason.length > 0) {
+    update.overage_disabled_reason = info.overageDisabledReason;
+  }
+
+  if (typeof info.isUsingOverage === "boolean") {
+    update.is_using_overage = info.isUsingOverage;
+  }
+
+  const surpassedThreshold = numberField(info, "surpassedThreshold");
+  if (surpassedThreshold !== undefined) {
+    update.surpassed_threshold = surpassedThreshold;
+  }
+
+  return update;
+}
+
+function availableAgentsSignature(agents: AvailableAgent[]): string {
+  return JSON.stringify(agents);
+}
+
+function normalizeAvailableAgentName(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.trim();
+}
+
+export function mapAvailableAgents(value: unknown): AvailableAgent[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const byName = new Map<string, AvailableAgent>();
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const record = entry as Record<string, unknown>;
+    const name = normalizeAvailableAgentName(record.name);
+    if (!name) {
+      continue;
+    }
+    const description = typeof record.description === "string" ? record.description : "";
+    const model = typeof record.model === "string" && record.model.trim().length > 0 ? record.model : undefined;
+    const existing = byName.get(name);
+    if (!existing) {
+      byName.set(name, { name, description, model });
+      continue;
+    }
+    if (existing.description.trim().length === 0 && description.trim().length > 0) {
+      existing.description = description;
+    }
+    if (!existing.model && model) {
+      existing.model = model;
+    }
+  }
+
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function mapAvailableAgentsFromNames(value: unknown): AvailableAgent[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const byName = new Map<string, AvailableAgent>();
+  for (const entry of value) {
+    const name = normalizeAvailableAgentName(entry);
+    if (!name || byName.has(name)) {
+      continue;
+    }
+    byName.set(name, { name, description: "" });
+  }
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function emitAvailableAgentsIfChanged(session: SessionState, agents: AvailableAgent[]): void {
+  const signature = availableAgentsSignature(agents);
+  if (session.lastAvailableAgentsSignature === signature) {
+    return;
+  }
+  session.lastAvailableAgentsSignature = signature;
+  emitSessionUpdate(session.sessionId, { type: "available_agents_update", agents });
+}
+
+function refreshAvailableAgents(session: SessionState): void {
+  if (typeof session.query.supportedAgents !== "function") {
+    return;
+  }
+  void session.query
+    .supportedAgents()
+    .then((agents) => {
+      emitAvailableAgentsIfChanged(session, mapAvailableAgents(agents));
+    })
+    .catch(() => {
+      // Best-effort only.
+    });
+}
+
+function emitFastModeUpdateIfChanged(session: SessionState, value: unknown): void {
+  const next = parseFastModeState(value);
+  if (!next || next === session.fastModeState) {
+    return;
+  }
+  session.fastModeState = next;
+  emitSessionUpdate(session.sessionId, { type: "fast_mode_update", fast_mode_state: next });
+}
+
 function handleResultMessage(session: SessionState, message: Record<string, unknown>): void {
   const usageUpdate = buildUsageUpdateFromResultForSession(session, message);
   if (usageUpdate) {
     emitSessionUpdate(session.sessionId, usageUpdate);
   }
+  emitFastModeUpdateIfChanged(session, message.fast_mode_state);
 
   const subtype = typeof message.subtype === "string" ? message.subtype : "";
   if (subtype === "success") {
@@ -806,6 +997,7 @@ function handleSdkMessage(session: SessionState, message: SDKMessage): void {
       if (incomingMode) {
         session.mode = incomingMode;
       }
+      emitFastModeUpdateIfChanged(session, msg.fast_mode_state);
 
       if (!session.connected) {
         emitConnectEvent(session);
@@ -822,6 +1014,7 @@ function handleSdkMessage(session: SessionState, message: SDKMessage): void {
             : {}),
         });
         session.resumeUpdates = undefined;
+        refreshSessionsList();
       }
 
       if (Array.isArray(msg.slash_commands)) {
@@ -831,6 +1024,10 @@ function handleSdkMessage(session: SessionState, message: SDKMessage): void {
         if (commands.length > 0) {
           emitSessionUpdate(session.sessionId, { type: "available_commands_update", commands });
         }
+      }
+
+      if (session.lastAvailableAgentsSignature === undefined && Array.isArray(msg.agents)) {
+        emitAvailableAgentsIfChanged(session, mapAvailableAgentsFromNames(msg.agents));
       }
 
       void session.query
@@ -846,6 +1043,7 @@ function handleSdkMessage(session: SessionState, message: SDKMessage): void {
         .catch(() => {
           // Best-effort only; slash commands from init were already emitted.
         });
+      refreshAvailableAgents(session);
       return;
     }
 
@@ -861,6 +1059,7 @@ function handleSdkMessage(session: SessionState, message: SDKMessage): void {
       } else if (msg.status === null) {
         emitSessionUpdate(session.sessionId, { type: "session_status_update", status: "idle" });
       }
+      emitFastModeUpdateIfChanged(session, msg.fast_mode_state);
       return;
     }
 
@@ -880,6 +1079,23 @@ function handleSdkMessage(session: SessionState, message: SDKMessage): void {
       }
       return;
     }
+
+    if (subtype === "local_command_output") {
+      const content = typeof msg.content === "string" ? msg.content : "";
+      if (content.trim().length > 0) {
+        emitSessionUpdate(session.sessionId, {
+          type: "agent_message_chunk",
+          content: { type: "text", text: content },
+        });
+      }
+      return;
+    }
+
+    if (subtype === "elicitation_complete") {
+      // No-op: elicitation flow is auto-canceled in the onElicitation callback.
+      return;
+    }
+
     handleTaskSystemMessage(session, subtype, msg);
     return;
   }
@@ -921,6 +1137,14 @@ function handleSdkMessage(session: SessionState, message: SDKMessage): void {
       for (const toolUseId of toolIds) {
         emitToolSummaryUpdate(session, toolUseId, summary);
       }
+    }
+    return;
+  }
+
+  if (type === "rate_limit_event") {
+    const update = buildRateLimitUpdate(msg.rate_limit_info);
+    if (update) {
+      emitSessionUpdate(session.sessionId, update);
     }
     return;
   }
@@ -1307,6 +1531,23 @@ async function createSession(params: {
         resume: params.resume,
         model: params.model,
         canUseTool,
+        onElicitation: async (request) => {
+          const requestMode = typeof request.mode === "string" ? request.mode : "unknown";
+          const requestServer =
+            typeof request.serverName === "string" && request.serverName.trim().length > 0
+              ? request.serverName
+              : "unknown";
+          const requestMessage =
+            typeof request.message === "string" && request.message.trim().length > 0
+              ? request.message
+              : "<no message>";
+          console.error(
+            `[sdk warn] elicitation unsupported without MCP settings UI; ` +
+              `auto-canceling session_id=${session.sessionId} server=${requestServer} ` +
+              `mode=${requestMode} message=${JSON.stringify(requestMessage)}`,
+          );
+          return { action: "cancel" as const };
+        },
       },
     });
   } catch (error) {
@@ -1323,6 +1564,7 @@ async function createSession(params: {
     cwd: params.cwd,
     model: params.model ?? "default",
     mode: startMode,
+    fastModeState: "off",
     yolo: params.yolo,
     query: queryHandle,
     input,
@@ -1351,6 +1593,7 @@ async function createSession(params: {
       if (!session.connected) {
         emitConnectEvent(session);
       }
+      emitFastModeUpdateIfChanged(session, result.fast_mode_state);
 
       const commands = Array.isArray(result.commands)
         ? result.commands.map((command) => ({
@@ -1362,6 +1605,8 @@ async function createSession(params: {
       if (commands.length > 0) {
         emitSessionUpdate(session.sessionId, { type: "available_commands_update", commands });
       }
+      emitAvailableAgentsIfChanged(session, mapAvailableAgents(result.agents));
+      refreshAvailableAgents(session);
     })
     .catch((error) => {
       if (session.connected) {
@@ -1482,23 +1727,14 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
             capabilities: {
               prompt_image: false,
               prompt_embedded_context: true,
-              load_session: true,
-              supports_list_sessions: true,
-              supports_resume: true,
+              supports_session_listing: true,
+              supports_resume_session: true,
             },
           },
         },
         requestId,
       );
-      writeEvent({
-        event: "sessions_listed",
-        sessions: listRecentPersistedSessions().map((entry) => ({
-          session_id: entry.session_id,
-          cwd: entry.cwd,
-          ...(entry.title ? { title: entry.title } : {}),
-          ...(entry.updated_at ? { updated_at: entry.updated_at } : {}),
-        })),
-      });
+      await emitSessionsList(requestId);
       return;
 
     case "create_session":
@@ -1512,18 +1748,23 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
       });
       return;
 
-    case "load_session": {
-      const persisted = resolvePersistedSessionEntry(command.session_id);
-      if (!persisted) {
-        slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
-        return;
-      }
-      const resumeUpdates = extractSessionHistoryUpdatesFromJsonl(persisted.file_path);
-      const staleSessions = Array.from(sessions.values());
-      const hadActiveSession = staleSessions.length > 0;
+    case "resume_session": {
       try {
+        const sdkSessions = await listSessions();
+        const matched = sdkSessions.find((entry) => entry.sessionId === command.session_id);
+        if (!matched) {
+          slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
+          return;
+        }
+        const historyMessages = await getSessionMessages(
+          command.session_id,
+          matched.cwd ? { dir: matched.cwd } : undefined,
+        );
+        const resumeUpdates = mapSessionMessagesToUpdates(historyMessages);
+        const staleSessions = Array.from(sessions.values());
+        const hadActiveSession = staleSessions.length > 0;
         await createSession({
-          cwd: persisted.cwd,
+          cwd: matched.cwd ?? process.cwd(),
           yolo: false,
           resume: command.session_id,
           ...(resumeUpdates.length > 0 ? { resumeUpdates } : {}),

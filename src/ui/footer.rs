@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::agent::model;
 use crate::app::App;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -44,18 +45,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.cached_footer_line.is_none() {
         let line = if let Some(ref mode) = app.mode {
             let color = mode_color(&mode.current_mode_id);
+            let (fast_mode_text, fast_mode_color) = fast_mode_badge(app.fast_mode_state);
             Line::from(vec![
                 Span::styled("[", Style::default().fg(color)),
                 Span::styled(mode.current_mode_name.clone(), Style::default().fg(color)),
                 Span::styled("]", Style::default().fg(color)),
                 Span::raw("  "),
+                Span::styled("[", Style::default().fg(fast_mode_color)),
+                Span::styled(fast_mode_text, Style::default().fg(fast_mode_color)),
+                Span::styled("]", Style::default().fg(fast_mode_color)),
+                Span::raw("  "),
                 Span::styled("?", Style::default().fg(Color::White)),
-                Span::styled(" : Shortcuts + Commands", Style::default().fg(theme::DIM)),
+                Span::styled(" : Help", Style::default().fg(theme::DIM)),
             ])
         } else {
             Line::from(vec![
                 Span::styled("?", Style::default().fg(Color::White)),
-                Span::styled(" : Shortcuts + Commands", Style::default().fg(theme::DIM)),
+                Span::styled(" : Help", Style::default().fg(theme::DIM)),
             ])
         };
         app.cached_footer_line = Some(line);
@@ -211,7 +217,7 @@ fn split_footer_columns_hint(area: Rect, left_min_width: u16) -> (Rect, Rect) {
 /// Note: `Length` (not `Min`) is intentional for left — `Min` allows left to grow beyond
 /// its minimum when there is excess space, which would steal that space from the hint.
 ///
-/// Example at 80 cols (78 available after 2 gaps), `left_min=24` ("? : Shortcuts + Commands"),
+/// Example at 80 cols (78 available after 2 gaps), `left_min=24`,
 /// `context_width=13` ("Context: 37%"):
 ///   left  = 24  (pinned, Length satisfied)
 ///   right = 13  (exact, Length satisfied)
@@ -293,6 +299,14 @@ fn mode_color(mode_id: &str) -> Color {
     }
 }
 
+fn fast_mode_badge(state: model::FastModeState) -> (&'static str, Color) {
+    match state {
+        model::FastModeState::Off => ("FAST:OFF", theme::DIM),
+        model::FastModeState::Cooldown => ("FAST:CD", Color::Yellow),
+        model::FastModeState::On => ("FAST:ON", theme::RUST_ORANGE),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,7 +352,7 @@ mod tests {
 
     #[test]
     fn split_footer_columns_hint_left_gets_its_minimum() {
-        // Left (mode/help, 24 chars "? : Shortcuts + Commands") must never shrink
+        // Left (mode/help) must never shrink even with wide update hints.
         // even when the update hint is wide.
         let area = Rect::new(0, 0, 80, 1);
         let left_min = 24u16;
@@ -391,7 +405,7 @@ mod tests {
     fn split_footer_three_columns_anchors_left_and_right() {
         // Columns 1 and 3 are anchored; mid (update hint) gets whatever is left.
         let area = Rect::new(0, 0, 80, 1);
-        let left_min = 24u16; // "? : Shortcuts + Commands"
+        let left_min = 24u16;
         let ctx_width = 13u16; // "Context: 37%"
         let (left, mid, right) = split_footer_three_columns(area, left_min, ctx_width);
 
@@ -528,5 +542,11 @@ mod tests {
 
         let text = footer_telemetry_text(&app).expect("footer telemetry");
         assert_eq!(text, "Context: -");
+    }
+
+    #[test]
+    fn fast_mode_badge_maps_cooldown_to_cd() {
+        let (label, _) = fast_mode_badge(model::FastModeState::Cooldown);
+        assert_eq!(label, "FAST:CD");
     }
 }

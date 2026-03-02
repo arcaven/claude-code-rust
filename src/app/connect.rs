@@ -120,6 +120,7 @@ pub fn create_app(cli: &Cli) -> App {
         todo_selected: 0,
         focus: FocusManager::default(),
         available_commands: Vec::new(),
+        available_agents: Vec::new(),
         recent_sessions: Vec::new(),
         cached_frame_area: ratatui::layout::Rect::new(0, 0, 0, 0),
         selection: Option::<SelectionState>::None,
@@ -130,6 +131,7 @@ pub fn create_app(cli: &Cli) -> App {
         rendered_input_area: ratatui::layout::Rect::new(0, 0, 0, 0),
         mention: None,
         slash: None,
+        subagent: None,
         pending_submit: false,
         drain_key_count: 0,
         paste_burst: crate::app::paste_burst::PasteBurstDetector::new(),
@@ -145,6 +147,8 @@ pub fn create_app(cli: &Cli) -> App {
         cached_footer_line: None,
         update_check_hint: None,
         session_usage: super::SessionUsageState::default(),
+        fast_mode_state: model::FastModeState::Off,
+        last_rate_limit_update: None,
         is_compacting: false,
         terminal_tool_calls: Vec::new(),
         needs_redraw: true,
@@ -305,7 +309,7 @@ fn build_session_command(params: &StartConnectionParams) -> CommandEnvelope {
     if let Some(resume) = &params.resume_id {
         CommandEnvelope {
             request_id: None,
-            command: BridgeCommand::LoadSession {
+            command: BridgeCommand::ResumeSession {
                 session_id: resume.clone(),
                 metadata: std::collections::BTreeMap::new(),
             },
@@ -327,7 +331,7 @@ fn build_session_command(params: &StartConnectionParams) -> CommandEnvelope {
 async fn send_session_command(params: &StartConnectionParams, bridge: &mut BridgeClient) -> bool {
     let command = build_session_command(params);
     if let Err(err) = bridge.send(command).await {
-        tracing::error!("failed to send create/load session command to bridge: {err}");
+        tracing::error!("failed to send create/resume session command to bridge: {err}");
         emit_connection_failed(
             &params.event_tx,
             format!("Failed to create bridge session: {err}"),
@@ -335,7 +339,7 @@ async fn send_session_command(params: &StartConnectionParams, bridge: &mut Bridg
         );
         return false;
     }
-    tracing::debug!("sent create/load session command to bridge");
+    tracing::debug!("sent create/resume session command to bridge");
     true
 }
 
@@ -517,8 +521,8 @@ fn handle_bridge_event(
                 history_updates,
             });
         }
-        BridgeEvent::SessionsListed { sessions, next_cursor } => {
-            let _ = event_tx.send(ClientEvent::SessionsListed { sessions, next_cursor });
+        BridgeEvent::SessionsListed { sessions } => {
+            let _ = event_tx.send(ClientEvent::SessionsListed { sessions });
         }
         BridgeEvent::Initialized { .. } => {}
     }
@@ -613,6 +617,64 @@ fn spawn_permission_response_forwarder(
     });
 }
 
+fn map_rate_limit_status(status: types::RateLimitStatus) -> model::RateLimitStatus {
+    match status {
+        types::RateLimitStatus::Allowed => model::RateLimitStatus::Allowed,
+        types::RateLimitStatus::AllowedWarning => model::RateLimitStatus::AllowedWarning,
+        types::RateLimitStatus::Rejected => model::RateLimitStatus::Rejected,
+    }
+}
+
+fn map_rate_limit_update(update: types::RateLimitUpdate) -> model::RateLimitUpdate {
+    model::RateLimitUpdate {
+        status: map_rate_limit_status(update.status),
+        resets_at: update.resets_at,
+        utilization: update.utilization,
+        rate_limit_type: update.rate_limit_type,
+        overage_status: update.overage_status.map(map_rate_limit_status),
+        overage_resets_at: update.overage_resets_at,
+        overage_disabled_reason: update.overage_disabled_reason,
+        is_using_overage: update.is_using_overage,
+        surpassed_threshold: update.surpassed_threshold,
+    }
+}
+
+fn map_available_commands_update(
+    commands: Vec<types::AvailableCommand>,
+) -> model::AvailableCommandsUpdate {
+    model::AvailableCommandsUpdate::new(
+        commands
+            .into_iter()
+            .map(|cmd| {
+                let mut mapped = model::AvailableCommand::new(cmd.name, cmd.description);
+                if let Some(input_hint) = cmd.input_hint
+                    && !input_hint.trim().is_empty()
+                {
+                    mapped = mapped.input_hint(input_hint);
+                }
+                mapped
+            })
+            .collect(),
+    )
+}
+
+fn map_available_agents_update(agents: Vec<types::AvailableAgent>) -> model::AvailableAgentsUpdate {
+    model::AvailableAgentsUpdate::new(
+        agents
+            .into_iter()
+            .map(|agent| {
+                let mut mapped = model::AvailableAgent::new(agent.name, agent.description);
+                if let Some(model_name) = agent.model
+                    && !model_name.trim().is_empty()
+                {
+                    mapped = mapped.model(model_name);
+                }
+                mapped
+            })
+            .collect(),
+    )
+}
+
 fn map_session_update(update: types::SessionUpdate) -> Option<model::SessionUpdate> {
     match update {
         types::SessionUpdate::UserMessageChunk { content } => {
@@ -637,21 +699,11 @@ fn map_session_update(update: types::SessionUpdate) -> Option<model::SessionUpda
             model::Plan::new(entries.into_iter().map(convert_plan_entry).collect()),
         )),
         types::SessionUpdate::AvailableCommandsUpdate { commands } => Some(
-            model::SessionUpdate::AvailableCommandsUpdate(model::AvailableCommandsUpdate::new(
-                commands
-                    .into_iter()
-                    .map(|cmd| {
-                        let mut mapped = model::AvailableCommand::new(cmd.name, cmd.description);
-                        if let Some(input_hint) = cmd.input_hint
-                            && !input_hint.trim().is_empty()
-                        {
-                            mapped = mapped.input_hint(input_hint);
-                        }
-                        mapped
-                    })
-                    .collect(),
-            )),
+            model::SessionUpdate::AvailableCommandsUpdate(map_available_commands_update(commands)),
         ),
+        types::SessionUpdate::AvailableAgentsUpdate { agents } => {
+            Some(model::SessionUpdate::AvailableAgentsUpdate(map_available_agents_update(agents)))
+        }
         types::SessionUpdate::CurrentModeUpdate { current_mode_id } => {
             Some(model::SessionUpdate::CurrentModeUpdate(model::CurrentModeUpdate::new(
                 model::SessionModeId::new(current_mode_id),
@@ -670,6 +722,36 @@ fn map_session_update(update: types::SessionUpdate) -> Option<model::SessionUpda
                 max_output_tokens: usage.max_output_tokens,
             }))
         }
+        types::SessionUpdate::FastModeUpdate { fast_mode_state } => {
+            Some(model::SessionUpdate::FastModeUpdate(match fast_mode_state {
+                types::FastModeState::Off => model::FastModeState::Off,
+                types::FastModeState::Cooldown => model::FastModeState::Cooldown,
+                types::FastModeState::On => model::FastModeState::On,
+            }))
+        }
+        types::SessionUpdate::RateLimitUpdate {
+            status,
+            resets_at,
+            utilization,
+            rate_limit_type,
+            overage_status,
+            overage_resets_at,
+            overage_disabled_reason,
+            is_using_overage,
+            surpassed_threshold,
+        } => Some(model::SessionUpdate::RateLimitUpdate(map_rate_limit_update(
+            types::RateLimitUpdate {
+                status,
+                resets_at,
+                utilization,
+                rate_limit_type,
+                overage_status,
+                overage_resets_at,
+                overage_disabled_reason,
+                is_using_overage,
+                surpassed_threshold,
+            },
+        ))),
         types::SessionUpdate::SessionStatusUpdate { status } => {
             Some(model::SessionUpdate::SessionStatusUpdate(match status {
                 types::SessionStatus::Compacting => model::SessionStatus::Compacting,

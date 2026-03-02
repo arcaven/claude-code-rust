@@ -458,6 +458,38 @@ impl AvailableCommandsUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableAgent {
+    pub name: String,
+    pub description: String,
+    pub model: Option<String>,
+}
+
+impl AvailableAgent {
+    #[must_use]
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self { name: name.into(), description: description.into(), model: None }
+    }
+
+    #[must_use]
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableAgentsUpdate {
+    pub available_agents: Vec<AvailableAgent>,
+}
+
+impl AvailableAgentsUpdate {
+    #[must_use]
+    pub fn new(available_agents: Vec<AvailableAgent>) -> Self {
+        Self { available_agents }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentModeUpdate {
     pub current_mode_id: SessionModeId,
 }
@@ -489,6 +521,35 @@ pub struct UsageUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum FastModeState {
+    Off,
+    Cooldown,
+    On,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitStatus {
+    Allowed,
+    AllowedWarning,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitUpdate {
+    pub status: RateLimitStatus,
+    pub resets_at: Option<f64>,
+    pub utilization: Option<f64>,
+    pub rate_limit_type: Option<String>,
+    pub overage_status: Option<RateLimitStatus>,
+    pub overage_resets_at: Option<f64>,
+    pub overage_disabled_reason: Option<String>,
+    pub is_using_overage: Option<bool>,
+    pub surpassed_threshold: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Compacting,
     Idle,
@@ -516,9 +577,12 @@ pub enum SessionUpdate {
     ToolCallUpdate(ToolCallUpdate),
     Plan(Plan),
     AvailableCommandsUpdate(AvailableCommandsUpdate),
+    AvailableAgentsUpdate(AvailableAgentsUpdate),
     CurrentModeUpdate(CurrentModeUpdate),
     ConfigOptionUpdate(ConfigOptionUpdate),
     UsageUpdate(UsageUpdate),
+    FastModeUpdate(FastModeState),
+    RateLimitUpdate(RateLimitUpdate),
     SessionStatusUpdate(SessionStatus),
     CompactionBoundary(CompactionBoundary),
 }

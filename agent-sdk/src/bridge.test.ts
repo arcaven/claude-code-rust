@@ -1,17 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import {
   CACHE_SPLIT_POLICY,
+  buildRateLimitUpdate,
   buildToolResultFields,
   buildUsageUpdateFromResult,
   createToolCall,
-  extractSessionHistoryUpdatesFromJsonl,
+  mapAvailableAgents,
+  mapSessionMessagesToUpdates,
+  mapSdkSessions,
   agentSdkVersionCompatibilityError,
   looksLikeAuthRequired,
   normalizeToolResultText,
+  parseFastModeState,
+  parseRateLimitStatus,
   normalizeToolKind,
   parseCommandEnvelope,
   permissionOptionsFromSuggestions,
@@ -37,17 +39,17 @@ test("parseCommandEnvelope validates initialize command", () => {
   assert.equal(parsed.command.cwd, "C:/work");
 });
 
-test("parseCommandEnvelope validates load_session command without cwd", () => {
+test("parseCommandEnvelope validates resume_session command without cwd", () => {
   const parsed = parseCommandEnvelope(
     JSON.stringify({
       request_id: "req-2",
-      command: "load_session",
+      command: "resume_session",
       session_id: "session-123",
     }),
   );
   assert.equal(parsed.requestId, "req-2");
-  assert.equal(parsed.command.command, "load_session");
-  if (parsed.command.command !== "load_session") {
+  assert.equal(parsed.command.command, "resume_session");
+  if (parsed.command.command !== "resume_session") {
     throw new Error("unexpected command variant");
   }
   assert.equal(parsed.command.session_id, "session-123");
@@ -64,8 +66,86 @@ test("normalizeToolKind maps known tool names", () => {
   assert.equal(normalizeToolKind("Bash"), "execute");
   assert.equal(normalizeToolKind("Delete"), "delete");
   assert.equal(normalizeToolKind("Move"), "move");
+  assert.equal(normalizeToolKind("Task"), "think");
+  assert.equal(normalizeToolKind("Agent"), "think");
   assert.equal(normalizeToolKind("ExitPlanMode"), "switch_mode");
   assert.equal(normalizeToolKind("TodoWrite"), "other");
+});
+
+test("parseFastModeState accepts known values and rejects unknown values", () => {
+  assert.equal(parseFastModeState("off"), "off");
+  assert.equal(parseFastModeState("cooldown"), "cooldown");
+  assert.equal(parseFastModeState("on"), "on");
+  assert.equal(parseFastModeState("CD"), null);
+  assert.equal(parseFastModeState(undefined), null);
+});
+
+test("parseRateLimitStatus accepts known values and rejects unknown values", () => {
+  assert.equal(parseRateLimitStatus("allowed"), "allowed");
+  assert.equal(parseRateLimitStatus("allowed_warning"), "allowed_warning");
+  assert.equal(parseRateLimitStatus("rejected"), "rejected");
+  assert.equal(parseRateLimitStatus("warn"), null);
+  assert.equal(parseRateLimitStatus(undefined), null);
+});
+
+test("buildRateLimitUpdate maps SDK fields to wire shape", () => {
+  const update = buildRateLimitUpdate({
+    status: "allowed_warning",
+    resetsAt: 1_741_280_000,
+    utilization: 0.92,
+    rateLimitType: "five_hour",
+    overageStatus: "rejected",
+    overageResetsAt: 1_741_280_600,
+    overageDisabledReason: "out_of_credits",
+    isUsingOverage: false,
+    surpassedThreshold: 0.9,
+  });
+
+  assert.deepEqual(update, {
+    type: "rate_limit_update",
+    status: "allowed_warning",
+    resets_at: 1_741_280_000,
+    utilization: 0.92,
+    rate_limit_type: "five_hour",
+    overage_status: "rejected",
+    overage_resets_at: 1_741_280_600,
+    overage_disabled_reason: "out_of_credits",
+    is_using_overage: false,
+    surpassed_threshold: 0.9,
+  });
+});
+
+test("buildRateLimitUpdate rejects invalid payloads", () => {
+  assert.equal(buildRateLimitUpdate(null), null);
+  assert.equal(buildRateLimitUpdate({}), null);
+  assert.equal(buildRateLimitUpdate({ status: "warning" }), null);
+  assert.deepEqual(
+    buildRateLimitUpdate({
+      status: "rejected",
+      overageStatus: "bad_status",
+    }),
+    { type: "rate_limit_update", status: "rejected" },
+  );
+});
+
+test("mapAvailableAgents normalizes and deduplicates agents", () => {
+  const agents = mapAvailableAgents([
+    { name: "reviewer", description: "", model: "" },
+    { name: "reviewer", description: "Reviews code", model: "haiku" },
+    { name: "explore", description: "Explore codebase", model: "sonnet" },
+    { name: "  ", description: "ignored" },
+    {},
+  ]);
+
+  assert.deepEqual(agents, [
+    { name: "explore", description: "Explore codebase", model: "sonnet" },
+    { name: "reviewer", description: "Reviews code", model: "haiku" },
+  ]);
+});
+
+test("mapAvailableAgents rejects non-array payload", () => {
+  assert.deepEqual(mapAvailableAgents(null), []);
+  assert.deepEqual(mapAvailableAgents({}), []);
 });
 
 test("createToolCall builds edit diff content", () => {
@@ -433,130 +513,134 @@ test("looksLikeAuthRequired detects login hints", () => {
 });
 
 test("agent sdk version compatibility check matches pinned version", () => {
-  assert.equal(resolveInstalledAgentSdkVersion(), "0.2.52");
+  assert.equal(resolveInstalledAgentSdkVersion(), "0.2.63");
   assert.equal(agentSdkVersionCompatibilityError(), undefined);
 });
 
-function withTempJsonl(lines: unknown[], run: (filePath: string) => void): void {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-rs-resume-test-"));
-  const filePath = path.join(dir, "session.jsonl");
-  fs.writeFileSync(filePath, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`, "utf8");
-  try {
-    run(filePath);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-test("extractSessionHistoryUpdatesFromJsonl parses nested progress message records", () => {
-  const lines = [
+test("mapSessionMessagesToUpdates maps message content blocks", () => {
+  const updates = mapSessionMessagesToUpdates([
     {
       type: "user",
+      uuid: "u1",
+      session_id: "s1",
+      parent_tool_use_id: null,
       message: {
         role: "user",
         content: [{ type: "text", text: "Top-level user prompt" }],
       },
     },
     {
-      type: "progress",
-      data: {
-        message: {
-          type: "assistant",
-          message: {
-            id: "msg-nested-1",
-            role: "assistant",
-            content: [
-              {
-                type: "tool_use",
-                id: "tool-nested-1",
-                name: "Bash",
-                input: { command: "echo hello" },
-              },
-            ],
-            usage: {
-              input_tokens: 11,
-              output_tokens: 7,
-              cache_read_input_tokens: 5,
-              cache_creation_input_tokens: 3,
-            },
-          },
+      type: "assistant",
+      uuid: "a1",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      message: {
+        id: "msg-1",
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "tool-1", name: "Bash", input: { command: "echo hello" } },
+          { type: "text", text: "Nested assistant final" },
+        ],
+        usage: {
+          input_tokens: 11,
+          output_tokens: 7,
+          cache_read_input_tokens: 5,
+          cache_creation_input_tokens: 3,
         },
       },
     },
     {
-      type: "progress",
-      data: {
-        message: {
-          type: "user",
-          message: {
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: "tool-nested-1",
-                content: "ok",
-                is_error: false,
-              },
-            ],
+      type: "user",
+      uuid: "u2",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool-1",
+            content: "ok",
+            is_error: false,
           },
-        },
+        ],
       },
     },
-    {
-      type: "progress",
-      data: {
-        message: {
-          type: "assistant",
-          message: {
-            id: "msg-nested-1",
-            role: "assistant",
-            content: [{ type: "text", text: "Nested assistant final" }],
-            usage: {
-              input_tokens: 11,
-              output_tokens: 7,
-              cache_read_input_tokens: 5,
-              cache_creation_input_tokens: 3,
-            },
-          },
-        },
-      },
-    },
-  ];
+  ]);
 
-  withTempJsonl(lines, (filePath) => {
-    const updates = extractSessionHistoryUpdatesFromJsonl(filePath);
-    const variantCounts = new Map<string, number>();
-    for (const update of updates) {
-      variantCounts.set(update.type, (variantCounts.get(update.type) ?? 0) + 1);
-    }
+  const variantCounts = new Map<string, number>();
+  for (const update of updates) {
+    variantCounts.set(update.type, (variantCounts.get(update.type) ?? 0) + 1);
+  }
 
-    assert.equal(variantCounts.get("user_message_chunk"), 1);
-    assert.equal(variantCounts.get("agent_message_chunk"), 1);
-    assert.equal(variantCounts.get("tool_call"), 1);
-    assert.equal(variantCounts.get("tool_call_update"), 1);
-    assert.equal(variantCounts.get("usage_update"), 1);
+  assert.equal(variantCounts.get("user_message_chunk"), 1);
+  assert.equal(variantCounts.get("agent_message_chunk"), 1);
+  assert.equal(variantCounts.get("tool_call"), 1);
+  assert.equal(variantCounts.get("tool_call_update"), 1);
+  assert.equal(variantCounts.get("usage_update"), 1);
 
-    const usage = updates.find((update) => update.type === "usage_update");
-    assert.ok(usage && usage.type === "usage_update");
-    assert.deepEqual(usage.usage, {
-      input_tokens: 11,
-      output_tokens: 7,
-      cache_read_tokens: 5,
-      cache_write_tokens: 3,
-    });
+  const usage = updates.find((update) => update.type === "usage_update");
+  assert.ok(usage && usage.type === "usage_update");
+  assert.deepEqual(usage.usage, {
+    input_tokens: 11,
+    output_tokens: 7,
+    cache_read_tokens: 5,
+    cache_write_tokens: 3,
   });
 });
 
-test("extractSessionHistoryUpdatesFromJsonl ignores invalid records", () => {
-  withTempJsonl(
-    [
-      { type: "queue-operation", operation: "enqueue" },
-      { type: "progress", data: { not_message: true } },
-      { type: "user", message: { role: "assistant", content: [{ type: "thinking", thinking: "h" }] } },
-    ],
-    (filePath) => {
-      const updates = extractSessionHistoryUpdatesFromJsonl(filePath);
-      assert.equal(updates.length, 0);
+test("mapSessionMessagesToUpdates ignores unsupported records", () => {
+  const updates = mapSessionMessagesToUpdates([
+    {
+      type: "user",
+      uuid: "u1",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "h" }],
+      },
     },
-  );
+  ]);
+  assert.equal(updates.length, 0);
+});
+
+test("mapSdkSessions normalizes and sorts sessions", () => {
+  const mapped = mapSdkSessions([
+    {
+      sessionId: "older",
+      summary: " Older summary ",
+      lastModified: 100,
+      fileSize: 10,
+      cwd: "C:/work",
+    },
+    {
+      sessionId: "latest",
+      summary: "",
+      lastModified: 200,
+      fileSize: 20,
+      customTitle: "Custom title",
+      gitBranch: "main",
+      firstPrompt: "hello",
+    },
+  ]);
+
+  assert.deepEqual(mapped, [
+    {
+      session_id: "latest",
+      summary: "Custom title",
+      last_modified_ms: 200,
+      file_size_bytes: 20,
+      git_branch: "main",
+      custom_title: "Custom title",
+      first_prompt: "hello",
+    },
+    {
+      session_id: "older",
+      summary: "Older summary",
+      last_modified_ms: 100,
+      file_size_bytes: 10,
+      cwd: "C:/work",
+    },
+  ]);
 });
