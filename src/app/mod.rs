@@ -16,6 +16,7 @@
 
 pub(crate) mod auth;
 mod cache_policy;
+pub(crate) mod config;
 mod connect;
 mod dialog;
 mod events;
@@ -34,13 +35,17 @@ mod state;
 pub(crate) mod subagent;
 mod terminal;
 mod todos;
+mod trust;
 mod update_check;
+mod view;
 
 // Re-export all public types so `crate::app::App`, `crate::app::BlockCache`, etc. still work.
 pub use cache_policy::{
     CacheSplitPolicy, DEFAULT_CACHE_SPLIT_HARD_LIMIT_BYTES, DEFAULT_CACHE_SPLIT_SOFT_LIMIT_BYTES,
-    DEFAULT_TOOL_PREVIEW_LIMIT_BYTES, default_cache_split_policy, find_text_split_index,
+    DEFAULT_TOOL_PREVIEW_LIMIT_BYTES, TextSplitDecision, TextSplitKind, default_cache_split_policy,
+    find_text_split, find_text_split_index,
 };
+pub use config::{ConfigState, ConfigTab};
 pub use connect::{create_app, start_connection};
 pub use events::{handle_client_event, handle_terminal_event};
 pub use focus::{FocusManager, FocusOwner, FocusTarget};
@@ -53,10 +58,12 @@ pub use state::{
     IncrementalMarkdown, InlinePermission, InvalidationLevel, LoginHint, MessageBlock, MessageRole,
     MessageUsage, ModeInfo, ModeState, PasteSessionState, PendingCommandAck, RecentSessionInfo,
     SelectionKind, SelectionPoint, SelectionState, SessionUsageState, SystemSeverity,
-    TerminalSnapshotMode, TodoItem, TodoStatus, ToolCallInfo, ToolCallScope, WelcomeBlock,
-    is_execute_tool_name,
+    TerminalSnapshotMode, TextBlock, TextBlockSpacing, TodoItem, TodoStatus, ToolCallInfo,
+    ToolCallScope, WelcomeBlock, is_execute_tool_name,
 };
+pub use trust::TrustSelection;
 pub use update_check::start_update_check;
+pub use view::ActiveView;
 
 use crate::agent::model;
 use crossterm::event::{
@@ -65,6 +72,9 @@ use crossterm::event::{
 };
 use futures::{FutureExt as _, StreamExt};
 use std::time::{Duration, Instant};
+
+const SPINNER_FRAME_INTERVAL_NORMAL: Duration = Duration::from_millis(30);
+const SPINNER_FRAME_INTERVAL_REDUCED: Duration = Duration::from_millis(120);
 
 // ---------------------------------------------------------------------------
 // Terminal suspend / resume helpers (reused by /login, /logout)
@@ -116,6 +126,8 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
     let mut last_render = Instant::now();
 
     loop {
+        start_connection(app);
+
         // Phase 1: wait for at least one event or the next frame tick
         let time_to_next = tick_duration.saturating_sub(last_render.elapsed());
         tokio::select! {
@@ -153,7 +165,9 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
         // Tick the burst detector: flush any held/buffered content that
         // has timed out. EmitChar re-inserts a single held character;
         // EmitPaste feeds the accumulated burst into the paste queue.
-        if let Some(action) = app.paste_burst.tick(Instant::now()) {
+        if app.active_view == ActiveView::Chat
+            && let Some(action) = app.paste_burst.tick(Instant::now())
+        {
             match action {
                 paste_burst::FlushAction::EmitChar(ch) => {
                     let _ = app.input.textarea_insert_char(ch);
@@ -165,13 +179,15 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
         }
 
         // Merge and process `Event::Paste` chunks as one paste action.
-        if !app.pending_paste_text.is_empty() {
+        if app.active_view == ActiveView::Chat && !app.pending_paste_text.is_empty() {
             finalize_pending_paste_event(app);
         }
 
+        mention::tick(app, Instant::now());
+
         // Deferred submit: if Enter was pressed and no paste payload arrived
         // in this drain cycle, strip the trailing newline and submit.
-        if app.pending_submit {
+        if app.active_view == ActiveView::Chat && app.pending_submit {
             app.pending_submit = false;
             finalize_deferred_submit(app);
         }
@@ -189,8 +205,10 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
                 | AppStatus::Running
         ) || app.is_compacting;
         if is_animating {
-            app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            advance_spinner_frame(app, Instant::now());
             app.needs_redraw = true;
+        } else {
+            app.spinner_last_advance_at = None;
         }
         // Smooth scroll still settling
         let scroll_delta = (app.viewport.scroll_target as f32 - app.viewport.scroll_pos).abs();
@@ -259,6 +277,22 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
     ratatui::restore();
 
     Ok(())
+}
+
+fn advance_spinner_frame(app: &mut App, now: Instant) {
+    let interval = if app.config.prefers_reduced_motion_effective() {
+        SPINNER_FRAME_INTERVAL_REDUCED
+    } else {
+        SPINNER_FRAME_INTERVAL_NORMAL
+    };
+
+    match app.spinner_last_advance_at {
+        Some(last_advance) if now.duration_since(last_advance) < interval => {}
+        Some(_) | None => {
+            app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            app.spinner_last_advance_at = Some(now);
+        }
+    }
 }
 
 async fn wait_for_shutdown_signal() -> std::io::Result<()> {
@@ -506,5 +540,30 @@ mod tests {
             vec!["[Pasted Text 1 - 1001 chars][Pasted Text 2 - 1001 chars]"]
         );
         assert_eq!(app.input.text(), format!("{}{}", "a".repeat(1001), "b".repeat(1001)));
+    }
+
+    #[test]
+    fn spinner_advances_less_frequently_when_reduced_motion_enabled() {
+        let mut app = App::test_default();
+        let base = Instant::now();
+
+        advance_spinner_frame(&mut app, base);
+        assert_eq!(app.spinner_frame, 1);
+        advance_spinner_frame(&mut app, base + Duration::from_millis(40));
+        assert_eq!(app.spinner_frame, 2);
+
+        crate::app::config::store::set_prefers_reduced_motion(
+            &mut app.config.committed_local_settings_document,
+            true,
+        );
+        app.spinner_last_advance_at = None;
+        app.spinner_frame = 0;
+
+        advance_spinner_frame(&mut app, base);
+        assert_eq!(app.spinner_frame, 1);
+        advance_spinner_frame(&mut app, base + Duration::from_millis(95));
+        assert_eq!(app.spinner_frame, 1);
+        advance_spinner_frame(&mut app, base + Duration::from_millis(121));
+        assert_eq!(app.spinner_frame, 2);
     }
 }

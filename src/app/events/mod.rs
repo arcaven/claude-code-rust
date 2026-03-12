@@ -24,8 +24,8 @@ mod tool_updates;
 mod turn;
 
 use super::{
-    App, AppStatus, BlockCache, ChatMessage, IncrementalMarkdown, MessageBlock, MessageRole,
-    PendingCommandAck, SystemSeverity,
+    ActiveView, App, AppStatus, ChatMessage, MessageBlock, MessageRole, PendingCommandAck,
+    SystemSeverity, TextBlock,
 };
 use crate::agent::events::ClientEvent;
 use crate::agent::model;
@@ -38,22 +38,12 @@ pub fn handle_terminal_event(app: &mut App, event: Event) {
     app.needs_redraw = true;
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            app.active_paste_session = None;
-            super::keys::dispatch_key_by_focus(app, key);
+            dispatch_key_by_view(app, key);
         }
         Event::Mouse(mouse) => {
-            app.active_paste_session = None;
-            mouse::handle_mouse_event(app, mouse);
+            dispatch_mouse_by_view(app, mouse);
         }
-        Event::Paste(text) => {
-            if !matches!(
-                app.status,
-                AppStatus::Connecting | AppStatus::CommandPending | AppStatus::Error
-            ) && !app.is_compacting
-            {
-                app.queue_paste_text(&text);
-            }
-        }
+        Event::Paste(text) => dispatch_paste_by_view(app, &text),
         Event::FocusGained => {
             app.notifications.on_focus_gained();
             app.refresh_git_branch();
@@ -74,6 +64,41 @@ pub fn handle_terminal_event(app: &mut App, event: Event) {
     }
 }
 
+fn dispatch_key_by_view(app: &mut App, key: crossterm::event::KeyEvent) {
+    match app.active_view {
+        ActiveView::Chat => {
+            app.active_paste_session = None;
+            super::keys::dispatch_key_by_focus(app, key);
+        }
+        ActiveView::Config => super::config::handle_key(app, key),
+        ActiveView::Trusted => super::trust::handle_key(app, key),
+    }
+}
+
+fn dispatch_mouse_by_view(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    match app.active_view {
+        ActiveView::Chat => {
+            app.active_paste_session = None;
+            mouse::handle_mouse_event(app, mouse);
+        }
+        ActiveView::Config | ActiveView::Trusted => {
+            let _ = mouse;
+        }
+    }
+}
+
+fn dispatch_paste_by_view(app: &mut App, text: &str) {
+    if app.active_view != ActiveView::Chat {
+        return;
+    }
+
+    if !matches!(app.status, AppStatus::Connecting | AppStatus::CommandPending | AppStatus::Error)
+        && !app.is_compacting
+    {
+        app.queue_paste_text(text);
+    }
+}
+
 pub fn handle_client_event(app: &mut App, event: ClientEvent) {
     app.needs_redraw = true;
     match event {
@@ -87,12 +112,20 @@ pub fn handle_client_event(app: &mut App, event: ClientEvent) {
         ClientEvent::TurnErrorClassified { message, class } => {
             turn::handle_turn_error_event(app, &message, Some(class));
         }
-        ClientEvent::Connected { session_id, cwd, model_name, mode, history_updates } => {
+        ClientEvent::Connected {
+            session_id,
+            cwd,
+            model_name,
+            available_models,
+            mode,
+            history_updates,
+        } => {
             session::handle_connected_client_event(
                 app,
                 session_id,
                 cwd,
                 model_name,
+                available_models,
                 mode,
                 &history_updates,
             );
@@ -109,12 +142,20 @@ pub fn handle_client_event(app: &mut App, event: ClientEvent) {
         ClientEvent::SlashCommandError(msg) => {
             session::handle_slash_command_error_event(app, &msg);
         }
-        ClientEvent::SessionReplaced { session_id, cwd, model_name, mode, history_updates } => {
+        ClientEvent::SessionReplaced {
+            session_id,
+            cwd,
+            model_name,
+            available_models,
+            mode,
+            history_updates,
+        } => {
             session::handle_session_replaced_event(
                 app,
                 session_id,
                 cwd,
                 model_name,
+                available_models,
                 mode,
                 &history_updates,
             );
@@ -125,8 +166,8 @@ pub fn handle_client_event(app: &mut App, event: ClientEvent) {
         ClientEvent::ServiceStatus { severity, message } => {
             session::handle_service_status_event(app, severity, &message);
         }
-        ClientEvent::AuthCompleted { conn, cwd, model } => {
-            session::handle_auth_completed_event(app, conn, cwd, model);
+        ClientEvent::AuthCompleted { conn } => {
+            session::handle_auth_completed_event(app, &conn);
         }
         ClientEvent::LogoutCompleted => {
             session::handle_logout_completed_event(app);
@@ -183,9 +224,16 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
                 super::subagent::update_query(app);
             }
         }
+        model::SessionUpdate::ModeStateUpdate(mode) => {
+            app.mode = Some(mode);
+            app.cached_footer_line = None;
+            if matches!(app.pending_command_ack, Some(PendingCommandAck::CurrentModeUpdate)) {
+                session::clear_pending_command(app);
+            }
+        }
         model::SessionUpdate::CurrentModeUpdate(update) => {
+            let mode_id = update.current_mode_id.to_string();
             if let Some(ref mut mode) = app.mode {
-                let mode_id = update.current_mode_id.to_string();
                 if let Some(info) = mode.available_modes.iter().find(|m| m.id == mode_id) {
                     mode.current_mode_name.clone_from(&info.name);
                     mode.current_mode_id = mode_id;
@@ -254,11 +302,7 @@ pub(crate) fn push_system_message_with_severity(
 ) {
     app.messages.push(ChatMessage {
         role: MessageRole::System(severity),
-        blocks: vec![MessageBlock::Text(
-            message.to_owned(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete(message),
-        )],
+        blocks: vec![MessageBlock::Text(TextBlock::from_complete(message))],
         usage: None,
     });
     app.enforce_history_retention_tracked();
@@ -293,6 +337,7 @@ fn session_update_name(update: &model::SessionUpdate) -> &'static str {
         model::SessionUpdate::Plan(_) => "Plan",
         model::SessionUpdate::AvailableCommandsUpdate(_) => "AvailableCommandsUpdate",
         model::SessionUpdate::AvailableAgentsUpdate(_) => "AvailableAgentsUpdate",
+        model::SessionUpdate::ModeStateUpdate(_) => "ModeStateUpdate",
         model::SessionUpdate::CurrentModeUpdate(_) => "CurrentModeUpdate",
         model::SessionUpdate::ConfigOptionUpdate(_) => "ConfigOptionUpdate",
         model::SessionUpdate::FastModeUpdate(_) => "FastModeUpdate",
@@ -327,7 +372,8 @@ mod tests {
     use crate::agent::error_handling::TurnErrorClass;
     use crate::agent::events::ServiceStatusSeverity;
     use crate::app::{
-        CancelOrigin, FocusOwner, FocusTarget, HelpView, InlinePermission, TodoItem, TodoStatus,
+        ActiveView, BlockCache, CancelOrigin, FocusOwner, FocusTarget, HelpView, InlinePermission,
+        SelectionKind, SelectionPoint, SelectionState, TextBlockSpacing, TodoItem, TodoStatus,
         ToolCallInfo, ToolCallScope, mention,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -371,11 +417,7 @@ mod tests {
     fn user_msg(text: &str) -> ChatMessage {
         ChatMessage {
             role: MessageRole::User,
-            blocks: vec![MessageBlock::Text(
-                text.into(),
-                BlockCache::default(),
-                IncrementalMarkdown::default(),
-            )],
+            blocks: vec![MessageBlock::Text(TextBlock::from_complete(text))],
             usage: None,
         }
     }
@@ -667,18 +709,21 @@ mod tests {
         };
         assert!(matches!(last.role, MessageRole::Assistant));
         assert_eq!(last.blocks.len(), 3);
-        let Some(MessageBlock::Text(b1, _, _)) = last.blocks.first() else {
+        let Some(MessageBlock::Text(b1)) = last.blocks.first() else {
             panic!("expected first text block");
         };
-        let Some(MessageBlock::Text(b2, _, _)) = last.blocks.get(1) else {
+        let Some(MessageBlock::Text(b2)) = last.blocks.get(1) else {
             panic!("expected second text block");
         };
-        let Some(MessageBlock::Text(b3, _, _)) = last.blocks.get(2) else {
+        let Some(MessageBlock::Text(b3)) = last.blocks.get(2) else {
             panic!("expected third text block");
         };
-        assert_eq!(b1, "p1\n\n");
-        assert_eq!(b2, "p2\n\n");
-        assert_eq!(b3, "p3");
+        assert_eq!(b1.text, "p1\n\n");
+        assert_eq!(b2.text, "p2\n\n");
+        assert_eq!(b3.text, "p3");
+        assert_eq!(b1.trailing_spacing, TextBlockSpacing::ParagraphBreak);
+        assert_eq!(b2.trailing_spacing, TextBlockSpacing::ParagraphBreak);
+        assert_eq!(b3.trailing_spacing, TextBlockSpacing::None);
     }
 
     // has_in_progress_tool_calls
@@ -692,6 +737,7 @@ mod tests {
             session_id: model::SessionId::new("test-session"),
             cwd: "/test".into(),
             model_name: model_name.to_owned(),
+            available_models: Vec::new(),
             mode: None,
             history_updates: Vec::new(),
         }
@@ -848,11 +894,8 @@ mod tests {
     #[test]
     fn has_in_progress_no_tool_calls() {
         let mut app = make_test_app();
-        app.messages.push(assistant_msg(vec![MessageBlock::Text(
-            "hello".into(),
-            BlockCache::default(),
-            IncrementalMarkdown::default(),
-        )]));
+        app.messages
+            .push(assistant_msg(vec![MessageBlock::Text(TextBlock::from_complete("hello"))]));
         assert!(!tool_calls::has_in_progress_tool_calls(&app));
     }
 
@@ -950,17 +993,9 @@ mod tests {
     fn has_in_progress_text_and_tools_mixed() {
         let mut app = make_test_app();
         app.messages.push(assistant_msg(vec![
-            MessageBlock::Text(
-                "thinking...".into(),
-                BlockCache::default(),
-                IncrementalMarkdown::default(),
-            ),
+            MessageBlock::Text(TextBlock::from_complete("thinking...")),
             MessageBlock::ToolCall(Box::new(tool_call("tc1", model::ToolCallStatus::Completed))),
-            MessageBlock::Text(
-                "done".into(),
-                BlockCache::default(),
-                IncrementalMarkdown::default(),
-            ),
+            MessageBlock::Text(TextBlock::from_complete("done")),
         ]));
         assert!(!tool_calls::has_in_progress_tool_calls(&app));
     }
@@ -1058,10 +1093,10 @@ mod tests {
         assert!(!app.cancelled_turn_pending_hint);
         let last = app.messages.last().expect("expected interruption hint message");
         assert!(matches!(last.role, MessageRole::System(Some(SystemSeverity::Info))));
-        let Some(MessageBlock::Text(text, _, _)) = last.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = last.blocks.first() else {
             panic!("expected text block");
         };
-        assert_eq!(text, "Conversation interrupted. Tell the model how to proceed.");
+        assert_eq!(block.text, "Conversation interrupted. Tell the model how to proceed.");
     }
 
     #[test]
@@ -1069,11 +1104,9 @@ mod tests {
         let mut app = make_test_app();
         app.status = AppStatus::Thinking;
         app.messages.push(user_msg("build app"));
-        app.messages.push(assistant_msg(vec![MessageBlock::Text(
-            "partial output".into(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete("partial output"),
-        )]));
+        app.messages.push(assistant_msg(vec![MessageBlock::Text(TextBlock::from_complete(
+            "partial output",
+        ))]));
         app.pending_cancel_origin = Some(CancelOrigin::Manual);
 
         handle_client_event(&mut app, ClientEvent::TurnComplete);
@@ -1091,11 +1124,9 @@ mod tests {
         let mut app = make_test_app();
         app.status = AppStatus::Running;
         app.messages.push(user_msg("build app"));
-        app.messages.push(assistant_msg(vec![MessageBlock::Text(
-            "partial output".into(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete("partial output"),
-        )]));
+        app.messages.push(assistant_msg(vec![MessageBlock::Text(TextBlock::from_complete(
+            "partial output",
+        ))]));
         app.pending_cancel_origin = Some(CancelOrigin::AutoQueue);
 
         handle_client_event(&mut app, ClientEvent::TurnComplete);
@@ -1128,7 +1159,6 @@ mod tests {
     fn connected_updates_cwd_and_clears_resuming_marker() {
         let mut app = make_test_app();
         app.messages.push(ChatMessage::welcome("Connecting...", "/test"));
-        app.file_cache = Some(Vec::new());
         app.resuming_session_id = Some("resume-123".into());
 
         handle_client_event(
@@ -1137,6 +1167,7 @@ mod tests {
                 session_id: model::SessionId::new("session-cwd"),
                 cwd: "/changed".into(),
                 model_name: "claude-updated".into(),
+                available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
             },
@@ -1144,7 +1175,6 @@ mod tests {
 
         assert_eq!(app.cwd_raw, "/changed");
         assert_eq!(app.cwd, "/changed");
-        assert!(app.file_cache.is_none());
         assert!(app.resuming_session_id.is_none());
         let Some(first) = app.messages.first() else {
             panic!("missing welcome message");
@@ -1260,11 +1290,8 @@ mod tests {
     fn session_replaced_resets_chat_and_transient_state() {
         let mut app = make_test_app();
         app.messages.push(user_msg("hello"));
-        app.messages.push(assistant_msg(vec![MessageBlock::Text(
-            "world".into(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete("world"),
-        )]));
+        app.messages
+            .push(assistant_msg(vec![MessageBlock::Text(TextBlock::from_complete("world"))]));
         app.status = AppStatus::Running;
         app.files_accessed = 9;
         app.pending_permission_ids.push("perm-1".into());
@@ -1275,13 +1302,7 @@ mod tests {
             status: TodoStatus::InProgress,
             active_form: String::new(),
         });
-        app.mention = Some(mention::MentionState {
-            trigger_row: 0,
-            trigger_col: 0,
-            query: String::new(),
-            candidates: Vec::new(),
-            dialog: super::super::dialog::DialogState::default(),
-        });
+        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
 
         handle_client_event(
             &mut app,
@@ -1289,6 +1310,7 @@ mod tests {
                 session_id: model::SessionId::new("replacement"),
                 cwd: "/replacement".into(),
                 model_name: "new-model".into(),
+                available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
             },
@@ -1424,6 +1446,7 @@ mod tests {
                 session_id: model::SessionId::new("active-456"),
                 cwd: "/replacement".into(),
                 model_name: "new-model".into(),
+                available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
             },
@@ -1453,6 +1476,7 @@ mod tests {
                 session_id: model::SessionId::new("active-456"),
                 cwd: "/replacement".into(),
                 model_name: "new-model".into(),
+                available_models: Vec::new(),
                 mode: None,
                 history_updates,
             },
@@ -1463,10 +1487,10 @@ mod tests {
         assert!(matches!(app.messages[1].role, MessageRole::User));
         assert!(matches!(app.messages[2].role, MessageRole::Assistant));
 
-        let Some(MessageBlock::Text(user_text, _, _)) = app.messages[1].blocks.first() else {
+        let Some(MessageBlock::Text(user_text)) = app.messages[1].blocks.first() else {
             panic!("expected user text block");
         };
-        assert_eq!(user_text, "first user line");
+        assert_eq!(user_text.text, "first user line");
     }
 
     #[test]
@@ -1482,6 +1506,7 @@ mod tests {
                 session_id: model::SessionId::new("active-789"),
                 cwd: "/replacement".into(),
                 model_name: "new-model".into(),
+                available_models: Vec::new(),
                 mode: None,
                 history_updates: vec![model::SessionUpdate::ToolCall(open_tool)],
             },
@@ -1509,11 +1534,8 @@ mod tests {
         let mut app = make_test_app();
         app.session_id = Some(model::SessionId::new("session-x"));
         app.messages.push(user_msg("/compact"));
-        app.messages.push(assistant_msg(vec![MessageBlock::Text(
-            "compacted".into(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete("compacted"),
-        )]));
+        app.messages
+            .push(assistant_msg(vec![MessageBlock::Text(TextBlock::from_complete("compacted"))]));
         handle_client_event(
             &mut app,
             ClientEvent::SessionUpdate(model::SessionUpdate::CompactionBoundary(
@@ -1535,10 +1557,10 @@ mod tests {
         else {
             panic!("expected compaction success system message");
         };
-        let Some(MessageBlock::Text(text, _, _)) = blocks.first() else {
+        let Some(MessageBlock::Text(block)) = blocks.first() else {
             panic!("expected text block");
         };
-        assert_eq!(text, "Session successfully compacted.");
+        assert_eq!(block.text, "Session successfully compacted.");
         assert_eq!(app.session_id.as_ref().map(ToString::to_string).as_deref(), Some("session-x"));
     }
 
@@ -1599,11 +1621,11 @@ mod tests {
         else {
             panic!("expected system error message");
         };
-        let Some(MessageBlock::Text(text, _, _)) = blocks.first() else {
+        let Some(MessageBlock::Text(block)) = blocks.first() else {
             panic!("expected text block");
         };
-        assert!(text.contains("Turn failed: adapter failed"));
-        assert!(text.contains("Press Ctrl+Q to quit and try again"));
+        assert!(block.text.contains("Turn failed: adapter failed"));
+        assert!(block.text.contains("Press Ctrl+Q to quit and try again"));
     }
 
     #[test]
@@ -1620,12 +1642,12 @@ mod tests {
         else {
             panic!("expected system error message");
         };
-        let Some(MessageBlock::Text(text, _, _)) = blocks.first() else {
+        let Some(MessageBlock::Text(block)) = blocks.first() else {
             panic!("expected text block");
         };
-        assert!(text.contains("Turn blocked by account or plan limits"));
-        assert!(text.contains("Next steps:"));
-        assert!(text.contains("Check quota/billing"));
+        assert!(block.text.contains("Turn blocked by account or plan limits"));
+        assert!(block.text.contains("Next steps:"));
+        assert!(block.text.contains("Check quota/billing"));
     }
 
     #[test]
@@ -1645,11 +1667,11 @@ mod tests {
         else {
             panic!("expected system error message");
         };
-        let Some(MessageBlock::Text(text, _, _)) = blocks.first() else {
+        let Some(MessageBlock::Text(block)) = blocks.first() else {
             panic!("expected text block");
         };
-        assert!(text.contains("Turn blocked by account or plan limits"));
-        assert!(text.contains("Next steps:"));
+        assert!(block.text.contains("Turn blocked by account or plan limits"));
+        assert!(block.text.contains("Next steps:"));
     }
 
     #[test]
@@ -1822,11 +1844,11 @@ mod tests {
             panic!("expected combined system message");
         };
         assert!(matches!(last.role, MessageRole::System(Some(SystemSeverity::Warning))));
-        let Some(MessageBlock::Text(text, _, _)) = last.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = last.blocks.first() else {
             panic!("expected text block");
         };
-        assert!(text.contains("Approaching rate limit"));
-        assert!(text.contains("Turn blocked by account or plan limits"));
+        assert!(block.text.contains("Approaching rate limit"));
+        assert!(block.text.contains("Turn blocked by account or plan limits"));
     }
 
     #[test]
@@ -1849,10 +1871,10 @@ mod tests {
             panic!("expected interruption hint message");
         };
         assert!(matches!(last.role, MessageRole::System(Some(SystemSeverity::Info))));
-        let Some(MessageBlock::Text(text, _, _)) = last.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = last.blocks.first() else {
             panic!("expected text block");
         };
-        assert_eq!(text, "Conversation interrupted. Tell the model how to proceed.");
+        assert_eq!(block.text, "Conversation interrupted. Tell the model how to proceed.");
     }
 
     #[test]
@@ -1860,11 +1882,9 @@ mod tests {
         let mut app = make_test_app();
         app.status = AppStatus::Running;
         app.messages.push(user_msg("build app"));
-        app.messages.push(assistant_msg(vec![MessageBlock::Text(
-            "partial output".into(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete("partial output"),
-        )]));
+        app.messages.push(assistant_msg(vec![MessageBlock::Text(TextBlock::from_complete(
+            "partial output",
+        ))]));
         app.pending_cancel_origin = Some(CancelOrigin::AutoQueue);
 
         handle_client_event(
@@ -2343,13 +2363,7 @@ mod tests {
             true,
         );
 
-        app.mention = Some(mention::MentionState {
-            trigger_row: 0,
-            trigger_col: 0,
-            query: String::new(),
-            candidates: Vec::new(),
-            dialog: super::super::dialog::DialogState::default(),
-        });
+        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
         app.claim_focus_target(FocusTarget::Mention);
         assert_eq!(app.focus_owner(), FocusOwner::Mention);
 
@@ -2753,13 +2767,7 @@ mod tests {
         });
         app.show_todo_panel = true;
         app.claim_focus_target(FocusTarget::TodoList);
-        app.mention = Some(mention::MentionState {
-            trigger_row: 0,
-            trigger_col: 0,
-            query: String::new(),
-            candidates: Vec::new(),
-            dialog: super::super::dialog::DialogState::default(),
-        });
+        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
         app.claim_focus_target(FocusTarget::Mention);
 
         handle_terminal_event(
@@ -2812,6 +2820,151 @@ mod tests {
 
         assert_eq!(app.input.cursor_row(), 1);
         assert_eq!(app.viewport.scroll_target, 3);
+    }
+
+    #[test]
+    fn settings_view_routes_space_to_settings_handler_not_chat_input() {
+        let mut app = make_test_app();
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.settings_home_override = Some(dir.path().to_path_buf());
+        app.cwd_raw = dir.path().to_string_lossy().to_string();
+        crate::app::config::open(&mut app).expect("open settings");
+        app.active_view = ActiveView::Config;
+        app.config.selected_setting_index = crate::app::config::setting_specs()
+            .iter()
+            .position(|spec| spec.id == crate::app::config::SettingId::FastMode)
+            .expect("fast mode setting row");
+        app.input.set_text("seed");
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        );
+
+        assert_eq!(app.input.text(), "seed");
+        assert!(!app.pending_submit);
+        assert!(app.config.fast_mode_effective());
+        assert!(app.config.last_error.is_none());
+    }
+
+    #[test]
+    fn settings_view_routes_enter_to_close_not_chat_submit() {
+        let mut app = make_test_app();
+        let dir = tempfile::tempdir().expect("tempdir");
+        app.settings_home_override = Some(dir.path().to_path_buf());
+        app.cwd_raw = dir.path().to_string_lossy().to_string();
+        crate::app::config::open(&mut app).expect("open settings");
+        app.active_view = ActiveView::Config;
+        app.input.set_text("seed");
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(app.active_view, ActiveView::Chat);
+        assert_eq!(app.input.text(), "seed");
+        assert!(!app.pending_submit);
+    }
+
+    #[test]
+    fn settings_view_ignores_paste_events() {
+        let mut app = make_test_app();
+        app.active_view = ActiveView::Config;
+
+        handle_terminal_event(&mut app, Event::Paste("blocked".into()));
+
+        assert!(app.pending_paste_text.is_empty());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn settings_view_ignores_mouse_events() {
+        let mut app = make_test_app();
+        app.active_view = ActiveView::Config;
+        app.viewport.scroll_target = 4;
+        app.selection = Some(SelectionState {
+            kind: SelectionKind::Chat,
+            start: SelectionPoint { row: 0, col: 0 },
+            end: SelectionPoint { row: 0, col: 1 },
+            dragging: false,
+        });
+
+        handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert_eq!(app.viewport.scroll_target, 4);
+        assert!(app.selection.is_some());
+    }
+
+    #[test]
+    fn trusted_view_accept_key_does_not_edit_chat_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, "{\n  \"projects\": {}\n}\n").expect("write");
+
+        let mut app = make_test_app();
+        app.active_view = ActiveView::Trusted;
+        app.input.set_text("seed");
+        app.cwd_raw = dir.path().join("project").to_string_lossy().to_string();
+        app.config.preferences_path = Some(path);
+        app.trust.status = crate::app::trust::TrustStatus::Untrusted;
+        app.trust.project_key =
+            crate::app::trust::store::normalize_project_key(std::path::Path::new(&app.cwd_raw));
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+        );
+
+        assert_eq!(app.active_view, ActiveView::Chat);
+        assert_eq!(app.input.text(), "seed");
+        assert!(app.pending_paste_text.is_empty());
+        assert!(app.startup_connection_requested);
+    }
+
+    #[test]
+    fn trusted_view_ignores_paste_events() {
+        let mut app = make_test_app();
+        app.active_view = ActiveView::Trusted;
+
+        handle_terminal_event(&mut app, Event::Paste("blocked".into()));
+
+        assert!(app.pending_paste_text.is_empty());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn trusted_view_ignores_mouse_events() {
+        let mut app = make_test_app();
+        app.active_view = ActiveView::Trusted;
+        app.viewport.scroll_target = 4;
+        app.selection = Some(SelectionState {
+            kind: SelectionKind::Chat,
+            start: SelectionPoint { row: 0, col: 0 },
+            end: SelectionPoint { row: 0, col: 1 },
+            dragging: false,
+        });
+
+        handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert_eq!(app.viewport.scroll_target, 4);
+        assert!(app.selection.is_some());
     }
 
     #[test]

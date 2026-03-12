@@ -15,8 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::super::{
-    App, AppStatus, BlockCache, CancelOrigin, ChatMessage, FocusTarget, IncrementalMarkdown,
-    InlinePermission, InvalidationLevel, MessageBlock, MessageRole, SystemSeverity,
+    App, AppStatus, CancelOrigin, ChatMessage, FocusTarget, InlinePermission, InvalidationLevel,
+    MessageBlock, MessageRole, SystemSeverity, TextBlock,
 };
 use super::clear_compaction_state;
 use super::rate_limit::format_rate_limit_summary;
@@ -73,7 +73,10 @@ pub(super) fn handle_permission_request_event(
         app.pending_permission_ids.push(tool_id);
         app.claim_focus_target(FocusTarget::Permission);
         app.viewport.engage_auto_scroll();
-        app.notifications.notify(super::super::notify::NotifyEvent::PermissionRequired);
+        app.notifications.notify(
+            app.config.preferred_notification_channel_effective(),
+            super::super::notify::NotifyEvent::PermissionRequired,
+        );
     } else {
         tracing::warn!("Permission request for non-tool block index: {tool_id}; auto-rejecting");
         reject_permission_request(response_tx, &options);
@@ -134,9 +137,14 @@ pub(super) fn handle_turn_complete_event(app: &mut App) {
         mark_turn_exit_assistant_layout_dirty(app, tail_assistant_idx);
     }
     if turn_was_active {
-        app.notifications.notify(super::super::notify::NotifyEvent::TurnComplete);
+        app.notifications.notify(
+            app.config.preferred_notification_channel_effective(),
+            super::super::notify::NotifyEvent::TurnComplete,
+        );
     }
-    super::super::input_submit::maybe_auto_submit_after_cancel(app);
+    if app.active_view == super::super::ActiveView::Chat {
+        super::super::input_submit::maybe_auto_submit_after_cancel(app);
+    }
 }
 
 pub(super) fn handle_turn_error_event(
@@ -169,7 +177,9 @@ pub(super) fn handle_turn_error_event(
         if show_interrupted_hint {
             push_interrupted_hint(app);
         }
-        super::super::input_submit::maybe_auto_submit_after_cancel(app);
+        if app.active_view == super::super::ActiveView::Chat {
+            super::super::input_submit::maybe_auto_submit_after_cancel(app);
+        }
         return;
     }
 
@@ -220,11 +230,7 @@ pub(super) fn handle_turn_error_event(
 fn push_interrupted_hint(app: &mut App) {
     app.messages.push(ChatMessage {
         role: MessageRole::System(Some(SystemSeverity::Info)),
-        blocks: vec![MessageBlock::Text(
-            CONVERSATION_INTERRUPTED_HINT.to_owned(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete(CONVERSATION_INTERRUPTED_HINT),
-        )],
+        blocks: vec![MessageBlock::Text(TextBlock::from_complete(CONVERSATION_INTERRUPTED_HINT))],
         usage: None,
     });
     app.enforce_history_retention_tracked();

@@ -27,7 +27,8 @@ pub mod viewport;
 pub use block_cache::BlockCache;
 pub use cache_metrics::CacheMetrics;
 pub use messages::{
-    ChatMessage, IncrementalMarkdown, MessageBlock, MessageRole, SystemSeverity, WelcomeBlock,
+    ChatMessage, IncrementalMarkdown, MessageBlock, MessageRole, SystemSeverity, TextBlock,
+    TextBlockSpacing, WelcomeBlock,
 };
 pub use tool_call_info::{
     InlinePermission, TerminalSnapshotMode, ToolCallInfo, is_execute_tool_name,
@@ -43,19 +44,27 @@ pub use viewport::{ChatViewport, InvalidationLevel};
 use crate::agent::events::ClientEvent;
 use crate::agent::model;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+use super::config::ConfigState;
 use super::dialog;
 use super::focus::{FocusContext, FocusManager, FocusOwner, FocusTarget};
 use super::input::{InputState, parse_paste_placeholder_before_cursor};
 use super::mention;
 use super::slash;
 use super::subagent;
+use super::trust::TrustState;
+use super::view::ActiveView;
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
+    pub active_view: ActiveView,
+    pub config: ConfigState,
+    pub trust: TrustState,
+    pub settings_home_override: Option<PathBuf>,
     pub messages: Vec<ChatMessage>,
     /// Single owner of all chat layout state: scroll, per-message heights, prefix sums.
     pub viewport: ChatViewport,
@@ -107,6 +116,7 @@ pub struct App {
     pub event_tx: mpsc::UnboundedSender<ClientEvent>,
     pub event_rx: mpsc::UnboundedReceiver<ClientEvent>,
     pub spinner_frame: usize,
+    pub spinner_last_advance_at: Option<Instant>,
     /// Session-level default for tool call collapsed state.
     /// Toggled by Ctrl+O - new tool calls inherit this value.
     pub tools_collapsed: bool,
@@ -144,6 +154,8 @@ pub struct App {
     pub available_commands: Vec<model::AvailableCommand>,
     /// Subagents advertised by the agent via `AvailableAgentsUpdate`.
     pub available_agents: Vec<model::AvailableAgent>,
+    /// Models advertised by the agent SDK for the active session.
+    pub available_models: Vec<model::AvailableModel>,
     /// Recently persisted session IDs discovered at startup.
     pub recent_sessions: Vec<RecentSessionInfo>,
     /// Last known frame area (for mouse selection mapping).
@@ -185,8 +197,6 @@ pub struct App {
     pub active_paste_session: Option<PasteSessionState>,
     /// Monotonic counter for paste session identifiers.
     pub next_paste_session_id: u64,
-    /// Cached file list from cwd (scanned on first `@` trigger).
-    pub file_cache: Option<Vec<mention::FileCandidate>>,
     /// Cached todo compact line (invalidated on `set_todos()`).
     pub cached_todo_compact: Option<ratatui::text::Line<'static>>,
     /// Current git branch (refreshed on focus gain + turn complete).
@@ -231,6 +241,11 @@ pub struct App {
     pub fps_ema: Option<f32>,
     /// Timestamp of the previous presented frame.
     pub last_frame_at: Option<Instant>,
+    pub startup_connection_requested: bool,
+    pub connection_started: bool,
+    pub startup_bridge_script: Option<PathBuf>,
+    pub startup_resume_id: Option<String>,
+    pub startup_resume_requested: bool,
 }
 
 impl App {
@@ -279,6 +294,11 @@ impl App {
             Some(current) => current * 0.9 + fps * 0.1,
             None => fps,
         });
+    }
+
+    #[must_use]
+    pub fn is_project_trusted(&self) -> bool {
+        self.trust.is_trusted()
     }
 
     #[must_use]
@@ -504,6 +524,10 @@ impl App {
     pub fn test_default() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
+            active_view: ActiveView::Chat,
+            config: ConfigState::default(),
+            trust: TrustState::default(),
+            settings_home_override: None,
             messages: Vec::new(),
             viewport: ChatViewport::new(),
             input: InputState::new(),
@@ -533,6 +557,7 @@ impl App {
             event_tx: tx,
             event_rx: rx,
             spinner_frame: 0,
+            spinner_last_advance_at: None,
             tools_collapsed: false,
             active_task_ids: HashSet::default(),
             tool_call_scopes: HashMap::default(),
@@ -549,6 +574,7 @@ impl App {
             focus: FocusManager::default(),
             available_commands: Vec::new(),
             available_agents: Vec::new(),
+            available_models: Vec::new(),
             recent_sessions: Vec::new(),
             cached_frame_area: ratatui::layout::Rect::default(),
             selection: None,
@@ -566,7 +592,6 @@ impl App {
             pending_paste_session: None,
             active_paste_session: None,
             next_paste_session_id: 1,
-            file_cache: None,
             cached_todo_compact: None,
             git_branch: None,
             cached_header_line: None,
@@ -587,6 +612,11 @@ impl App {
             cache_metrics: CacheMetrics::default(),
             fps_ema: None,
             last_frame_at: None,
+            startup_connection_requested: false,
+            connection_started: false,
+            startup_bridge_script: None,
+            startup_resume_id: None,
+            startup_resume_requested: false,
         }
     }
 
@@ -964,11 +994,7 @@ mod tests {
     }
 
     fn assistant_text_block(text: &str) -> MessageBlock {
-        MessageBlock::Text(
-            text.to_owned(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete(text),
-        )
+        MessageBlock::Text(TextBlock::from_complete(text))
     }
 
     fn user_text_message(text: &str) -> ChatMessage {
@@ -1067,16 +1093,16 @@ mod tests {
             },
         ];
 
-        let bytes_a = if let MessageBlock::Text(_, cache, _) = &mut app.messages[0].blocks[0] {
-            cache.store(vec![Line::from("x".repeat(2200))]);
-            cache.cached_bytes()
+        let bytes_a = if let MessageBlock::Text(block) = &mut app.messages[0].blocks[0] {
+            block.cache.store(vec![Line::from("x".repeat(2200))]);
+            block.cache.cached_bytes()
         } else {
             0
         };
-        let bytes_b = if let MessageBlock::Text(_, cache, _) = &mut app.messages[1].blocks[0] {
-            cache.store(vec![Line::from("y".repeat(2200))]);
-            let _ = cache.get();
-            cache.cached_bytes()
+        let bytes_b = if let MessageBlock::Text(block) = &mut app.messages[1].blocks[0] {
+            block.cache.store(vec![Line::from("y".repeat(2200))]);
+            let _ = block.cache.get();
+            block.cache.cached_bytes()
         } else {
             0
         };
@@ -1088,13 +1114,13 @@ mod tests {
         assert!(stats.total_after_bytes <= app.render_cache_budget.max_bytes);
         assert_eq!(stats.protected_bytes, 0);
 
-        if let MessageBlock::Text(_, cache, _) = &app.messages[0].blocks[0] {
-            assert_eq!(cache.cached_bytes(), 0);
+        if let MessageBlock::Text(block) = &app.messages[0].blocks[0] {
+            assert_eq!(block.cache.cached_bytes(), 0);
         } else {
             panic!("expected text block");
         }
-        if let MessageBlock::Text(_, cache, _) = &app.messages[1].blocks[0] {
-            assert_eq!(cache.cached_bytes(), bytes_b);
+        if let MessageBlock::Text(block) = &app.messages[1].blocks[0] {
+            assert_eq!(block.cache.cached_bytes(), bytes_b);
         } else {
             panic!("expected text block");
         }
@@ -1110,9 +1136,9 @@ mod tests {
             usage: None,
         }];
 
-        let before = if let MessageBlock::Text(_, cache, _) = &mut app.messages[0].blocks[0] {
-            cache.store(vec![Line::from("z".repeat(4096))]);
-            cache.cached_bytes()
+        let before = if let MessageBlock::Text(block) = &mut app.messages[0].blocks[0] {
+            block.cache.store(vec![Line::from("z".repeat(4096))]);
+            block.cache.cached_bytes()
         } else {
             0
         };
@@ -1122,8 +1148,8 @@ mod tests {
         assert_eq!(stats.evicted_bytes, 0);
         assert_eq!(stats.protected_bytes, before);
 
-        if let MessageBlock::Text(_, cache, _) = &app.messages[0].blocks[0] {
-            assert_eq!(cache.cached_bytes(), before);
+        if let MessageBlock::Text(block) = &app.messages[0].blocks[0] {
+            assert_eq!(block.cache.cached_bytes(), before);
         } else {
             panic!("expected text block");
         }
@@ -1146,15 +1172,15 @@ mod tests {
             },
         ];
 
-        let bytes_a = if let MessageBlock::Text(_, cache, _) = &mut app.messages[0].blocks[0] {
-            cache.store(vec![Line::from("x".repeat(2200))]);
-            cache.cached_bytes()
+        let bytes_a = if let MessageBlock::Text(block) = &mut app.messages[0].blocks[0] {
+            block.cache.store(vec![Line::from("x".repeat(2200))]);
+            block.cache.cached_bytes()
         } else {
             0
         };
-        let bytes_b = if let MessageBlock::Text(_, cache, _) = &mut app.messages[1].blocks[0] {
-            cache.store(vec![Line::from("y".repeat(5000))]);
-            cache.cached_bytes()
+        let bytes_b = if let MessageBlock::Text(block) = &mut app.messages[1].blocks[0] {
+            block.cache.store(vec![Line::from("y".repeat(5000))]);
+            block.cache.cached_bytes()
         } else {
             0
         };
@@ -1171,8 +1197,8 @@ mod tests {
         assert_eq!(stats.evicted_blocks, 0);
         assert_eq!(stats.evicted_bytes, 0);
         // Old message cache intact.
-        if let MessageBlock::Text(_, cache, _) = &app.messages[0].blocks[0] {
-            assert_eq!(cache.cached_bytes(), bytes_a);
+        if let MessageBlock::Text(block) = &app.messages[0].blocks[0] {
+            assert_eq!(block.cache.cached_bytes(), bytes_a);
         } else {
             panic!("expected text block");
         }
@@ -1201,19 +1227,19 @@ mod tests {
         ];
 
         // Populate caches: messages 0 and 1 evictable, message 2 protected.
-        if let MessageBlock::Text(_, cache, _) = &mut app.messages[0].blocks[0] {
-            cache.store(vec![Line::from("x".repeat(3000))]);
+        if let MessageBlock::Text(block) = &mut app.messages[0].blocks[0] {
+            block.cache.store(vec![Line::from("x".repeat(3000))]);
         }
-        let bytes_b = if let MessageBlock::Text(_, cache, _) = &mut app.messages[1].blocks[0] {
-            cache.store(vec![Line::from("y".repeat(3000))]);
-            let _ = cache.get(); // touch to make more recently accessed
-            cache.cached_bytes()
+        let bytes_b = if let MessageBlock::Text(block) = &mut app.messages[1].blocks[0] {
+            block.cache.store(vec![Line::from("y".repeat(3000))]);
+            let _ = block.cache.get(); // touch to make more recently accessed
+            block.cache.cached_bytes()
         } else {
             0
         };
-        let bytes_c = if let MessageBlock::Text(_, cache, _) = &mut app.messages[2].blocks[0] {
-            cache.store(vec![Line::from("z".repeat(5000))]);
-            cache.cached_bytes()
+        let bytes_c = if let MessageBlock::Text(block) = &mut app.messages[2].blocks[0] {
+            block.cache.store(vec![Line::from("z".repeat(5000))]);
+            block.cache.cached_bytes()
         } else {
             0
         };
@@ -1226,8 +1252,8 @@ mod tests {
         assert_eq!(stats.protected_bytes, bytes_c);
         assert!(stats.evicted_blocks >= 1); // message A evicted (older access)
         // Message B should survive (more recent access).
-        if let MessageBlock::Text(_, cache, _) = &app.messages[1].blocks[0] {
-            assert_eq!(cache.cached_bytes(), bytes_b);
+        if let MessageBlock::Text(block) = &app.messages[1].blocks[0] {
+            assert_eq!(block.cache.cached_bytes(), bytes_b);
         } else {
             panic!("expected text block");
         }
@@ -1243,8 +1269,8 @@ mod tests {
             usage: None,
         }];
 
-        if let MessageBlock::Text(_, cache, _) = &mut app.messages[0].blocks[0] {
-            cache.store(vec![Line::from("x".repeat(2000))]);
+        if let MessageBlock::Text(block) = &mut app.messages[0].blocks[0] {
+            block.cache.store(vec![Line::from("x".repeat(2000))]);
         }
         app.render_cache_budget.max_bytes = usize::MAX;
 
@@ -1833,13 +1859,7 @@ mod tests {
         app.claim_focus_target(FocusTarget::TodoList);
         app.pending_permission_ids.push("perm-1".into());
         app.claim_focus_target(FocusTarget::Permission);
-        app.mention = Some(mention::MentionState {
-            trigger_row: 0,
-            trigger_col: 0,
-            query: String::new(),
-            candidates: Vec::new(),
-            dialog: super::dialog::DialogState::default(),
-        });
+        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
         app.claim_focus_target(FocusTarget::Mention);
         assert_eq!(app.focus_owner(), FocusOwner::Mention);
     }
@@ -1875,13 +1895,7 @@ mod tests {
             active_form: String::new(),
         });
         app.show_todo_panel = true;
-        app.mention = Some(mention::MentionState {
-            trigger_row: 0,
-            trigger_col: 0,
-            query: String::new(),
-            candidates: Vec::new(),
-            dialog: super::dialog::DialogState::default(),
-        });
+        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
         app.pending_permission_ids.push("perm-1".into());
 
         app.claim_focus_target(FocusTarget::TodoList);

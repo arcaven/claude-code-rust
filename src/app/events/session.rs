@@ -15,15 +15,16 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use super::super::connect::take_connection_slot;
+use super::super::connect::{SessionStartReason, start_new_session};
 use super::super::state::RecentSessionInfo;
 use super::super::{
-    App, AppStatus, BlockCache, ChatMessage, IncrementalMarkdown, InvalidationLevel, LoginHint,
-    MessageBlock, MessageRole, SystemSeverity,
+    App, AppStatus, ChatMessage, InvalidationLevel, LoginHint, MessageBlock, MessageRole,
+    SystemSeverity, TextBlock,
 };
 use super::push_system_message_with_severity;
 use super::session_reset::{load_resume_history, reset_for_new_session};
 use crate::agent::client::AgentConnection;
-use crate::agent::events::{ClientEvent, ServiceStatusSeverity};
+use crate::agent::events::ServiceStatusSeverity;
 use crate::agent::model;
 use crate::error::AppError;
 use std::rc::Rc;
@@ -36,6 +37,7 @@ pub(super) fn handle_connected_client_event(
     session_id: model::SessionId,
     cwd: String,
     model_name: String,
+    available_models: Vec<model::AvailableModel>,
     mode: Option<super::super::ModeState>,
     history_updates: &[model::SessionUpdate],
 ) {
@@ -45,6 +47,7 @@ pub(super) fn handle_connected_client_event(
     apply_session_cwd(app, cwd);
     app.session_id = Some(session_id);
     app.model_name = model_name;
+    app.available_models = available_models;
     app.mode = mode;
     app.config_options.clear();
     app.config_options
@@ -122,11 +125,7 @@ pub(super) fn handle_connection_failed_event(app: &mut App, msg: &str) {
 pub(super) fn handle_slash_command_error_event(app: &mut App, msg: &str) {
     app.messages.push(ChatMessage {
         role: MessageRole::System(None),
-        blocks: vec![MessageBlock::Text(
-            msg.to_owned(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete(msg),
-        )],
+        blocks: vec![MessageBlock::Text(TextBlock::from_complete(msg))],
         usage: None,
     });
     app.enforce_history_retention_tracked();
@@ -135,12 +134,7 @@ pub(super) fn handle_slash_command_error_event(app: &mut App, msg: &str) {
     app.resuming_session_id = None;
 }
 
-pub(super) fn handle_auth_completed_event(
-    app: &mut App,
-    conn: Rc<AgentConnection>,
-    cwd: String,
-    model: String,
-) {
+pub(super) fn handle_auth_completed_event(app: &mut App, conn: &Rc<AgentConnection>) {
     tracing::info!("Authentication completed via /login");
     app.login_hint = None;
     app.pending_command_label = Some("Starting session...".to_owned());
@@ -152,14 +146,14 @@ pub(super) fn handle_auth_completed_event(
     );
     app.force_redraw = true;
 
-    let tx = app.event_tx.clone();
-    tokio::task::spawn_local(async move {
-        if let Err(e) = conn.new_session(cwd, false, Some(model)) {
-            let _ = tx.send(ClientEvent::SlashCommandError(format!(
-                "Failed to start session after login: {e}"
-            )));
-        }
-    });
+    if let Err(e) = start_new_session(app, conn, SessionStartReason::Login) {
+        clear_pending_command(app);
+        push_system_message_with_severity(
+            app,
+            Some(SystemSeverity::Error),
+            &format!("Failed to start session after login: {e}"),
+        );
+    }
 }
 
 pub(super) fn handle_logout_completed_event(app: &mut App) {
@@ -172,17 +166,14 @@ pub(super) fn handle_logout_completed_event(app: &mut App) {
     if let Some(ref conn) = app.conn {
         app.pending_command_label = Some("Starting session...".to_owned());
         app.pending_command_ack = None;
-        let conn = Rc::clone(conn);
-        let tx = app.event_tx.clone();
-        let cwd = app.cwd_raw.clone();
-        let model = Some(app.model_name.clone());
-        tokio::task::spawn_local(async move {
-            if let Err(e) = conn.new_session(cwd, false, model) {
-                let _ = tx.send(ClientEvent::SlashCommandError(format!(
-                    "Failed to start new session after logout: {e}"
-                )));
-            }
-        });
+        if let Err(e) = start_new_session(app, conn, SessionStartReason::Logout) {
+            clear_pending_command(app);
+            push_system_message_with_severity(
+                app,
+                Some(SystemSeverity::Error),
+                &format!("Failed to start new session after logout: {e}"),
+            );
+        }
     } else {
         tracing::warn!("No connection available after logout; cannot start new session");
         clear_pending_command(app);
@@ -199,6 +190,7 @@ pub(super) fn handle_session_replaced_event(
     session_id: model::SessionId,
     cwd: String,
     model_name: String,
+    available_models: Vec<model::AvailableModel>,
     mode: Option<super::super::ModeState>,
     history_updates: &[model::SessionUpdate],
 ) {
@@ -206,6 +198,7 @@ pub(super) fn handle_session_replaced_event(
     app.pending_cancel_origin = None;
     app.pending_auto_submit_after_cancel = false;
     apply_session_cwd(app, cwd);
+    app.available_models = available_models;
     reset_for_new_session(app, session_id, model_name, mode);
     if !history_updates.is_empty() {
         load_resume_history(app, history_updates);
@@ -305,7 +298,6 @@ fn sync_welcome_cwd(app: &mut App) {
 pub(super) fn apply_session_cwd(app: &mut App, cwd_raw: String) {
     app.cwd_raw = cwd_raw;
     app.cwd = shorten_cwd_display(&app.cwd_raw);
-    app.file_cache = None;
     app.cached_header_line = None;
     app.cached_footer_line = None;
     app.refresh_git_branch();

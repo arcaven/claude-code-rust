@@ -80,6 +80,37 @@ pub(super) fn map_available_agents_update(
     )
 }
 
+pub(super) fn map_available_models(
+    models: Vec<types::AvailableModel>,
+) -> Vec<model::AvailableModel> {
+    models
+        .into_iter()
+        .map(|model_info| {
+            let mut mapped = model::AvailableModel::new(model_info.id, model_info.display_name);
+            if let Some(description) = model_info.description
+                && !description.trim().is_empty()
+            {
+                mapped = mapped.description(description);
+            }
+            mapped = mapped.supports_effort(model_info.supports_effort);
+            if !model_info.supported_effort_levels.is_empty() {
+                mapped = mapped.supported_effort_levels(
+                    model_info
+                        .supported_effort_levels
+                        .into_iter()
+                        .map(|level| match level {
+                            types::EffortLevel::Low => model::EffortLevel::Low,
+                            types::EffortLevel::Medium => model::EffortLevel::Medium,
+                            types::EffortLevel::High => model::EffortLevel::High,
+                        })
+                        .collect(),
+                );
+            }
+            mapped
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn map_session_update(update: types::SessionUpdate) -> Option<model::SessionUpdate> {
     match update {
@@ -109,6 +140,9 @@ pub(super) fn map_session_update(update: types::SessionUpdate) -> Option<model::
         ),
         types::SessionUpdate::AvailableAgentsUpdate { agents } => {
             Some(model::SessionUpdate::AvailableAgentsUpdate(map_available_agents_update(agents)))
+        }
+        types::SessionUpdate::ModeStateUpdate { mode } => {
+            Some(model::SessionUpdate::ModeStateUpdate(convert_mode_state(mode)))
         }
         types::SessionUpdate::CurrentModeUpdate { current_mode_id } => {
             Some(model::SessionUpdate::CurrentModeUpdate(model::CurrentModeUpdate::new(

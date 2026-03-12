@@ -26,8 +26,7 @@ mod executors;
 mod navigation;
 
 use super::{
-    App, AppStatus, BlockCache, ChatMessage, IncrementalMarkdown, MessageBlock, MessageRole,
-    dialog::DialogState,
+    App, AppStatus, ChatMessage, MessageBlock, MessageRole, TextBlock, dialog::DialogState,
 };
 use crate::agent::model;
 use std::rc::Rc;
@@ -105,11 +104,7 @@ fn push_system_message(app: &mut App, text: impl Into<String>) {
     let text = text.into();
     app.messages.push(ChatMessage {
         role: MessageRole::System(None),
-        blocks: vec![MessageBlock::Text(
-            text.clone(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete(&text),
-        )],
+        blocks: vec![MessageBlock::Text(TextBlock::from_complete(&text))],
         usage: None,
     });
     app.enforce_history_retention_tracked();
@@ -120,11 +115,7 @@ fn push_user_message(app: &mut App, text: impl Into<String>) {
     let text = text.into();
     app.messages.push(ChatMessage {
         role: MessageRole::User,
-        blocks: vec![MessageBlock::Text(
-            text.clone(),
-            BlockCache::default(),
-            IncrementalMarkdown::from_complete(&text),
-        )],
+        blocks: vec![MessageBlock::Text(TextBlock::from_complete(&text))],
         usage: None,
     });
     app.enforce_history_retention_tracked();
@@ -208,8 +199,37 @@ mod tests {
         let app = App::test_default();
         let names: Vec<String> =
             supported_command_candidates(&app).into_iter().map(|c| c.primary).collect();
+        assert!(names.iter().any(|n| n == "/config"), "missing /config");
         assert!(names.iter().any(|n| n == "/login"), "missing /login");
         assert!(names.iter().any(|n| n == "/logout"), "missing /logout");
+    }
+
+    #[test]
+    fn config_without_args_opens_settings_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = App::test_default();
+        app.settings_home_override = Some(dir.path().to_path_buf());
+
+        let consumed = try_handle_submit(&mut app, "/config");
+
+        assert!(consumed);
+        assert_eq!(app.active_view, super::super::ActiveView::Config);
+    }
+
+    #[test]
+    fn config_with_extra_args_returns_usage_message() {
+        let mut app = App::test_default();
+
+        let consumed = try_handle_submit(&mut app, "/config extra");
+
+        assert!(consumed);
+        let Some(last) = app.messages.last() else {
+            panic!("expected usage message");
+        };
+        let Some(MessageBlock::Text(block)) = last.blocks.first() else {
+            panic!("expected text block");
+        };
+        assert_eq!(block.text, "Usage: /config");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -291,19 +311,18 @@ mod tests {
     }
 
     #[test]
-    fn model_argument_candidates_include_aliases() {
-        let app = App::test_default();
+    fn model_argument_candidates_are_dynamic() {
+        let mut app = App::test_default();
+        app.available_models = vec![
+            crate::agent::model::AvailableModel::new("sonnet", "Claude Sonnet")
+                .description("Balanced coding model"),
+            crate::agent::model::AvailableModel::new("opus", "Claude Opus"),
+        ];
         let candidates = argument_candidates(&app, "/model", 0);
-        for alias in ["default", "sonnet", "opus", "haiku", "sonnet[1m]", "opusplan"] {
-            assert!(candidates.iter().any(|c| c.insert_value == alias), "missing alias {alias}");
-        }
-    }
-
-    #[test]
-    fn model_argument_candidates_do_not_include_retired_37_alias() {
-        let app = App::test_default();
-        let candidates = argument_candidates(&app, "/model", 0);
-        assert!(!candidates.iter().any(|c| c.insert_value.contains("3-7")));
+        assert!(candidates.iter().any(|c| c.insert_value == "sonnet"));
+        assert!(candidates.iter().any(|c| c.primary == "Claude Sonnet"));
+        assert!(candidates.iter().any(|c| c.secondary.as_deref() == Some("Balanced coding model")));
+        assert!(candidates.iter().any(|c| c.insert_value == "opus"));
     }
 
     #[test]
@@ -384,10 +403,10 @@ mod tests {
             panic!("expected first message");
         };
         assert!(matches!(first.role, MessageRole::User));
-        let Some(MessageBlock::Text(text, _, _)) = first.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = first.blocks.first() else {
             panic!("expected user text block");
         };
-        assert_eq!(text, "/new-session");
+        assert_eq!(block.text, "/new-session");
     }
 
     #[test]
@@ -398,10 +417,10 @@ mod tests {
         let Some(last) = app.messages.last() else {
             panic!("expected usage message");
         };
-        let Some(MessageBlock::Text(text, _, _)) = last.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = last.blocks.first() else {
             panic!("expected text block");
         };
-        assert_eq!(text, "Usage: /resume <session_id>");
+        assert_eq!(block.text, "Usage: /resume <session_id>");
     }
 
     #[test]
@@ -416,10 +435,10 @@ mod tests {
             panic!("expected user message");
         };
         assert!(matches!(first.role, MessageRole::User));
-        let Some(MessageBlock::Text(text, _, _)) = first.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = first.blocks.first() else {
             panic!("expected text block");
         };
-        assert_eq!(text, "/resume abc-123");
+        assert_eq!(block.text, "/resume abc-123");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -559,10 +578,10 @@ mod tests {
             panic!("expected system message");
         };
         assert!(matches!(last.role, MessageRole::System(_)));
-        let Some(MessageBlock::Text(text, _, _)) = last.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = last.blocks.first() else {
             panic!("expected text block");
         };
-        assert_eq!(text, "Cannot compact: not connected yet.");
+        assert_eq!(block.text, "Cannot compact: not connected yet.");
     }
 
     #[test]
@@ -583,11 +602,7 @@ mod tests {
         let mut app = App::test_default();
         app.messages.push(ChatMessage {
             role: MessageRole::User,
-            blocks: vec![MessageBlock::Text(
-                "keep".into(),
-                BlockCache::default(),
-                IncrementalMarkdown::from_complete("keep"),
-            )],
+            blocks: vec![MessageBlock::Text(TextBlock::from_complete("keep"))],
             usage: None,
         });
 
@@ -598,10 +613,10 @@ mod tests {
             panic!("expected system usage message");
         };
         assert!(matches!(last.role, MessageRole::System(_)));
-        let Some(MessageBlock::Text(text, _, _)) = last.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = last.blocks.first() else {
             panic!("expected text block");
         };
-        assert_eq!(text, "Usage: /compact");
+        assert_eq!(block.text, "Usage: /compact");
     }
 
     #[test]
@@ -614,10 +629,10 @@ mod tests {
             panic!("expected system usage message");
         };
         assert!(matches!(last.role, MessageRole::System(_)));
-        let Some(MessageBlock::Text(text, _, _)) = last.blocks.first() else {
+        let Some(MessageBlock::Text(block)) = last.blocks.first() else {
             panic!("expected text block");
         };
-        assert_eq!(text, "Usage: /mode <id>");
+        assert_eq!(block.text, "Usage: /mode <id>");
     }
 
     #[test]

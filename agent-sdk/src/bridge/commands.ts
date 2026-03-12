@@ -6,6 +6,9 @@ import type {
   ModeInfo,
   ModeState,
   PermissionOutcome,
+  SessionEffortLevel,
+  SessionThinkingMode,
+  SessionLaunchSettings,
 } from "../types.js";
 
 const MODE_NAMES: Record<PermissionMode, string> = {
@@ -39,14 +42,6 @@ function expectString(record: Record<string, unknown>, key: string, context: str
   return value;
 }
 
-function expectBoolean(record: Record<string, unknown>, key: string, context: string): boolean {
-  const value = record[key];
-  if (typeof value !== "boolean") {
-    throw new Error(`${context}.${key} must be a boolean`);
-  }
-  return value;
-}
-
 function optionalString(
   record: Record<string, unknown>,
   key: string,
@@ -68,6 +63,60 @@ function optionalMetadata(record: Record<string, unknown>, key: string): Record<
     return {};
   }
   return asRecord(value, `${key} metadata`) as Record<string, Json>;
+}
+
+function optionalLaunchSettings(
+  record: Record<string, unknown>,
+  key: string,
+  context: string,
+): SessionLaunchSettings {
+  const value = record[key];
+  if (value === undefined || value === null) {
+    return {};
+  }
+  const parsed = asRecord(value, `${context}.${key}`);
+  const model = optionalString(parsed, "model", `${context}.${key}`);
+  const language = optionalString(parsed, "language", `${context}.${key}`);
+  const permissionMode = optionalString(parsed, "permission_mode", `${context}.${key}`);
+  const thinkingMode = optionalThinkingMode(parsed, "thinking_mode", `${context}.${key}`);
+  const effortLevel = optionalEffortLevel(parsed, "effort_level", `${context}.${key}`);
+  return {
+    ...(model ? { model } : {}),
+    ...(language ? { language } : {}),
+    ...(permissionMode ? { permission_mode: permissionMode } : {}),
+    ...(thinkingMode ? { thinking_mode: thinkingMode } : {}),
+    ...(effortLevel ? { effort_level: effortLevel } : {}),
+  };
+}
+
+function optionalThinkingMode(
+  record: Record<string, unknown>,
+  key: string,
+  context: string,
+): SessionThinkingMode | undefined {
+  const value = optionalString(record, key, context);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "adaptive" || value === "disabled") {
+    return value;
+  }
+  throw new Error(`${context}.${key} must be "adaptive" or "disabled" when provided`);
+}
+
+function optionalEffortLevel(
+  record: Record<string, unknown>,
+  key: string,
+  context: string,
+): SessionEffortLevel | undefined {
+  const value = optionalString(record, key, context);
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "low" || value === "medium" || value === "high") {
+    return value;
+  }
+  throw new Error(`${context}.${key} must be "low", "medium", or "high" when provided`);
 }
 
 function parsePromptChunks(
@@ -102,23 +151,22 @@ export function parseCommandEnvelope(line: string): { requestId?: string; comman
         return {
           command: "create_session",
           cwd: expectString(raw, "cwd", "create_session"),
-          yolo: expectBoolean(raw, "yolo", "create_session"),
-          model: optionalString(raw, "model", "create_session"),
           resume: optionalString(raw, "resume", "create_session"),
+          launch_settings: optionalLaunchSettings(raw, "launch_settings", "create_session"),
           metadata: optionalMetadata(raw, "metadata"),
         };
       case "resume_session":
         return {
           command: "resume_session",
           session_id: expectString(raw, "session_id", "resume_session"),
+          launch_settings: optionalLaunchSettings(raw, "launch_settings", "resume_session"),
           metadata: optionalMetadata(raw, "metadata"),
         };
       case "new_session":
         return {
           command: "new_session",
           cwd: expectString(raw, "cwd", "new_session"),
-          yolo: expectBoolean(raw, "yolo", "new_session"),
-          model: optionalString(raw, "model", "new_session"),
+          launch_settings: optionalLaunchSettings(raw, "launch_settings", "new_session"),
         };
       case "prompt":
         return {
