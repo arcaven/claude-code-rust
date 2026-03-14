@@ -58,6 +58,9 @@ pub(super) fn register_tool_call_scope(
     id: &str,
     sdk_tool_name: &str,
 ) -> ToolCallScope {
+    // TODO: When the bridge exposes an explicit Task/Agent <-> child-tool relation,
+    // redesign subagent rendering so the parent Task/Agent summary block becomes
+    // the primary visible surface and child agent tools are not rendered directly.
     let is_task = matches!(sdk_tool_name, "Task" | "Agent");
     let scope = if is_task {
         ToolCallScope::Task
@@ -132,6 +135,7 @@ fn build_tool_info_from_tool_call(
         title: shorten_tool_title(&tc.title, &app.cwd_raw),
         sdk_tool_name,
         raw_input: tc.raw_input,
+        output_metadata: tc.output_metadata,
         status: tc.status,
         content: tc.content,
         collapsed: app.tools_collapsed,
@@ -150,6 +154,7 @@ fn build_tool_info_from_tool_call(
         last_measured_layout_generation: 0,
         cache: BlockCache::default(),
         pending_permission: None,
+        pending_question: None,
     };
     if let Some(output) = initial_execute_output {
         tool_info.terminal_output_len = output.len();
@@ -199,6 +204,7 @@ fn update_existing_tool_call(app: &mut App, mi: usize, bi: usize, tool_info: &To
         changed |= sync_if_changed(&mut existing.content, &tool_info.content);
         changed |= sync_if_changed(&mut existing.sdk_tool_name, &tool_info.sdk_tool_name);
         changed |= sync_if_changed(&mut existing.raw_input, &tool_info.raw_input);
+        changed |= sync_if_changed(&mut existing.output_metadata, &tool_info.output_metadata);
         if changed {
             existing.mark_tool_call_layout_dirty();
             layout_dirty = true;

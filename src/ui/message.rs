@@ -1283,6 +1283,7 @@ mod tests {
             title: id.to_owned(),
             sdk_tool_name: sdk_tool_name.to_owned(),
             raw_input: None,
+            output_metadata: None,
             status,
             content: if text.is_empty() {
                 Vec::new()
@@ -1305,6 +1306,7 @@ mod tests {
             last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
+            pending_question: None,
         }
     }
 

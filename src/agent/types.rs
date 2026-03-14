@@ -60,6 +60,9 @@ pub struct AvailableModel {
     pub supports_effort: bool,
     #[serde(default)]
     pub supported_effort_levels: Vec<EffortLevel>,
+    pub supports_adaptive_thinking: Option<bool>,
+    pub supports_fast_mode: Option<bool>,
+    pub supports_auto_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +125,7 @@ pub struct ToolCall {
     pub content: Vec<ToolCallContent>,
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<String>,
+    pub output_metadata: Option<ToolOutputMetadata>,
     pub locations: Vec<ToolLocation>,
     pub meta: Option<serde_json::Value>,
 }
@@ -140,6 +144,7 @@ pub struct ToolCallUpdateFields {
     pub content: Option<Vec<ToolCallContent>>,
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<String>,
+    pub output_metadata: Option<ToolOutputMetadata>,
     pub locations: Option<Vec<ToolLocation>>,
     pub meta: Option<serde_json::Value>,
 }
@@ -150,11 +155,48 @@ pub struct ToolLocation {
     pub line: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ExitPlanModeOutputMetadata {
+    pub is_ultraplan: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TodoWriteOutputMetadata {
+    pub verification_nudge_needed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BashOutputMetadata {
+    pub assistant_auto_backgrounded: Option<bool>,
+    pub token_saver_active: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolOutputMetadata {
+    pub bash: Option<BashOutputMetadata>,
+    pub exit_plan_mode: Option<ExitPlanModeOutputMetadata>,
+    pub todo_write: Option<TodoWriteOutputMetadata>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolCallContent {
-    Content { content: ContentBlock },
-    Diff { old_path: String, new_path: String, old: String, new: String },
+    Content {
+        content: ContentBlock,
+    },
+    Diff {
+        old_path: String,
+        new_path: String,
+        old: String,
+        new: String,
+        repository: Option<String>,
+    },
+    McpResource {
+        uri: String,
+        mime_type: Option<String>,
+        text: Option<String>,
+        blob_saved_to: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,9 +281,46 @@ pub struct PermissionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub option_id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionPrompt {
+    pub question: String,
+    pub header: String,
+    pub multi_select: bool,
+    pub options: Vec<QuestionOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionRequest {
+    pub tool_call: ToolCall,
+    pub prompt: QuestionPrompt,
+    pub question_index: u64,
+    pub total_questions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnnotation {
+    pub preview: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum PermissionOutcome {
     Selected { option_id: String },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum QuestionOutcome {
+    Answered { selected_option_ids: Vec<String>, annotation: Option<QuestionAnnotation> },
     Cancelled,
 }
 

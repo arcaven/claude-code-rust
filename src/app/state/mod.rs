@@ -31,7 +31,7 @@ pub use messages::{
     TextBlockSpacing, WelcomeBlock,
 };
 pub use tool_call_info::{
-    InlinePermission, TerminalSnapshotMode, ToolCallInfo, is_execute_tool_name,
+    InlinePermission, InlineQuestion, TerminalSnapshotMode, ToolCallInfo, is_execute_tool_name,
 };
 pub use types::{
     AppStatus, CancelOrigin, HelpView, HistoryRetentionPolicy, HistoryRetentionStats, LoginHint,
@@ -259,6 +259,12 @@ impl App {
         if text.is_empty() {
             return;
         }
+        tracing::debug!(
+            text = %debug_paste_text(text),
+            pending_len = self.pending_paste_text.chars().count(),
+            had_pending_submit = self.pending_submit.is_some(),
+            "paste_queue: enqueue"
+        );
         self.pending_submit = None;
         if self.pending_paste_text.is_empty() {
             let continued_session = self.active_paste_session.and_then(|session| {
@@ -279,8 +285,22 @@ impl App {
                     placeholder_index: None,
                 }
             }));
+            if let Some(session) = self.pending_paste_session {
+                tracing::debug!(
+                    session_id = session.id,
+                    start_row = session.start.row,
+                    start_col = session.start.col,
+                    placeholder_index = ?session.placeholder_index,
+                    "paste_queue: opened session"
+                );
+            }
         }
         self.pending_paste_text.push_str(text);
+        tracing::debug!(
+            merged = %debug_paste_text(&self.pending_paste_text),
+            merged_len = self.pending_paste_text.chars().count(),
+            "paste_queue: merged pending text"
+        );
     }
 
     /// Mark one presented frame at `now`, updating smoothed FPS.
@@ -485,7 +505,7 @@ impl App {
     /// Returns the number of tool calls that were transitioned.
     pub fn finalize_in_progress_tool_calls(&mut self, new_status: model::ToolCallStatus) -> usize {
         let mut changed = 0usize;
-        let mut cleared_permission = false;
+        let mut cleared_interaction = false;
         let mut first_changed_idx: Option<usize> = None;
 
         for (msg_idx, msg) in self.messages.iter_mut().enumerate() {
@@ -499,7 +519,10 @@ impl App {
                         tc.status = new_status;
                         tc.mark_tool_call_layout_dirty();
                         if tc.pending_permission.take().is_some() {
-                            cleared_permission = true;
+                            cleared_interaction = true;
+                        }
+                        if tc.pending_question.take().is_some() {
+                            cleared_interaction = true;
                         }
                         first_changed_idx =
                             Some(first_changed_idx.map_or(msg_idx, |prev| prev.min(msg_idx)));
@@ -509,7 +532,7 @@ impl App {
             }
         }
 
-        if changed > 0 || cleared_permission {
+        if changed > 0 || cleared_interaction {
             if let Some(msg_idx) = first_changed_idx {
                 self.invalidate_layout(InvalidationLevel::Single(msg_idx));
             }
@@ -684,6 +707,22 @@ impl App {
         )
         .with_help(self.is_help_active())
     }
+}
+
+fn debug_paste_text(text: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let mut out = String::new();
+    let mut iter = text.chars();
+    for _ in 0..MAX_CHARS {
+        let Some(ch) = iter.next() else {
+            return out;
+        };
+        out.extend(ch.escape_default());
+    }
+    if iter.next().is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1017,6 +1056,7 @@ mod tests {
                 title: format!("tool {id}"),
                 sdk_tool_name: "Read".to_owned(),
                 raw_input: None,
+                output_metadata: None,
                 status,
                 content: Vec::new(),
                 collapsed: false,
@@ -1035,6 +1075,7 @@ mod tests {
                 last_measured_layout_generation: 0,
                 cache: BlockCache::default(),
                 pending_permission: None,
+                pending_question: None,
             }))],
             usage: None,
         }
@@ -1049,6 +1090,7 @@ mod tests {
                 title: format!("tool {id}"),
                 sdk_tool_name: "Read".to_owned(),
                 raw_input: None,
+                output_metadata: None,
                 status: model::ToolCallStatus::Completed,
                 content: Vec::new(),
                 collapsed: false,
@@ -1076,6 +1118,7 @@ mod tests {
                     selected_index: 0,
                     focused: false,
                 }),
+                pending_question: None,
             }))],
             usage: None,
         }

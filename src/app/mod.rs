@@ -21,6 +21,7 @@ mod connect;
 mod dialog;
 mod events;
 mod focus;
+mod inline_interactions;
 pub(crate) mod input;
 mod input_submit;
 mod keys;
@@ -28,6 +29,7 @@ pub(crate) mod mention;
 mod notify;
 pub(crate) mod paste_burst;
 mod permissions;
+mod questions;
 mod selection;
 mod service_status_check;
 pub(crate) mod slash;
@@ -55,11 +57,11 @@ pub use service_status_check::start_service_status_check;
 pub(crate) use state::cache_metrics;
 pub use state::{
     App, AppStatus, BlockCache, CacheMetrics, CancelOrigin, ChatMessage, ChatViewport, HelpView,
-    IncrementalMarkdown, InlinePermission, InvalidationLevel, LoginHint, MessageBlock, MessageRole,
-    MessageUsage, ModeInfo, ModeState, PasteSessionState, PendingCommandAck, RecentSessionInfo,
-    SelectionKind, SelectionPoint, SelectionState, SessionUsageState, SystemSeverity,
-    TerminalSnapshotMode, TextBlock, TextBlockSpacing, TodoItem, TodoStatus, ToolCallInfo,
-    ToolCallScope, WelcomeBlock, is_execute_tool_name,
+    IncrementalMarkdown, InlinePermission, InlineQuestion, InvalidationLevel, LoginHint,
+    MessageBlock, MessageRole, MessageUsage, ModeInfo, ModeState, PasteSessionState,
+    PendingCommandAck, RecentSessionInfo, SelectionKind, SelectionPoint, SelectionState,
+    SessionUsageState, SystemSeverity, TerminalSnapshotMode, TextBlock, TextBlockSpacing, TodoItem,
+    TodoStatus, ToolCallInfo, ToolCallScope, WelcomeBlock, is_execute_tool_name,
 };
 pub use trust::TrustSelection;
 pub use update_check::start_update_check;
@@ -261,6 +263,11 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
                     ),
                 ));
             }
+            if let Some(pending) = tc.pending_question.take() {
+                let _ = pending.response_tx.send(model::RequestQuestionResponse::new(
+                    model::RequestQuestionOutcome::Cancelled,
+                ));
+            }
         }
     }
 
@@ -320,6 +327,13 @@ fn finalize_pending_paste_event(app: &mut App) {
     if pasted.is_empty() {
         return;
     }
+    tracing::debug!(
+        text = %debug_paste_text(&pasted),
+        len = pasted.chars().count(),
+        cursor_row = app.input.cursor_row(),
+        cursor_col = app.input.cursor_col(),
+        "paste_finalize: begin"
+    );
 
     let session = app.pending_paste_session.take().unwrap_or_else(|| {
         let id = app.next_paste_session_id;
@@ -330,9 +344,21 @@ fn finalize_pending_paste_event(app: &mut App) {
             placeholder_index: None,
         }
     });
+    tracing::debug!(
+        session_id = session.id,
+        start_row = session.start.row,
+        start_col = session.start.col,
+        placeholder_index = ?session.placeholder_index,
+        "paste_finalize: session"
+    );
 
     if session.placeholder_index.is_none() {
         let end = SelectionPoint { row: app.input.cursor_row(), col: app.input.cursor_col() };
+        tracing::debug!(
+            end_row = end.row,
+            end_col = end.col,
+            "paste_finalize: strip leaked inline range"
+        );
         strip_input_range(app, session.start, end);
     }
 
@@ -348,6 +374,8 @@ fn finalize_pending_paste_event(app: &mut App) {
         && app.input.append_to_active_paste_block(&pasted);
     if appended {
         app.active_paste_session = Some(session);
+        app.needs_redraw = true;
+        tracing::debug!("paste_finalize: appended to active placeholder");
         return;
     }
 
@@ -359,10 +387,17 @@ fn finalize_pending_paste_event(app: &mut App) {
         });
         app.active_paste_session =
             Some(state::PasteSessionState { placeholder_index: idx, ..session });
+        tracing::debug!(char_count, placeholder_index = ?idx, "paste_finalize: inserted placeholder");
     } else {
         app.input.insert_str(&pasted);
         app.active_paste_session = None;
+        tracing::debug!(
+            char_count,
+            lines = app.input.lines().len(),
+            "paste_finalize: inserted inline text"
+        );
     }
+    app.needs_redraw = true;
 }
 
 fn cursor_gt(a: SelectionPoint, b: SelectionPoint) -> bool {
@@ -416,6 +451,22 @@ fn apply_merged_input_snapshot(app: &mut App, merged: &str, cursor_offset: usize
     }
 
     app.input.replace_lines_and_cursor(lines, cursor.row, cursor.col);
+}
+
+fn debug_paste_text(text: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let mut out = String::new();
+    let mut iter = text.chars();
+    for _ in 0..MAX_CHARS {
+        let Some(ch) = iter.next() else {
+            return out;
+        };
+        out.extend(ch.escape_default());
+    }
+    if iter.next().is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 fn strip_input_range(app: &mut App, start: SelectionPoint, end: SelectionPoint) {
@@ -512,6 +563,71 @@ mod tests {
         finalize_pending_paste_event(&mut app);
 
         assert_eq!(app.input.lines(), vec!["x".repeat(1000)]);
+    }
+
+    #[test]
+    fn pending_paste_finalization_marks_redraw() {
+        let mut app = App::test_default();
+        app.needs_redraw = false;
+        app.pending_paste_text = "hello\nworld".to_owned();
+
+        finalize_pending_paste_event(&mut app);
+
+        assert!(app.needs_redraw);
+        assert_eq!(app.input.lines(), vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn suppressed_enter_preserves_multiline_inline_paste() {
+        let mut app = App::test_default();
+        let t0 = Instant::now();
+
+        assert_eq!(app.paste_burst.on_char('a', t0), paste_burst::CharAction::Passthrough('a'));
+        let _ = app.input.textarea_insert_char('a');
+        assert_eq!(
+            app.paste_burst.on_char('b', t0 + Duration::from_millis(2)),
+            paste_burst::CharAction::Consumed
+        );
+        assert_eq!(
+            app.paste_burst.on_char('c', t0 + Duration::from_millis(4)),
+            paste_burst::CharAction::RetroCapture(1)
+        );
+        let _ = app.input.textarea_delete_char_before();
+
+        let t_flush = t0 + Duration::from_millis(200);
+        assert_eq!(
+            app.paste_burst.tick(t_flush),
+            Some(paste_burst::FlushAction::EmitPaste("abc".to_owned()))
+        );
+        app.queue_paste_text("abc");
+        finalize_pending_paste_event(&mut app);
+        assert_eq!(app.input.text(), "abc");
+
+        let t_enter = t_flush + Duration::from_millis(10);
+        assert!(app.paste_burst.on_enter(t_enter));
+        assert_eq!(
+            app.paste_burst.on_char('d', t_enter + Duration::from_millis(1)),
+            paste_burst::CharAction::Consumed
+        );
+        assert_eq!(
+            app.paste_burst.on_char('e', t_enter + Duration::from_millis(2)),
+            paste_burst::CharAction::Consumed
+        );
+        assert_eq!(
+            app.paste_burst.on_char('f', t_enter + Duration::from_millis(3)),
+            paste_burst::CharAction::Consumed
+        );
+
+        let t_second_flush = t_enter + Duration::from_millis(200);
+        assert_eq!(
+            app.paste_burst.tick(t_second_flush),
+            Some(paste_burst::FlushAction::EmitPaste("\ndef".to_owned()))
+        );
+        app.queue_paste_text("\ndef");
+        finalize_pending_paste_event(&mut app);
+
+        assert_eq!(app.input.lines(), vec!["abc", "def"]);
+        assert_eq!(app.input.text(), "abc\ndef");
     }
 
     #[test]

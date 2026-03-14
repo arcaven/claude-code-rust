@@ -6,8 +6,7 @@ import type {
   ModeInfo,
   ModeState,
   PermissionOutcome,
-  SessionEffortLevel,
-  SessionThinkingMode,
+  QuestionOutcome,
   SessionLaunchSettings,
 } from "../types.js";
 
@@ -75,48 +74,50 @@ function optionalLaunchSettings(
     return {};
   }
   const parsed = asRecord(value, `${context}.${key}`);
-  const model = optionalString(parsed, "model", `${context}.${key}`);
   const language = optionalString(parsed, "language", `${context}.${key}`);
-  const permissionMode = optionalString(parsed, "permission_mode", `${context}.${key}`);
-  const thinkingMode = optionalThinkingMode(parsed, "thinking_mode", `${context}.${key}`);
-  const effortLevel = optionalEffortLevel(parsed, "effort_level", `${context}.${key}`);
+  const settings = optionalJsonObject(parsed, "settings", `${context}.${key}`);
+  const agentProgressSummaries = optionalBoolean(
+    parsed,
+    "agent_progress_summaries",
+    `${context}.${key}`,
+  );
   return {
-    ...(model ? { model } : {}),
     ...(language ? { language } : {}),
-    ...(permissionMode ? { permission_mode: permissionMode } : {}),
-    ...(thinkingMode ? { thinking_mode: thinkingMode } : {}),
-    ...(effortLevel ? { effort_level: effortLevel } : {}),
+    ...(settings ? { settings } : {}),
+    ...(agentProgressSummaries !== undefined
+      ? { agent_progress_summaries: agentProgressSummaries }
+      : {}),
   };
 }
 
-function optionalThinkingMode(
+function optionalBoolean(
   record: Record<string, unknown>,
   key: string,
   context: string,
-): SessionThinkingMode | undefined {
-  const value = optionalString(record, key, context);
-  if (value === undefined) {
+): boolean | undefined {
+  const value = record[key];
+  if (value === undefined || value === null) {
     return undefined;
   }
-  if (value === "adaptive" || value === "disabled") {
-    return value;
+  if (typeof value !== "boolean") {
+    throw new Error(`${context}.${key} must be a boolean when provided`);
   }
-  throw new Error(`${context}.${key} must be "adaptive" or "disabled" when provided`);
+  return value;
 }
 
-function optionalEffortLevel(
+function optionalJsonObject(
   record: Record<string, unknown>,
   key: string,
   context: string,
-): SessionEffortLevel | undefined {
-  const value = optionalString(record, key, context);
-  if (value === undefined) {
+): { [key: string]: Json } | undefined {
+  const value = record[key];
+  if (value === undefined || value === null) {
     return undefined;
   }
-  if (value === "low" || value === "medium" || value === "high") {
-    return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${context}.${key} must be an object when provided`);
   }
-  throw new Error(`${context}.${key} must be "low", "medium", or "high" when provided`);
+  return value as { [key: string]: Json };
 }
 
 function parsePromptChunks(
@@ -191,6 +192,18 @@ export function parseCommandEnvelope(line: string): { requestId?: string; comman
           session_id: expectString(raw, "session_id", "set_mode"),
           mode: expectString(raw, "mode", "set_mode"),
         };
+      case "generate_session_title":
+        return {
+          command: "generate_session_title",
+          session_id: expectString(raw, "session_id", "generate_session_title"),
+          description: expectString(raw, "description", "generate_session_title"),
+        };
+      case "rename_session":
+        return {
+          command: "rename_session",
+          session_id: expectString(raw, "session_id", "rename_session"),
+          title: expectString(raw, "title", "rename_session"),
+        };
       case "get_status_snapshot":
         return {
           command: "get_status_snapshot",
@@ -216,6 +229,33 @@ export function parseCommandEnvelope(line: string): { requestId?: string; comman
           outcome: parsedOutcome,
         };
       }
+      case "question_response": {
+        const outcome = asRecord(raw.outcome, "question_response.outcome");
+        const outcomeType = expectString(outcome, "outcome", "question_response.outcome");
+        if (outcomeType !== "answered" && outcomeType !== "cancelled") {
+          throw new Error("question_response.outcome.outcome must be 'answered' or 'cancelled'");
+        }
+        const parsedOutcome: QuestionOutcome =
+          outcomeType === "answered"
+            ? {
+                outcome: "answered",
+                selected_option_ids: expectStringArray(
+                  outcome,
+                  "selected_option_ids",
+                  "question_response.outcome",
+                ),
+                ...(outcome.annotation === undefined || outcome.annotation === null
+                  ? {}
+                  : { annotation: parseQuestionAnnotation(outcome.annotation) }),
+              }
+            : { outcome: "cancelled" };
+        return {
+          command: "question_response",
+          session_id: expectString(raw, "session_id", "question_response"),
+          tool_call_id: expectString(raw, "tool_call_id", "question_response"),
+          outcome: parsedOutcome,
+        };
+      }
       case "shutdown":
         return { command: "shutdown" };
       default:
@@ -224,6 +264,33 @@ export function parseCommandEnvelope(line: string): { requestId?: string; comman
   })();
 
   return { requestId, command };
+}
+
+function expectStringArray(
+  record: Record<string, unknown>,
+  key: string,
+  context: string,
+): string[] {
+  const value = record[key];
+  if (!Array.isArray(value)) {
+    throw new Error(`${context}.${key} must be an array`);
+  }
+  return value.map((entry, index) => {
+    if (typeof entry !== "string") {
+      throw new Error(`${context}.${key}[${index}] must be a string`);
+    }
+    return entry;
+  });
+}
+
+function parseQuestionAnnotation(value: unknown): { preview?: string; notes?: string } {
+  const record = asRecord(value, "question_response.outcome.annotation");
+  const preview = optionalString(record, "preview", "question_response.outcome.annotation");
+  const notes = optionalString(record, "notes", "question_response.outcome.annotation");
+  return {
+    ...(preview !== undefined ? { preview } : {}),
+    ...(notes !== undefined ? { notes } : {}),
+  };
 }
 
 export function toPermissionMode(mode: string): PermissionMode | null {

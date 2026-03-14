@@ -13,16 +13,15 @@ import {
   type Query,
   type SDKUserMessage,
   type SettingSource,
-  type ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
 import type {
   AvailableCommand,
-  EffortLevel,
   AvailableModel,
   BridgeCommand,
   FastModeState,
   PermissionOutcome,
   PermissionRequest,
+  QuestionOutcome,
   SessionLaunchSettings,
   SessionUpdate,
   ToolCall,
@@ -66,6 +65,12 @@ export type PendingPermission = {
   suggestions?: PermissionUpdate[];
 };
 
+export type PendingQuestion = {
+  onOutcome: (outcome: QuestionOutcome) => void;
+  toolName: string;
+  inputData: Record<string, unknown>;
+};
+
 export type SessionState = {
   sessionId: string;
   cwd: string;
@@ -81,6 +86,7 @@ export type SessionState = {
   toolCalls: Map<string, ToolCall>;
   taskToolUseIds: Map<string, string>;
   pendingPermissions: Map<string, PendingPermission>;
+  pendingQuestions: Map<string, PendingQuestion>;
   authHintSent: boolean;
   lastAvailableAgentsSignature?: string;
   lastAssistantError?: string;
@@ -92,6 +98,12 @@ export const sessions = new Map<string, SessionState>();
 const DEFAULT_SETTING_SOURCES: SettingSource[] = ["user", "project", "local"];
 const DEFAULT_MODEL_NAME = "default";
 const DEFAULT_PERMISSION_MODE: PermissionMode = "default";
+
+function settingsObjectFromLaunchSettings(
+  launchSettings: SessionLaunchSettings,
+): Record<string, unknown> | undefined {
+  return launchSettings.settings;
+}
 
 export function sessionById(sessionId: string): SessionState | null {
   return sessions.get(sessionId) ?? null;
@@ -114,6 +126,10 @@ export async function closeSession(session: SessionState): Promise<void> {
     pending.onOutcome?.({ outcome: "cancelled" });
   }
   session.pendingPermissions.clear();
+  for (const pending of session.pendingQuestions.values()) {
+    pending.onOutcome({ outcome: "cancelled" });
+  }
+  session.pendingQuestions.clear();
 }
 
 export async function closeAllSessions(): Promise<void> {
@@ -153,7 +169,6 @@ export async function createSession(params: {
       return await requestAskUserQuestionAnswers(
         session,
         toolUseId,
-        toolName,
         inputData,
         existing,
       );
@@ -225,6 +240,7 @@ export async function createSession(params: {
     toolCalls: new Map<string, ToolCall>(),
     taskToolUseIds: new Map<string, string>(),
     pendingPermissions: new Map<string, PendingPermission>(),
+    pendingQuestions: new Map<string, PendingQuestion>(),
     authHintSent: false,
     ...(params.resumeUpdates && params.resumeUpdates.length > 0
       ? { resumeUpdates: params.resumeUpdates }
@@ -309,8 +325,8 @@ type QueryOptionsBuilderParams = {
   sessionIdForLogs: () => string;
 };
 
-function permissionModeFromLaunchSettings(rawMode: string | undefined): PermissionMode | undefined {
-  if (rawMode === undefined) {
+function permissionModeFromSettingsValue(rawMode: unknown): PermissionMode | undefined {
+  if (typeof rawMode !== "string") {
     return undefined;
   }
   switch (rawMode) {
@@ -321,42 +337,23 @@ function permissionModeFromLaunchSettings(rawMode: string | undefined): Permissi
     case "dontAsk":
       return rawMode;
     default:
-      throw new Error(`unsupported launch_settings.permission_mode: ${rawMode}`);
+      throw new Error(`unsupported launch_settings.settings.permissions.defaultMode: ${rawMode}`);
   }
 }
 
 function initialSessionModel(launchSettings: SessionLaunchSettings): string {
-  return launchSettings.model?.trim() || DEFAULT_MODEL_NAME;
+  const settings = settingsObjectFromLaunchSettings(launchSettings);
+  const model = typeof settings?.model === "string" ? settings.model.trim() : "";
+  return model || DEFAULT_MODEL_NAME;
 }
 
 function initialSessionMode(launchSettings: SessionLaunchSettings): PermissionMode {
-  return permissionModeFromLaunchSettings(launchSettings.permission_mode) ?? DEFAULT_PERMISSION_MODE;
-}
-
-function thinkingConfigFromLaunchSettings(
-  launchSettings: SessionLaunchSettings,
-): ThinkingConfig | undefined {
-  switch (launchSettings.thinking_mode) {
-    case undefined:
-      return undefined;
-    case "adaptive":
-      return { type: "adaptive" };
-    case "disabled":
-      return { type: "disabled" };
-    default:
-      throw new Error(
-        `unsupported launch_settings.thinking_mode: ${String(launchSettings.thinking_mode)}`,
-      );
-  }
-}
-
-function effortFromLaunchSettings(
-  launchSettings: SessionLaunchSettings,
-): EffortLevel | undefined {
-  if (launchSettings.thinking_mode !== "adaptive") {
-    return undefined;
-  }
-  return launchSettings.effort_level;
+  const settings = settingsObjectFromLaunchSettings(launchSettings);
+  const permissions =
+    settings?.permissions && typeof settings.permissions === "object" && !Array.isArray(settings.permissions)
+      ? (settings.permissions as Record<string, unknown>)
+      : undefined;
+  return permissionModeFromSettingsValue(permissions?.defaultMode) ?? DEFAULT_PERMISSION_MODE;
 }
 
 function systemPromptFromLaunchSettings(
@@ -383,22 +380,18 @@ function systemPromptFromLaunchSettings(
 }
 
 export function buildQueryOptions(params: QueryOptionsBuilderParams) {
-  const permissionMode = permissionModeFromLaunchSettings(
-    params.launchSettings.permission_mode,
-  );
-  const thinking = thinkingConfigFromLaunchSettings(params.launchSettings);
-  const effort = effortFromLaunchSettings(params.launchSettings);
   const systemPrompt = systemPromptFromLaunchSettings(params.launchSettings);
   return {
     cwd: params.cwd,
     includePartialMessages: true,
     executable: "node" as const,
     ...(params.resume ? {} : { sessionId: params.provisionalSessionId }),
-    ...(params.launchSettings.model ? { model: params.launchSettings.model } : {}),
+    ...(params.launchSettings.settings ? { settings: params.launchSettings.settings } : {}),
+    toolConfig: { askUserQuestion: { previewFormat: "markdown" as const } },
     ...(systemPrompt ? { systemPrompt } : {}),
-    ...(permissionMode ? { permissionMode } : {}),
-    ...(thinking ? { thinking } : {}),
-    ...(effort ? { effort } : {}),
+    ...(params.launchSettings.agent_progress_summaries !== undefined
+      ? { agentProgressSummaries: params.launchSettings.agent_progress_summaries }
+      : {}),
     ...(params.claudeCodeExecutable
       ? { pathToClaudeCodeExecutable: params.claudeCodeExecutable }
       : {}),
@@ -466,7 +459,7 @@ export function buildQueryOptions(params: QueryOptionsBuilderParams) {
   };
 }
 
-function mapAvailableModels(models: ModelInfo[] | undefined): AvailableModel[] {
+export function mapAvailableModels(models: ModelInfo[] | undefined): AvailableModel[] {
   if (!Array.isArray(models)) {
     return [];
   }
@@ -490,6 +483,15 @@ function mapAvailableModels(models: ModelInfo[] | undefined): AvailableModel[] {
               level === "low" || level === "medium" || level === "high",
           )
         : [],
+      ...(typeof entry.supportsAdaptiveThinking === "boolean"
+        ? { supports_adaptive_thinking: entry.supportsAdaptiveThinking }
+        : {}),
+      ...(typeof entry.supportsFastMode === "boolean"
+        ? { supports_fast_mode: entry.supportsFastMode }
+        : {}),
+      ...(typeof entry.supportsAutoMode === "boolean"
+        ? { supports_auto_mode: entry.supportsAutoMode }
+        : {}),
       ...(typeof entry.description === "string" && entry.description.trim().length > 0
         ? { description: entry.description }
         : {}),
@@ -560,4 +562,23 @@ export function handlePermissionResponse(command: Extract<BridgeCommand, { comma
     );
   }
   resolver.resolve(permissionResult);
+}
+
+export function handleQuestionResponse(command: Extract<BridgeCommand, { command: "question_response" }>): void {
+  const session = sessionById(command.session_id);
+  if (!session) {
+    logPermissionDebug(
+      `question response dropped: unknown session session_id=${command.session_id} tool_call_id=${command.tool_call_id}`,
+    );
+    return;
+  }
+  const resolver = session.pendingQuestions.get(command.tool_call_id);
+  if (!resolver) {
+    logPermissionDebug(
+      `question response dropped: no pending resolver session_id=${command.session_id} tool_call_id=${command.tool_call_id}`,
+    );
+    return;
+  }
+  session.pendingQuestions.delete(command.tool_call_id);
+  resolver.onOutcome(command.outcome);
 }

@@ -93,6 +93,9 @@ pub(super) fn map_available_models(
                 mapped = mapped.description(description);
             }
             mapped = mapped.supports_effort(model_info.supports_effort);
+            mapped = mapped.supports_adaptive_thinking(model_info.supports_adaptive_thinking);
+            mapped = mapped.supports_fast_mode(model_info.supports_fast_mode);
+            mapped = mapped.supports_auto_mode(model_info.supports_auto_mode);
             if !model_info.supported_effort_levels.is_empty() {
                 mapped = mapped.supported_effort_levels(
                     model_info
@@ -251,6 +254,46 @@ pub(super) fn map_permission_request(
     )
 }
 
+pub(super) fn map_question_request(
+    session_id: &str,
+    request: types::QuestionRequest,
+) -> (model::RequestQuestionRequest, String) {
+    let tool_call_id = request.tool_call.tool_call_id.clone();
+    let tool_call_meta = request.tool_call.meta.clone();
+    let tool_call_fields = convert_tool_call_to_fields(request.tool_call);
+    let mut tool_call_update = model::ToolCallUpdate::new(tool_call_id.clone(), tool_call_fields);
+    if let Some(meta) = tool_call_meta {
+        tool_call_update = tool_call_update.meta(meta);
+    }
+
+    let prompt = model::QuestionPrompt::new(
+        request.prompt.question,
+        request.prompt.header,
+        request.prompt.multi_select,
+        request
+            .prompt
+            .options
+            .into_iter()
+            .map(|option| {
+                model::QuestionOption::new(option.option_id, option.label)
+                    .description(option.description)
+                    .preview(option.preview)
+            })
+            .collect(),
+    );
+
+    (
+        model::RequestQuestionRequest::new(
+            model::SessionId::new(session_id),
+            tool_call_update,
+            prompt,
+            usize::try_from(request.question_index).unwrap_or(0),
+            usize::try_from(request.total_questions).unwrap_or(0),
+        ),
+        tool_call_id,
+    )
+}
+
 pub(super) fn convert_content_block(content: types::ContentBlock) -> Option<model::ContentBlock> {
     match content {
         types::ContentBlock::Text { text } => {
@@ -270,6 +313,7 @@ pub(super) fn convert_tool_call(tool_call: types::ToolCall) -> model::ToolCall {
         content,
         raw_input,
         raw_output,
+        output_metadata,
         locations,
         meta,
     } = tool_call;
@@ -297,6 +341,9 @@ pub(super) fn convert_tool_call(tool_call: types::ToolCall) -> model::ToolCall {
 
     if let Some(raw_output) = raw_output {
         tc = tc.raw_output(serde_json::Value::String(raw_output));
+    }
+    if let Some(output_metadata) = output_metadata {
+        tc = tc.output_metadata(convert_tool_output_metadata(output_metadata));
     }
     if let Some(meta) = meta {
         tc = tc.meta(meta);
@@ -348,6 +395,9 @@ pub(super) fn convert_tool_call_to_fields(
     if let Some(raw_output) = tool_call.raw_output {
         fields = fields.raw_output(serde_json::Value::String(raw_output));
     }
+    if let Some(output_metadata) = tool_call.output_metadata {
+        fields = fields.output_metadata(convert_tool_output_metadata(output_metadata));
+    }
 
     fields
 }
@@ -376,6 +426,9 @@ pub(super) fn convert_tool_call_update_fields(
     if let Some(raw_output) = fields.raw_output {
         out = out.raw_output(serde_json::Value::String(raw_output));
     }
+    if let Some(output_metadata) = fields.output_metadata {
+        out = out.output_metadata(convert_tool_output_metadata(output_metadata));
+    }
     if let Some(locations) = fields.locations {
         out = out.locations(
             locations
@@ -394,6 +447,24 @@ pub(super) fn convert_tool_call_update_fields(
     out
 }
 
+fn convert_tool_output_metadata(
+    output_metadata: types::ToolOutputMetadata,
+) -> model::ToolOutputMetadata {
+    model::ToolOutputMetadata::new()
+        .bash(output_metadata.bash.map(|bash| {
+            model::BashOutputMetadata::new()
+                .assistant_auto_backgrounded(bash.assistant_auto_backgrounded)
+                .token_saver_active(bash.token_saver_active)
+        }))
+        .exit_plan_mode(output_metadata.exit_plan_mode.map(|exit_plan_mode| {
+            model::ExitPlanModeOutputMetadata::new().ultraplan(exit_plan_mode.is_ultraplan)
+        }))
+        .todo_write(output_metadata.todo_write.map(|todo_write| {
+            model::TodoWriteOutputMetadata::new()
+                .verification_nudge_needed(todo_write.verification_nudge_needed)
+        }))
+}
+
 fn convert_tool_call_content(
     tool_content: types::ToolCallContent,
 ) -> Option<model::ToolCallContent> {
@@ -402,8 +473,18 @@ fn convert_tool_call_content(
             let block = convert_content_block(content)?;
             Some(model::ToolCallContent::Content(model::Content::new(block)))
         }
-        types::ToolCallContent::Diff { old_path: _, new_path, old, new } => {
-            Some(model::ToolCallContent::Diff(model::Diff::new(new_path, new).old_text(Some(old))))
+        types::ToolCallContent::Diff { old_path: _, new_path, old, new, repository } => {
+            Some(model::ToolCallContent::Diff(
+                model::Diff::new(new_path, new).old_text(Some(old)).repository(repository),
+            ))
+        }
+        types::ToolCallContent::McpResource { uri, mime_type, text, blob_saved_to } => {
+            Some(model::ToolCallContent::McpResource(
+                model::McpResource::new(uri)
+                    .mime_type(mime_type)
+                    .text(text)
+                    .blob_saved_to(blob_saved_to),
+            ))
         }
     }
 }
@@ -448,5 +529,249 @@ pub(super) fn convert_mode_state(mode: types::ModeState) -> ModeState {
         current_mode_id: mode.current_mode_id,
         current_mode_name: mode.current_mode_name,
         available_modes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        convert_tool_call, convert_tool_call_update_fields, map_available_models,
+        map_question_request,
+    };
+    use crate::agent::{model, types};
+
+    #[test]
+    fn map_available_models_preserves_optional_fast_and_auto_metadata() {
+        let mapped = map_available_models(vec![
+            types::AvailableModel {
+                id: "sonnet".to_owned(),
+                display_name: "Claude Sonnet".to_owned(),
+                description: Some("Balanced model".to_owned()),
+                supports_effort: true,
+                supported_effort_levels: vec![
+                    types::EffortLevel::Low,
+                    types::EffortLevel::Medium,
+                    types::EffortLevel::High,
+                ],
+                supports_adaptive_thinking: Some(true),
+                supports_fast_mode: Some(true),
+                supports_auto_mode: Some(false),
+            },
+            types::AvailableModel {
+                id: "haiku".to_owned(),
+                display_name: "Claude Haiku".to_owned(),
+                description: None,
+                supports_effort: false,
+                supported_effort_levels: Vec::new(),
+                supports_adaptive_thinking: None,
+                supports_fast_mode: None,
+                supports_auto_mode: None,
+            },
+        ]);
+
+        assert_eq!(
+            mapped,
+            vec![
+                model::AvailableModel::new("sonnet", "Claude Sonnet")
+                    .description("Balanced model")
+                    .supports_effort(true)
+                    .supported_effort_levels(vec![
+                        model::EffortLevel::Low,
+                        model::EffortLevel::Medium,
+                        model::EffortLevel::High,
+                    ])
+                    .supports_adaptive_thinking(Some(true))
+                    .supports_fast_mode(Some(true))
+                    .supports_auto_mode(Some(false)),
+                model::AvailableModel::new("haiku", "Claude Haiku")
+                    .supports_adaptive_thinking(None)
+                    .supports_fast_mode(None)
+                    .supports_auto_mode(None),
+            ]
+        );
+    }
+
+    #[test]
+    fn map_question_request_preserves_preview_and_annotation_shape() {
+        let (request, tool_call_id) = map_question_request(
+            "session-1",
+            types::QuestionRequest {
+                tool_call: types::ToolCall {
+                    tool_call_id: "tool-1".to_owned(),
+                    title: "Pick target".to_owned(),
+                    kind: "other".to_owned(),
+                    status: "in_progress".to_owned(),
+                    content: Vec::new(),
+                    raw_input: Some(serde_json::json!({ "source": "ask_user_question" })),
+                    raw_output: None,
+                    output_metadata: None,
+                    locations: Vec::new(),
+                    meta: Some(
+                        serde_json::json!({ "claudeCode": { "toolName": "AskUserQuestion" } }),
+                    ),
+                },
+                prompt: types::QuestionPrompt {
+                    question: "Where should this roll out?".to_owned(),
+                    header: "Target".to_owned(),
+                    multi_select: true,
+                    options: vec![
+                        types::QuestionOption {
+                            option_id: "question_0".to_owned(),
+                            label: "Staging".to_owned(),
+                            description: Some("Validate in staging first".to_owned()),
+                            preview: Some("Deploy to staging first.".to_owned()),
+                        },
+                        types::QuestionOption {
+                            option_id: "question_1".to_owned(),
+                            label: "Production".to_owned(),
+                            description: Some("Customer-facing rollout".to_owned()),
+                            preview: None,
+                        },
+                    ],
+                },
+                question_index: 1,
+                total_questions: 3,
+            },
+        );
+
+        assert_eq!(tool_call_id, "tool-1");
+        assert_eq!(
+            request,
+            model::RequestQuestionRequest::new(
+                model::SessionId::new("session-1"),
+                model::ToolCallUpdate::new(
+                    "tool-1",
+                    model::ToolCallUpdateFields::new()
+                        .title("Pick target")
+                        .kind(model::ToolKind::Other)
+                        .status(model::ToolCallStatus::InProgress)
+                        .content(Vec::new())
+                        .raw_input(serde_json::json!({ "source": "ask_user_question" }))
+                        .locations(Vec::new()),
+                )
+                .meta(serde_json::json!({ "claudeCode": { "toolName": "AskUserQuestion" } })),
+                model::QuestionPrompt::new(
+                    "Where should this roll out?",
+                    "Target",
+                    true,
+                    vec![
+                        model::QuestionOption::new("question_0", "Staging")
+                            .description(Some("Validate in staging first".to_owned()))
+                            .preview(Some("Deploy to staging first.".to_owned())),
+                        model::QuestionOption::new("question_1", "Production")
+                            .description(Some("Customer-facing rollout".to_owned()))
+                            .preview(None),
+                    ],
+                ),
+                1,
+                3,
+            )
+        );
+    }
+
+    #[test]
+    fn convert_tool_call_update_fields_preserves_output_metadata() {
+        let fields = convert_tool_call_update_fields(types::ToolCallUpdateFields {
+            status: Some("completed".to_owned()),
+            output_metadata: Some(types::ToolOutputMetadata {
+                bash: Some(types::BashOutputMetadata {
+                    assistant_auto_backgrounded: Some(true),
+                    token_saver_active: Some(true),
+                }),
+                exit_plan_mode: Some(types::ExitPlanModeOutputMetadata {
+                    is_ultraplan: Some(true),
+                }),
+                todo_write: Some(types::TodoWriteOutputMetadata {
+                    verification_nudge_needed: Some(true),
+                }),
+            }),
+            ..types::ToolCallUpdateFields::default()
+        });
+
+        assert_eq!(
+            fields.output_metadata,
+            Some(
+                model::ToolOutputMetadata::new()
+                    .bash(Some(
+                        model::BashOutputMetadata::new()
+                            .assistant_auto_backgrounded(Some(true))
+                            .token_saver_active(Some(true)),
+                    ))
+                    .exit_plan_mode(Some(
+                        model::ExitPlanModeOutputMetadata::new().ultraplan(Some(true)),
+                    ))
+                    .todo_write(Some(
+                        model::TodoWriteOutputMetadata::new().verification_nudge_needed(Some(true)),
+                    )),
+            )
+        );
+    }
+
+    #[test]
+    fn convert_tool_call_preserves_diff_repository() {
+        let tool_call = convert_tool_call(types::ToolCall {
+            tool_call_id: "tool-1".to_owned(),
+            title: "Write src/main.rs".to_owned(),
+            kind: "edit".to_owned(),
+            status: "completed".to_owned(),
+            content: vec![types::ToolCallContent::Diff {
+                old_path: "src/main.rs".to_owned(),
+                new_path: "src/main.rs".to_owned(),
+                old: "old".to_owned(),
+                new: "new".to_owned(),
+                repository: Some("acme/project".to_owned()),
+            }],
+            raw_input: None,
+            raw_output: None,
+            output_metadata: None,
+            locations: Vec::new(),
+            meta: None,
+        });
+
+        assert_eq!(
+            tool_call.content,
+            vec![model::ToolCallContent::Diff(
+                model::Diff::new("src/main.rs", "new")
+                    .old_text(Some("old"))
+                    .repository(Some("acme/project".to_owned())),
+            )]
+        );
+    }
+
+    #[test]
+    fn convert_tool_call_preserves_mcp_resource_blob_path() {
+        let tool_call = convert_tool_call(types::ToolCall {
+            tool_call_id: "tool-2".to_owned(),
+            title: "ReadMcpResource docs file://manual.pdf".to_owned(),
+            kind: "read".to_owned(),
+            status: "completed".to_owned(),
+            content: vec![types::ToolCallContent::McpResource {
+                uri: "file://manual.pdf".to_owned(),
+                mime_type: Some("application/pdf".to_owned()),
+                text: Some(
+                    "[Resource from docs at file://manual.pdf] Saved to C:\\tmp\\manual.pdf"
+                        .to_owned(),
+                ),
+                blob_saved_to: Some("C:\\tmp\\manual.pdf".to_owned()),
+            }],
+            raw_input: None,
+            raw_output: None,
+            output_metadata: None,
+            locations: Vec::new(),
+            meta: None,
+        });
+
+        assert_eq!(
+            tool_call.content,
+            vec![model::ToolCallContent::McpResource(
+                model::McpResource::new("file://manual.pdf")
+                    .mime_type(Some("application/pdf".to_owned()))
+                    .text(Some(
+                        "[Resource from docs at file://manual.pdf] Saved to C:\\tmp\\manual.pdf"
+                            .to_owned(),
+                    ))
+                    .blob_saved_to(Some("C:\\tmp\\manual.pdf".to_owned())),
+            )]
+        );
     }
 }

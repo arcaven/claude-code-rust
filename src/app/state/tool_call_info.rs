@@ -24,6 +24,7 @@ pub struct ToolCallInfo {
     /// Falls back to a derived name when metadata is absent.
     pub sdk_tool_name: String,
     pub raw_input: Option<serde_json::Value>,
+    pub output_metadata: Option<model::ToolOutputMetadata>,
     pub status: model::ToolCallStatus,
     pub content: Vec<model::ToolCallContent>,
     pub collapsed: bool,
@@ -58,6 +59,8 @@ pub struct ToolCallInfo {
     pub cache: BlockCache,
     /// Inline permission prompt - rendered inside this tool call block.
     pub pending_permission: Option<InlinePermission>,
+    /// Inline question prompt from `AskUserQuestion`.
+    pub pending_question: Option<InlineQuestion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +83,42 @@ impl ToolCallInfo {
     #[must_use]
     pub fn is_exit_plan_mode_tool(&self) -> bool {
         is_exit_plan_mode_tool_name(&self.sdk_tool_name)
+    }
+
+    #[must_use]
+    pub fn is_ultraplan(&self) -> bool {
+        self.output_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.exit_plan_mode.as_ref())
+            .and_then(|metadata| metadata.is_ultraplan)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn assistant_auto_backgrounded(&self) -> bool {
+        self.output_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.bash.as_ref())
+            .and_then(|metadata| metadata.assistant_auto_backgrounded)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn token_saver_active(&self) -> bool {
+        self.output_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.bash.as_ref())
+            .and_then(|metadata| metadata.token_saver_active)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn verification_nudge_needed(&self) -> bool {
+        self.output_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.todo_write.as_ref())
+            .and_then(|metadata| metadata.verification_nudge_needed)
+            .unwrap_or(false)
     }
 
     /// Mark render cache for this tool call as stale.
@@ -140,4 +179,17 @@ pub struct InlinePermission {
     /// When multiple permissions are pending, only the focused one
     /// shows the selection arrow and accepts Left/Right/Enter input.
     pub focused: bool,
+}
+
+pub struct InlineQuestion {
+    pub prompt: model::QuestionPrompt,
+    pub response_tx: tokio::sync::oneshot::Sender<model::RequestQuestionResponse>,
+    pub focused_option_index: usize,
+    pub selected_option_indices: std::collections::BTreeSet<usize>,
+    pub notes: String,
+    pub notes_cursor: usize,
+    pub editing_notes: bool,
+    pub focused: bool,
+    pub question_index: usize,
+    pub total_questions: usize,
 }

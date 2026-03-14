@@ -21,7 +21,7 @@ use std::mem::size_of;
 use super::messages::{
     ChatMessage, IncrementalMarkdown, MessageBlock, MessageRole, TextBlock, WelcomeBlock,
 };
-use super::tool_call_info::{InlinePermission, ToolCallInfo};
+use super::tool_call_info::{InlinePermission, InlineQuestion, ToolCallInfo};
 use super::types::{HistoryRetentionStats, MessageUsage, RecentSessionInfo};
 use super::viewport::InvalidationLevel;
 
@@ -54,6 +54,7 @@ impl super::App {
         msg.blocks.iter().any(|block| {
             if let MessageBlock::ToolCall(tc) = block {
                 tc.pending_permission.is_some()
+                    || tc.pending_question.is_some()
                     || matches!(
                         tc.status,
                         model::ToolCallStatus::Pending | model::ToolCallStatus::InProgress
@@ -78,6 +79,14 @@ impl super::App {
                 .capacity()
                 .saturating_add(diff.old_text.as_ref().map_or(0, String::capacity))
                 .saturating_add(diff.new_text.capacity()),
+            model::ToolCallContent::McpResource(resource) => resource
+                .uri
+                .capacity()
+                .saturating_add(resource.mime_type.as_ref().map_or(0, String::capacity))
+                .saturating_add(resource.text.as_ref().map_or(0, String::capacity))
+                .saturating_add(
+                    resource.blob_saved_to.as_ref().map_or(0, std::path::PathBuf::capacity),
+                ),
             model::ToolCallContent::Terminal(term) => term.terminal_id.capacity(),
         }
     }
@@ -115,6 +124,27 @@ impl super::App {
                     .saturating_add(option.option_id.capacity())
                     .saturating_add(option.name.capacity())
                     .saturating_add(option.description.as_ref().map_or(0, String::capacity));
+            }
+        }
+        if let Some(question) = &tc.pending_question {
+            total = total
+                .saturating_add(size_of::<InlineQuestion>())
+                .saturating_add(question.prompt.question.capacity())
+                .saturating_add(question.prompt.header.capacity())
+                .saturating_add(
+                    question
+                        .prompt
+                        .options
+                        .capacity()
+                        .saturating_mul(size_of::<model::QuestionOption>()),
+                )
+                .saturating_add(question.notes.capacity());
+            for option in &question.prompt.options {
+                total = total
+                    .saturating_add(option.option_id.capacity())
+                    .saturating_add(option.label.capacity())
+                    .saturating_add(option.description.as_ref().map_or(0, String::capacity))
+                    .saturating_add(option.preview.as_ref().map_or(0, String::capacity));
             }
         }
 
@@ -196,6 +226,10 @@ impl super::App {
                         permission.focused = false;
                         pending_permission_ids.push(tc.id.clone());
                     }
+                    if let Some(question) = tc.pending_question.as_mut() {
+                        question.focused = false;
+                        pending_permission_ids.push(tc.id.clone());
+                    }
                 }
             }
         }
@@ -214,9 +248,13 @@ impl super::App {
             if let Some((msg_idx, block_idx)) = self.lookup_tool_call(&first_id)
                 && let Some(MessageBlock::ToolCall(tc)) =
                     self.messages.get_mut(msg_idx).and_then(|m| m.blocks.get_mut(block_idx))
-                && let Some(permission) = tc.pending_permission.as_mut()
             {
-                permission.focused = true;
+                if let Some(permission) = tc.pending_permission.as_mut() {
+                    permission.focused = true;
+                }
+                if let Some(question) = tc.pending_question.as_mut() {
+                    question.focused = true;
+                }
             }
         } else {
             self.release_focus_target(super::super::focus::FocusTarget::Permission);

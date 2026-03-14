@@ -37,6 +37,9 @@ export interface AvailableModel {
   description?: string;
   supports_effort: boolean;
   supported_effort_levels: EffortLevel[];
+  supports_adaptive_thinking?: boolean;
+  supports_fast_mode?: boolean;
+  supports_auto_mode?: boolean;
 }
 
 export type FastModeState = "off" | "cooldown" | "on";
@@ -60,7 +63,40 @@ export type ContentBlock =
 
 export type ToolCallContent =
   | { type: "content"; content: ContentBlock }
-  | { type: "diff"; old_path: string; new_path: string; old: string; new: string };
+  | {
+      type: "diff";
+      old_path: string;
+      new_path: string;
+      old: string;
+      new: string;
+      repository?: string;
+    }
+  | {
+      type: "mcp_resource";
+      uri: string;
+      mime_type?: string;
+      text?: string;
+      blob_saved_to?: string;
+    };
+
+export interface ExitPlanModeOutputMetadata {
+  is_ultraplan?: boolean;
+}
+
+export interface TodoWriteOutputMetadata {
+  verification_nudge_needed?: boolean;
+}
+
+export interface BashOutputMetadata {
+  assistant_auto_backgrounded?: boolean;
+  token_saver_active?: boolean;
+}
+
+export interface ToolOutputMetadata {
+  bash?: BashOutputMetadata;
+  exit_plan_mode?: ExitPlanModeOutputMetadata;
+  todo_write?: TodoWriteOutputMetadata;
+}
 
 export interface ToolLocation {
   path: string;
@@ -75,6 +111,7 @@ export interface ToolCall {
   content: ToolCallContent[];
   raw_input?: Json;
   raw_output?: string;
+  output_metadata?: ToolOutputMetadata;
   locations: ToolLocation[];
   meta?: Json;
 }
@@ -86,6 +123,7 @@ export interface ToolCallUpdateFields {
   content?: ToolCallContent[];
   raw_input?: Json;
   raw_output?: string;
+  output_metadata?: ToolOutputMetadata;
   locations?: ToolLocation[];
   meta?: Json;
 }
@@ -134,6 +172,32 @@ export type ElicitationMode = "form" | "url";
 
 export type ElicitationAction = "accept" | "decline" | "cancel";
 
+export interface QuestionOption {
+  option_id: string;
+  label: string;
+  description?: string;
+  preview?: string;
+}
+
+export interface QuestionPrompt {
+  question: string;
+  header: string;
+  multi_select: boolean;
+  options: QuestionOption[];
+}
+
+export interface QuestionRequest {
+  tool_call: ToolCall;
+  prompt: QuestionPrompt;
+  question_index: number;
+  total_questions: number;
+}
+
+export interface QuestionAnnotation {
+  preview?: string;
+  notes?: string;
+}
+
 export interface ElicitationRequest {
   request_id: string;
   server_name: string;
@@ -146,6 +210,14 @@ export interface ElicitationRequest {
 
 export type PermissionOutcome =
   | { outcome: "selected"; option_id: string }
+  | { outcome: "cancelled" };
+
+export type QuestionOutcome =
+  | {
+      outcome: "answered";
+      selected_option_ids: string[];
+      annotation?: QuestionAnnotation;
+    }
   | { outcome: "cancelled" };
 
 export interface SessionListEntry {
@@ -167,15 +239,10 @@ export interface AccountInfo {
   api_key_source?: string;
 }
 
-export type SessionThinkingMode = "adaptive" | "disabled";
-export type SessionEffortLevel = EffortLevel;
-
 export interface SessionLaunchSettings {
-  model?: string;
   language?: string;
-  permission_mode?: string;
-  thinking_mode?: SessionThinkingMode;
-  effort_level?: SessionEffortLevel;
+  settings?: { [key: string]: Json };
+  agent_progress_summaries?: boolean;
 }
 
 export interface BridgeCommandEnvelope {
@@ -223,6 +290,16 @@ export type BridgeCommand =
       mode: string;
     }
   | {
+      command: "generate_session_title";
+      session_id: string;
+      description: string;
+    }
+  | {
+      command: "rename_session";
+      session_id: string;
+      title: string;
+    }
+  | {
       command: "new_session";
       cwd: string;
       launch_settings: SessionLaunchSettings;
@@ -232,6 +309,12 @@ export type BridgeCommand =
       session_id: string;
       tool_call_id: string;
       outcome: PermissionOutcome;
+    }
+  | {
+      command: "question_response";
+      session_id: string;
+      tool_call_id: string;
+      outcome: QuestionOutcome;
     }
   | {
       command: "elicitation_response";
@@ -282,6 +365,7 @@ export type BridgeEvent =
   | { event: "connection_failed"; message: string }
   | { event: "session_update"; session_id: string; update: SessionUpdate }
   | { event: "permission_request"; session_id: string; request: PermissionRequest }
+  | { event: "question_request"; session_id: string; request: QuestionRequest }
   | { event: "elicitation_request"; session_id: string; request: ElicitationRequest }
   | { event: "turn_complete"; session_id: string }
   | {

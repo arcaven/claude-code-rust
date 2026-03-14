@@ -14,7 +14,6 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::agent::model::EffortLevel;
 use crate::agent::types;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -22,25 +21,19 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLaunchSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission_mode: Option<String>,
+    pub settings: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thinking_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort_level: Option<EffortLevel>,
+    pub agent_progress_summaries: Option<bool>,
 }
 
 impl SessionLaunchSettings {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.model.is_none()
-            && self.language.is_none()
-            && self.permission_mode.is_none()
-            && self.thinking_mode.is_none()
-            && self.effort_level.is_none()
+        self.language.is_none()
+            && self.settings.is_none()
+            && self.agent_progress_summaries.is_none()
     }
 }
 
@@ -90,6 +83,14 @@ pub enum BridgeCommand {
         session_id: String,
         mode: String,
     },
+    GenerateSessionTitle {
+        session_id: String,
+        description: String,
+    },
+    RenameSession {
+        session_id: String,
+        title: String,
+    },
     NewSession {
         cwd: String,
         #[serde(default, skip_serializing_if = "SessionLaunchSettings::is_empty")]
@@ -99,6 +100,11 @@ pub enum BridgeCommand {
         session_id: String,
         tool_call_id: String,
         outcome: types::PermissionOutcome,
+    },
+    QuestionResponse {
+        session_id: String,
+        tool_call_id: String,
+        outcome: types::QuestionOutcome,
     },
     GetStatusSnapshot {
         session_id: String,
@@ -141,6 +147,10 @@ pub enum BridgeEvent {
         session_id: String,
         request: types::PermissionRequest,
     },
+    QuestionRequest {
+        session_id: String,
+        request: types::QuestionRequest,
+    },
     TurnComplete {
         session_id: String,
     },
@@ -178,7 +188,9 @@ pub enum BridgeEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{BridgeCommand, BridgeEvent, CommandEnvelope, EventEnvelope};
+    use super::{
+        BridgeCommand, BridgeEvent, CommandEnvelope, EventEnvelope, SessionLaunchSettings,
+    };
     use crate::agent::types;
 
     #[test]
@@ -209,5 +221,23 @@ mod tests {
         let json = serde_json::to_string(&env).expect("serialize");
         let decoded: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, env);
+    }
+
+    #[test]
+    fn session_launch_settings_serializes_agent_progress_summaries() {
+        let settings = SessionLaunchSettings {
+            settings: Some(serde_json::json!({ "model": "haiku" })),
+            agent_progress_summaries: Some(true),
+            ..SessionLaunchSettings::default()
+        };
+
+        let json = serde_json::to_value(&settings).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "settings": { "model": "haiku" },
+                "agent_progress_summaries": true
+            })
+        );
     }
 }

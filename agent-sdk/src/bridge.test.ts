@@ -5,9 +5,15 @@ import {
   CACHE_SPLIT_POLICY,
   buildRateLimitUpdate,
   buildQueryOptions,
+  canGenerateSessionTitle,
+  generatePersistedSessionTitle,
+  buildSessionMutationOptions,
+  buildSessionListOptions,
   buildToolResultFields,
   createToolCall,
+  handleTaskSystemMessage,
   mapAvailableAgents,
+  mapAvailableModels,
   mapSessionMessagesToUpdates,
   mapSdkSessions,
   agentSdkVersionCompatibilityError,
@@ -23,6 +29,99 @@ import {
   resolveInstalledAgentSdkVersion,
   unwrapToolUseResult,
 } from "./bridge.js";
+import type { SessionState } from "./bridge.js";
+import { requestAskUserQuestionAnswers } from "./bridge/user_interaction.js";
+
+function makeSessionState(): SessionState {
+  const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
+  return {
+    sessionId: "session-1",
+    cwd: "C:/work",
+    model: "haiku",
+    availableModels: [],
+    mode: null,
+    fastModeState: "off",
+    query: {} as import("@anthropic-ai/claude-agent-sdk").Query,
+    input,
+    connected: true,
+    connectEvent: "connected",
+    toolCalls: new Map(),
+    taskToolUseIds: new Map(),
+    pendingPermissions: new Map(),
+    pendingQuestions: new Map(),
+    authHintSent: false,
+  };
+}
+
+function captureBridgeEvents(run: () => void): Array<Record<string, unknown>> {
+  const writes: string[] = [];
+  const originalWrite = process.stdout.write;
+  (process.stdout.write as unknown as (...args: unknown[]) => boolean) = (
+    chunk: unknown,
+  ): boolean => {
+    if (typeof chunk === "string") {
+      writes.push(chunk);
+    } else if (Buffer.isBuffer(chunk)) {
+      writes.push(chunk.toString("utf8"));
+    } else {
+      writes.push(String(chunk));
+    }
+    return true;
+  };
+
+  try {
+    run();
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+
+  return writes
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("{"))
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+}
+
+async function captureBridgeEventsAsync(
+  run: () => Promise<void>,
+): Promise<Array<Record<string, unknown>>> {
+  const writes: string[] = [];
+  const originalWrite = process.stdout.write;
+  (process.stdout.write as unknown as (...args: unknown[]) => boolean) = (
+    chunk: unknown,
+  ): boolean => {
+    if (typeof chunk === "string") {
+      writes.push(chunk);
+    } else if (Buffer.isBuffer(chunk)) {
+      writes.push(chunk.toString("utf8"));
+    } else {
+      writes.push(String(chunk));
+    }
+    return true;
+  };
+
+  try {
+    await run();
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+
+  return writes
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("{"))
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+}
 
 test("parseCommandEnvelope validates initialize command", () => {
   const parsed = parseCommandEnvelope(
@@ -47,11 +146,18 @@ test("parseCommandEnvelope validates resume_session command without cwd", () => 
       command: "resume_session",
       session_id: "session-123",
       launch_settings: {
-        model: "haiku",
         language: "German",
-        permission_mode: "plan",
-        thinking_mode: "adaptive",
-        effort_level: "high",
+        settings: {
+          alwaysThinkingEnabled: true,
+          model: "haiku",
+          permissions: { defaultMode: "plan" },
+          fastMode: false,
+          effortLevel: "high",
+          outputStyle: "Default",
+          spinnerTipsEnabled: true,
+          terminalProgressBarEnabled: true,
+        },
+        agent_progress_summaries: true,
       },
     }),
   );
@@ -61,11 +167,90 @@ test("parseCommandEnvelope validates resume_session command without cwd", () => 
     throw new Error("unexpected command variant");
   }
   assert.equal(parsed.command.session_id, "session-123");
-  assert.equal(parsed.command.launch_settings.model, "haiku");
   assert.equal(parsed.command.launch_settings.language, "German");
-  assert.equal(parsed.command.launch_settings.permission_mode, "plan");
-  assert.equal(parsed.command.launch_settings.thinking_mode, "adaptive");
-  assert.equal(parsed.command.launch_settings.effort_level, "high");
+  assert.deepEqual(parsed.command.launch_settings.settings, {
+    alwaysThinkingEnabled: true,
+    model: "haiku",
+    permissions: { defaultMode: "plan" },
+    fastMode: false,
+    effortLevel: "high",
+    outputStyle: "Default",
+    spinnerTipsEnabled: true,
+    terminalProgressBarEnabled: true,
+  });
+  assert.equal(parsed.command.launch_settings.agent_progress_summaries, true);
+});
+
+test("parseCommandEnvelope validates rename_session command", () => {
+  const parsed = parseCommandEnvelope(
+    JSON.stringify({
+      request_id: "req-rename",
+      command: "rename_session",
+      session_id: "session-123",
+      title: "Renamed session",
+    }),
+  );
+
+  assert.equal(parsed.requestId, "req-rename");
+  assert.equal(parsed.command.command, "rename_session");
+  if (parsed.command.command !== "rename_session") {
+    throw new Error("unexpected command variant");
+  }
+  assert.equal(parsed.command.session_id, "session-123");
+  assert.equal(parsed.command.title, "Renamed session");
+});
+
+test("parseCommandEnvelope validates generate_session_title command", () => {
+  const parsed = parseCommandEnvelope(
+    JSON.stringify({
+      request_id: "req-generate",
+      command: "generate_session_title",
+      session_id: "session-123",
+      description: "Current custom title",
+    }),
+  );
+
+  assert.equal(parsed.requestId, "req-generate");
+  assert.equal(parsed.command.command, "generate_session_title");
+  if (parsed.command.command !== "generate_session_title") {
+    throw new Error("unexpected command variant");
+  }
+  assert.equal(parsed.command.session_id, "session-123");
+  assert.equal(parsed.command.description, "Current custom title");
+});
+
+test("buildSessionMutationOptions scopes rename requests to the session cwd", () => {
+  assert.deepEqual(buildSessionMutationOptions("C:/worktree"), { dir: "C:/worktree" });
+  assert.equal(buildSessionMutationOptions(undefined), undefined);
+});
+
+test("canGenerateSessionTitle detects supported query objects", () => {
+  const query = {
+    async generateSessionTitle(): Promise<string> {
+      return "Generated";
+    },
+  } as unknown as import("@anthropic-ai/claude-agent-sdk").Query;
+
+  assert.equal(canGenerateSessionTitle(query), true);
+  assert.equal(canGenerateSessionTitle({} as import("@anthropic-ai/claude-agent-sdk").Query), false);
+});
+
+test("generatePersistedSessionTitle calls sdk query with persist true", async () => {
+  const calls: Array<{ description: string; persist?: boolean }> = [];
+  const query = {
+    async generateSessionTitle(
+      description: string,
+      options?: { persist?: boolean },
+    ): Promise<string> {
+      calls.push({ description, persist: options?.persist });
+      return "Generated title";
+    },
+  } as unknown as import("@anthropic-ai/claude-agent-sdk").Query;
+
+  const title = await generatePersistedSessionTitle(query, "Current summary");
+
+  assert.equal(title, "Generated title");
+  assert.deepEqual(calls, [{ description: "Current summary", persist: true }]);
 });
 
 test("buildQueryOptions maps launch settings into sdk query options", () => {
@@ -73,11 +258,18 @@ test("buildQueryOptions maps launch settings into sdk query options", () => {
   const options = buildQueryOptions({
     cwd: "C:/work",
     launchSettings: {
-      model: "haiku",
       language: "German",
-      permission_mode: "plan",
-      thinking_mode: "adaptive",
-      effort_level: "medium",
+      settings: {
+        alwaysThinkingEnabled: true,
+        model: "haiku",
+        permissions: { defaultMode: "plan" },
+        fastMode: false,
+        effortLevel: "medium",
+        outputStyle: "Default",
+        spinnerTipsEnabled: true,
+        terminalProgressBarEnabled: true,
+      },
+      agent_progress_summaries: true,
     },
     provisionalSessionId: "session-1",
     input,
@@ -87,7 +279,16 @@ test("buildQueryOptions maps launch settings into sdk query options", () => {
     sessionIdForLogs: () => "session-1",
   });
 
-  assert.equal(options.model, "haiku");
+  assert.deepEqual(options.settings, {
+    alwaysThinkingEnabled: true,
+    model: "haiku",
+    permissions: { defaultMode: "plan" },
+    fastMode: false,
+    effortLevel: "medium",
+    outputStyle: "Default",
+    spinnerTipsEnabled: true,
+    terminalProgressBarEnabled: true,
+  });
   assert.deepEqual(options.systemPrompt, {
     type: "preset",
     preset: "claude_code",
@@ -95,20 +296,32 @@ test("buildQueryOptions maps launch settings into sdk query options", () => {
       "Always respond to the user in German unless the user explicitly asks for a different language. " +
       "Keep code, shell commands, file paths, API names, tool names, and raw error text unchanged unless the user explicitly asks for translation.",
   });
-  assert.equal(options.permissionMode, "plan");
-  assert.deepEqual(options.thinking, { type: "adaptive" });
-  assert.equal(options.effort, "medium");
+  assert.equal("model" in options, false);
+  assert.equal("permissionMode" in options, false);
+  assert.equal("thinking" in options, false);
+  assert.equal("effort" in options, false);
+  assert.equal(options.agentProgressSummaries, true);
   assert.equal(options.sessionId, "session-1");
   assert.deepEqual(options.settingSources, ["user", "project", "local"]);
+  assert.deepEqual(options.toolConfig, {
+    askUserQuestion: { previewFormat: "markdown" },
+  });
 });
 
-test("buildQueryOptions maps disabled thinking mode into sdk query options", () => {
+test("buildQueryOptions forwards settings without direct model and permission flags", () => {
   const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
   const options = buildQueryOptions({
     cwd: "C:/work",
     launchSettings: {
-      thinking_mode: "disabled",
-      effort_level: "high",
+      settings: {
+        alwaysThinkingEnabled: false,
+        permissions: { defaultMode: "default" },
+        fastMode: true,
+        effortLevel: "high",
+        outputStyle: "Learning",
+        spinnerTipsEnabled: false,
+        terminalProgressBarEnabled: false,
+      },
     },
     provisionalSessionId: "session-3",
     input,
@@ -118,7 +331,18 @@ test("buildQueryOptions maps disabled thinking mode into sdk query options", () 
     sessionIdForLogs: () => "session-3",
   });
 
-  assert.deepEqual(options.thinking, { type: "disabled" });
+  assert.deepEqual(options.settings, {
+    alwaysThinkingEnabled: false,
+    permissions: { defaultMode: "default" },
+    fastMode: true,
+    effortLevel: "high",
+    outputStyle: "Learning",
+    spinnerTipsEnabled: false,
+    terminalProgressBarEnabled: false,
+  });
+  assert.equal("model" in options, false);
+  assert.equal("permissionMode" in options, false);
+  assert.equal("thinking" in options, false);
   assert.equal("effort" in options, false);
 });
 
@@ -138,6 +362,125 @@ test("buildQueryOptions omits startup overrides for default logout path", () => 
   assert.equal("model" in options, false);
   assert.equal("permissionMode" in options, false);
   assert.equal("systemPrompt" in options, false);
+  assert.equal("agentProgressSummaries" in options, false);
+});
+
+test("handleTaskSystemMessage prefers task_progress summary over fallback text", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleTaskSystemMessage(session, "task_started", {
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Initial task description",
+    });
+    handleTaskSystemMessage(session, "task_progress", {
+      task_id: "task-1",
+      summary: "Analyzing authentication flow",
+      description: "Should not be shown",
+      last_tool_name: "Read",
+    });
+  });
+
+  const lastEvent = events.at(-1);
+  assert.ok(lastEvent);
+  assert.equal(lastEvent.event, "session_update");
+  assert.deepEqual(lastEvent.update, {
+    type: "tool_call_update",
+    tool_call_update: {
+      tool_call_id: "tool-1",
+      fields: {
+        status: "in_progress",
+        raw_output: "Analyzing authentication flow",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "Analyzing authentication flow" },
+          },
+        ],
+      },
+    },
+  });
+});
+
+test("handleTaskSystemMessage falls back to description and last tool when progress summary is absent", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleTaskSystemMessage(session, "task_started", {
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Initial task description",
+    });
+    handleTaskSystemMessage(session, "task_progress", {
+      task_id: "task-1",
+      description: "Inspecting auth code",
+      last_tool_name: "Read",
+    });
+  });
+
+  const lastEvent = events.at(-1);
+  assert.ok(lastEvent);
+  assert.equal(lastEvent.event, "session_update");
+  assert.deepEqual(lastEvent.update, {
+    type: "tool_call_update",
+    tool_call_update: {
+      tool_call_id: "tool-1",
+      fields: {
+        status: "in_progress",
+        raw_output: "Inspecting auth code (last tool: Read)",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "Inspecting auth code (last tool: Read)" },
+          },
+        ],
+      },
+    },
+  });
+});
+
+test("handleTaskSystemMessage final summary replaces prior task content and finalizes status", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleTaskSystemMessage(session, "task_started", {
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Initial task description",
+    });
+    handleTaskSystemMessage(session, "task_progress", {
+      task_id: "task-1",
+      summary: "Analyzing authentication flow",
+      description: "Should not be shown",
+    });
+    handleTaskSystemMessage(session, "task_notification", {
+      task_id: "task-1",
+      status: "completed",
+      summary: "Found the auth bug and prepared the fix",
+    });
+  });
+
+  const lastEvent = events.at(-1);
+  assert.ok(lastEvent);
+  assert.equal(lastEvent.event, "session_update");
+  assert.deepEqual(lastEvent.update, {
+    type: "tool_call_update",
+    tool_call_update: {
+      tool_call_id: "tool-1",
+      fields: {
+        status: "completed",
+        raw_output: "Found the auth bug and prepared the fix",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "Found the auth bug and prepared the fix" },
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(session.taskToolUseIds.has("task-1"), false);
 });
 
 test("buildQueryOptions trims language before appending system prompt", () => {
@@ -169,6 +512,186 @@ test("parseCommandEnvelope rejects missing required fields", () => {
     () => parseCommandEnvelope(JSON.stringify({ command: "set_model", session_id: "s1" })),
     /set_model\.model must be a string/,
   );
+});
+
+test("parseCommandEnvelope validates question_response command", () => {
+  const parsed = parseCommandEnvelope(
+    JSON.stringify({
+      request_id: "req-question",
+      command: "question_response",
+      session_id: "session-1",
+      tool_call_id: "tool-1",
+      outcome: {
+        outcome: "answered",
+        selected_option_ids: ["question_0", "question_2"],
+        annotation: {
+          preview: "Rendered preview",
+          notes: "User note",
+        },
+      },
+    }),
+  );
+
+  assert.equal(parsed.requestId, "req-question");
+  assert.equal(parsed.command.command, "question_response");
+  if (parsed.command.command !== "question_response") {
+    throw new Error("unexpected command variant");
+  }
+  assert.deepEqual(parsed.command.outcome, {
+    outcome: "answered",
+    selected_option_ids: ["question_0", "question_2"],
+    annotation: {
+      preview: "Rendered preview",
+      notes: "User note",
+    },
+  });
+});
+
+test("requestAskUserQuestionAnswers preserves previews and annotations in updated input", async () => {
+  const session = makeSessionState();
+  const baseToolCall = {
+    tool_call_id: "tool-question",
+    title: "AskUserQuestion",
+    kind: "other",
+    status: "in_progress",
+    content: [] as Array<import("./types.js").ToolCallContent>,
+    locations: [] as Array<import("./types.js").ToolLocation>,
+    meta: { claudeCode: { toolName: "AskUserQuestion" } },
+  };
+
+  const events = await captureBridgeEventsAsync(async () => {
+    const resultPromise = requestAskUserQuestionAnswers(
+      session,
+      "tool-question",
+      {
+        questions: [
+          {
+            question: "Pick deployment target",
+            header: "Target",
+            multiSelect: true,
+            options: [
+              {
+                label: "Staging",
+                description: "Low-risk validation",
+                preview: "Deploy to staging first.",
+              },
+              {
+                label: "Production",
+                description: "Customer-facing rollout",
+                preview: "Deploy to production after approval.",
+              },
+            ],
+          },
+        ],
+      },
+      baseToolCall,
+    );
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const pending = session.pendingQuestions.get("tool-question");
+    assert.ok(pending, "expected pending question");
+    pending.onOutcome({
+      outcome: "answered",
+      selected_option_ids: ["question_0", "question_1"],
+      annotation: {
+        notes: "Roll out in both environments",
+      },
+    });
+
+    const result = await resultPromise;
+    assert.equal(result.behavior, "allow");
+    if (result.behavior !== "allow") {
+      throw new Error("expected allow result");
+    }
+    assert.deepEqual(result.updatedInput, {
+      questions: [
+        {
+          question: "Pick deployment target",
+          header: "Target",
+          multiSelect: true,
+          options: [
+            {
+              label: "Staging",
+              description: "Low-risk validation",
+              preview: "Deploy to staging first.",
+            },
+            {
+              label: "Production",
+              description: "Customer-facing rollout",
+              preview: "Deploy to production after approval.",
+            },
+          ],
+        },
+      ],
+      answers: {
+        "Pick deployment target": "Staging, Production",
+      },
+      annotations: {
+        "Pick deployment target": {
+          preview: "Deploy to staging first.\n\nDeploy to production after approval.",
+          notes: "Roll out in both environments",
+        },
+      },
+    });
+  });
+
+  const questionEvent = events.find((event) => event.event === "question_request");
+  assert.ok(questionEvent, "expected question request event");
+  assert.deepEqual(questionEvent.request, {
+    tool_call: {
+      tool_call_id: "tool-question",
+      title: "Pick deployment target",
+      kind: "other",
+      status: "in_progress",
+      content: [],
+      locations: [],
+      meta: { claudeCode: { toolName: "AskUserQuestion" } },
+      raw_input: {
+        prompt: {
+          question: "Pick deployment target",
+          header: "Target",
+          multi_select: true,
+          options: [
+            {
+              option_id: "question_0",
+              label: "Staging",
+              description: "Low-risk validation",
+              preview: "Deploy to staging first.",
+            },
+            {
+              option_id: "question_1",
+              label: "Production",
+              description: "Customer-facing rollout",
+              preview: "Deploy to production after approval.",
+            },
+          ],
+        },
+        question_index: 0,
+        total_questions: 1,
+      },
+    },
+    prompt: {
+      question: "Pick deployment target",
+      header: "Target",
+      multi_select: true,
+      options: [
+        {
+          option_id: "question_0",
+          label: "Staging",
+          description: "Low-risk validation",
+          preview: "Deploy to staging first.",
+        },
+        {
+          option_id: "question_1",
+          label: "Production",
+          description: "Customer-facing rollout",
+          preview: "Deploy to production after approval.",
+        },
+      ],
+    },
+    question_index: 0,
+    total_questions: 1,
+  });
 });
 
 test("normalizeToolKind maps known tool names", () => {
@@ -407,6 +930,9 @@ test("buildToolResultFields maps structured Write output to diff content", () =>
       content: "new",
       originalFile: "old",
       structuredPatch: [],
+      gitDiff: {
+        repository: "acme/project",
+      },
     },
     base,
   );
@@ -418,17 +944,30 @@ test("buildToolResultFields maps structured Write output to diff content", () =>
       new_path: "src/main.ts",
       old: "old",
       new: "new",
+      repository: "acme/project",
     },
   ]);
 });
 
-test("buildToolResultFields preserves Edit diff content from input", () => {
+test("buildToolResultFields preserves Edit diff content from input and structured repository", () => {
   const base = createToolCall("tc-e", "Edit", {
     file_path: "src/main.ts",
     old_string: "old",
     new_string: "new",
   });
-  const fields = buildToolResultFields(false, [{ text: "Updated successfully" }], base);
+  const fields = buildToolResultFields(
+    false,
+    [{ text: "Updated successfully" }],
+    base,
+    {
+      result: {
+        filePath: "src/main.ts",
+        gitDiff: {
+          repository: "acme/project",
+        },
+      },
+    },
+  );
   assert.equal(fields.status, "completed");
   assert.deepEqual(fields.content, [
     {
@@ -437,6 +976,146 @@ test("buildToolResultFields preserves Edit diff content from input", () => {
       new_path: "src/main.ts",
       old: "old",
       new: "new",
+      repository: "acme/project",
+    },
+  ]);
+});
+
+test("buildToolResultFields prefers structured Bash stdout over token-saver output", () => {
+  const base = createToolCall("tc-bash", "Bash", { command: "npm test" });
+  const fields = buildToolResultFields(
+    false,
+    {
+      stdout: "real stdout",
+      stderr: "",
+      interrupted: false,
+      tokenSaverOutput: "compressed output for model",
+    },
+    base,
+    {
+      result: {
+        stdout: "real stdout",
+        stderr: "",
+        interrupted: false,
+        tokenSaverOutput: "compressed output for model",
+      },
+    },
+  );
+
+  assert.equal(fields.raw_output, "real stdout");
+  assert.deepEqual(fields.output_metadata, {
+    bash: {
+      token_saver_active: true,
+    },
+  });
+});
+
+test("buildToolResultFields adds Bash auto-backgrounded metadata and message", () => {
+  const base = createToolCall("tc-bash-bg", "Bash", { command: "npm run watch" });
+  const fields = buildToolResultFields(
+    false,
+    {
+      stdout: "",
+      stderr: "",
+      interrupted: false,
+      backgroundTaskId: "task-42",
+      assistantAutoBackgrounded: true,
+    },
+    base,
+    {
+      result: {
+        stdout: "",
+        stderr: "",
+        interrupted: false,
+        backgroundTaskId: "task-42",
+        assistantAutoBackgrounded: true,
+      },
+    },
+  );
+
+  assert.equal(
+    fields.raw_output,
+    "Command was auto-backgrounded by assistant mode with ID: task-42.",
+  );
+  assert.deepEqual(fields.output_metadata, {
+    bash: {
+      assistant_auto_backgrounded: true,
+    },
+  });
+});
+
+test("buildToolResultFields maps structured ReadMcpResource output to typed resource content", () => {
+  const base = createToolCall("tc-mcp", "ReadMcpResource", {
+    server: "docs",
+    uri: "file://manual.pdf",
+  });
+  const fields = buildToolResultFields(
+    false,
+    {
+      contents: [
+        {
+          uri: "file://manual.pdf",
+          mimeType: "application/pdf",
+          text: "[Resource from docs at file://manual.pdf] Saved to C:\\tmp\\manual.pdf",
+          blobSavedTo: "C:\\tmp\\manual.pdf",
+        },
+      ],
+    },
+    base,
+    {
+      result: {
+        contents: [
+          {
+            uri: "file://manual.pdf",
+            mimeType: "application/pdf",
+            text: "[Resource from docs at file://manual.pdf] Saved to C:\\tmp\\manual.pdf",
+            blobSavedTo: "C:\\tmp\\manual.pdf",
+          },
+        ],
+      },
+    },
+  );
+
+  assert.equal(fields.status, "completed");
+  assert.deepEqual(fields.content, [
+    {
+      type: "mcp_resource",
+      uri: "file://manual.pdf",
+      mime_type: "application/pdf",
+      text: "[Resource from docs at file://manual.pdf] Saved to C:\\tmp\\manual.pdf",
+      blob_saved_to: "C:\\tmp\\manual.pdf",
+    },
+  ]);
+});
+
+test("buildToolResultFields restores ReadMcpResource blob paths from transcript JSON text", () => {
+  const base = createToolCall("tc-mcp-history", "ReadMcpResource", {
+    server: "docs",
+    uri: "file://manual.pdf",
+  });
+  const transcriptJson = JSON.stringify({
+    contents: [
+      {
+        uri: "file://manual.pdf",
+        mimeType: "application/pdf",
+        text: "[Resource from docs at file://manual.pdf] Saved to C:\\tmp\\manual.pdf",
+        blobSavedTo: "C:\\tmp\\manual.pdf",
+      },
+    ],
+  });
+  const fields = buildToolResultFields(false, transcriptJson, base, {
+    type: "tool_result",
+    tool_use_id: "tc-mcp-history",
+    content: transcriptJson,
+  });
+
+  assert.deepEqual(fields.content, [
+    {
+      type: "mcp_resource",
+      uri: "file://manual.pdf",
+      mime_type: "application/pdf",
+      text: "[Resource from docs at file://manual.pdf] Saved to C:\\tmp\\manual.pdf",
+      blob_saved_to: "C:\\tmp\\manual.pdf",
     },
   ]);
 });
@@ -631,7 +1310,7 @@ test("looksLikeAuthRequired detects login hints", () => {
 });
 
 test("agent sdk version compatibility check matches pinned version", () => {
-  assert.equal(resolveInstalledAgentSdkVersion(), "0.2.63");
+  assert.equal(resolveInstalledAgentSdkVersion(), "0.2.74");
   assert.equal(agentSdkVersionCompatibilityError(), undefined);
 });
 
@@ -749,6 +1428,103 @@ test("mapSdkSessions normalizes and sorts sessions", () => {
       last_modified_ms: 100,
       file_size_bytes: 10,
       cwd: "C:/work",
+    },
+  ]);
+});
+
+test("buildSessionListOptions scopes repo-local listings to worktrees", () => {
+  assert.deepEqual(buildSessionListOptions("C:/repo"), {
+    dir: "C:/repo",
+    includeWorktrees: true,
+    limit: 50,
+  });
+  assert.deepEqual(buildSessionListOptions(undefined), {
+    limit: 50,
+  });
+});
+
+test("buildToolResultFields extracts ExitPlanMode ultraplan metadata from structured results", () => {
+  const base = createToolCall("tc-plan", "ExitPlanMode", {});
+  const fields = buildToolResultFields(
+    false,
+    [{ text: "Plan ready for approval" }],
+    base,
+    {
+      result: {
+        plan: "Plan contents",
+        isUltraplan: true,
+      },
+    },
+  );
+
+  assert.deepEqual(fields.output_metadata, {
+    exit_plan_mode: {
+      is_ultraplan: true,
+    },
+  });
+});
+
+test("buildToolResultFields extracts TodoWrite verification metadata from structured results", () => {
+  const base = createToolCall("tc-todo", "TodoWrite", {
+    todos: [{ content: "Verify changes", status: "pending", activeForm: "Verifying changes" }],
+  });
+  const fields = buildToolResultFields(
+    false,
+    [{ text: "Todos have been modified successfully." }],
+    base,
+    {
+      data: {
+        oldTodos: [],
+        newTodos: [],
+        verificationNudgeNeeded: true,
+      },
+    },
+  );
+
+  assert.deepEqual(fields.output_metadata, {
+    todo_write: {
+      verification_nudge_needed: true,
+    },
+  });
+});
+
+test("mapAvailableModels preserves optional fast and auto mode metadata", () => {
+  const mapped = mapAvailableModels([
+    {
+      value: "sonnet",
+      displayName: "Claude Sonnet",
+      description: "Balanced model",
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "medium", "high", "max"],
+      supportsAdaptiveThinking: true,
+      supportsFastMode: true,
+      supportsAutoMode: false,
+    },
+    {
+      value: "haiku",
+      displayName: "Claude Haiku",
+      description: "Fast model",
+      supportsEffort: false,
+    },
+  ]);
+
+  assert.deepEqual(mapped, [
+    {
+      id: "sonnet",
+      display_name: "Claude Sonnet",
+      description: "Balanced model",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+      supports_adaptive_thinking: true,
+      supports_fast_mode: true,
+      supports_auto_mode: false,
+    },
+    {
+      id: "haiku",
+      display_name: "Claude Haiku",
+      description: "Fast model",
+      supports_effort: false,
+      supported_effort_levels: [],
     },
   ]);
 });

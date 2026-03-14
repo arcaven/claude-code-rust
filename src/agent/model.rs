@@ -191,17 +191,58 @@ pub struct Diff {
     pub path: PathBuf,
     pub old_text: Option<String>,
     pub new_text: String,
+    pub repository: Option<String>,
 }
 
 impl Diff {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, new_text: impl Into<String>) -> Self {
-        Self { path: path.into(), old_text: None, new_text: new_text.into() }
+        Self { path: path.into(), old_text: None, new_text: new_text.into(), repository: None }
     }
 
     #[must_use]
     pub fn old_text<T: Into<String>>(mut self, old_text: Option<T>) -> Self {
         self.old_text = old_text.map(Into::into);
+        self
+    }
+
+    #[must_use]
+    pub fn repository(mut self, repository: Option<String>) -> Self {
+        self.repository = repository.filter(|repository| !repository.trim().is_empty());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpResource {
+    pub uri: String,
+    pub mime_type: Option<String>,
+    pub text: Option<String>,
+    pub blob_saved_to: Option<PathBuf>,
+}
+
+impl McpResource {
+    #[must_use]
+    pub fn new(uri: impl Into<String>) -> Self {
+        Self { uri: uri.into(), mime_type: None, text: None, blob_saved_to: None }
+    }
+
+    #[must_use]
+    pub fn mime_type(mut self, mime_type: Option<String>) -> Self {
+        self.mime_type = mime_type.filter(|mime_type| !mime_type.trim().is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn text(mut self, text: Option<String>) -> Self {
+        self.text = text.filter(|text| !text.trim().is_empty());
+        self
+    }
+
+    #[must_use]
+    pub fn blob_saved_to(mut self, blob_saved_to: Option<String>) -> Self {
+        self.blob_saved_to =
+            blob_saved_to.filter(|path| !path.trim().is_empty()).map(PathBuf::from);
         self
     }
 }
@@ -210,6 +251,7 @@ impl Diff {
 pub enum ToolCallContent {
     Content(Content),
     Diff(Diff),
+    McpResource(McpResource),
     Terminal(TerminalToolCallContent),
 }
 
@@ -235,6 +277,7 @@ pub struct ToolCall {
     pub content: Vec<ToolCallContent>,
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<serde_json::Value>,
+    pub output_metadata: Option<ToolOutputMetadata>,
     pub locations: Vec<ToolCallLocation>,
     pub meta: Option<serde_json::Value>,
 }
@@ -250,6 +293,7 @@ impl ToolCall {
             content: Vec::new(),
             raw_input: None,
             raw_output: None,
+            output_metadata: None,
             locations: Vec::new(),
             meta: None,
         }
@@ -286,6 +330,12 @@ impl ToolCall {
     }
 
     #[must_use]
+    pub fn output_metadata(mut self, output_metadata: ToolOutputMetadata) -> Self {
+        self.output_metadata = Some(output_metadata);
+        self
+    }
+
+    #[must_use]
     pub fn locations(mut self, locations: Vec<ToolCallLocation>) -> Self {
         self.locations = locations;
         self
@@ -306,6 +356,7 @@ pub struct ToolCallUpdateFields {
     pub content: Option<Vec<ToolCallContent>>,
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<serde_json::Value>,
+    pub output_metadata: Option<ToolOutputMetadata>,
     pub locations: Option<Vec<ToolCallLocation>>,
 }
 
@@ -352,6 +403,12 @@ impl ToolCallUpdateFields {
     }
 
     #[must_use]
+    pub fn output_metadata(mut self, output_metadata: ToolOutputMetadata) -> Self {
+        self.output_metadata = Some(output_metadata);
+        self
+    }
+
+    #[must_use]
     pub fn locations(mut self, locations: Vec<ToolCallLocation>) -> Self {
         self.locations = Some(locations);
         self
@@ -375,6 +432,102 @@ impl ToolCallUpdate {
     #[must_use]
     pub fn meta(mut self, meta: impl Into<serde_json::Value>) -> Self {
         self.meta = Some(meta.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ExitPlanModeOutputMetadata {
+    pub is_ultraplan: Option<bool>,
+}
+
+impl ExitPlanModeOutputMetadata {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { is_ultraplan: None }
+    }
+
+    #[must_use]
+    pub fn ultraplan(mut self, is_ultraplan: Option<bool>) -> Self {
+        self.is_ultraplan = is_ultraplan;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TodoWriteOutputMetadata {
+    pub verification_nudge_needed: Option<bool>,
+}
+
+impl TodoWriteOutputMetadata {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { verification_nudge_needed: None }
+    }
+
+    #[must_use]
+    pub fn verification_nudge_needed(mut self, verification_nudge_needed: Option<bool>) -> Self {
+        self.verification_nudge_needed = verification_nudge_needed;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BashOutputMetadata {
+    pub assistant_auto_backgrounded: Option<bool>,
+    pub token_saver_active: Option<bool>,
+}
+
+impl BashOutputMetadata {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { assistant_auto_backgrounded: None, token_saver_active: None }
+    }
+
+    #[must_use]
+    pub fn assistant_auto_backgrounded(
+        mut self,
+        assistant_auto_backgrounded: Option<bool>,
+    ) -> Self {
+        self.assistant_auto_backgrounded = assistant_auto_backgrounded;
+        self
+    }
+
+    #[must_use]
+    pub fn token_saver_active(mut self, token_saver_active: Option<bool>) -> Self {
+        self.token_saver_active = token_saver_active;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolOutputMetadata {
+    pub bash: Option<BashOutputMetadata>,
+    pub exit_plan_mode: Option<ExitPlanModeOutputMetadata>,
+    pub todo_write: Option<TodoWriteOutputMetadata>,
+}
+
+impl ToolOutputMetadata {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn bash(mut self, bash: Option<BashOutputMetadata>) -> Self {
+        self.bash = bash;
+        self
+    }
+
+    #[must_use]
+    pub fn exit_plan_mode(mut self, exit_plan_mode: Option<ExitPlanModeOutputMetadata>) -> Self {
+        self.exit_plan_mode = exit_plan_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn todo_write(mut self, todo_write: Option<TodoWriteOutputMetadata>) -> Self {
+        self.todo_write = todo_write;
         self
     }
 }
@@ -531,6 +684,9 @@ pub struct AvailableModel {
     pub description: Option<String>,
     pub supports_effort: bool,
     pub supported_effort_levels: Vec<EffortLevel>,
+    pub supports_adaptive_thinking: Option<bool>,
+    pub supports_fast_mode: Option<bool>,
+    pub supports_auto_mode: Option<bool>,
 }
 
 impl AvailableModel {
@@ -542,6 +698,9 @@ impl AvailableModel {
             description: None,
             supports_effort: false,
             supported_effort_levels: Vec::new(),
+            supports_adaptive_thinking: None,
+            supports_fast_mode: None,
+            supports_auto_mode: None,
         }
     }
 
@@ -560,6 +719,24 @@ impl AvailableModel {
     #[must_use]
     pub fn supported_effort_levels(mut self, supported_effort_levels: Vec<EffortLevel>) -> Self {
         self.supported_effort_levels = supported_effort_levels;
+        self
+    }
+
+    #[must_use]
+    pub fn supports_adaptive_thinking(mut self, supports_adaptive_thinking: Option<bool>) -> Self {
+        self.supports_adaptive_thinking = supports_adaptive_thinking;
+        self
+    }
+
+    #[must_use]
+    pub fn supports_fast_mode(mut self, supports_fast_mode: Option<bool>) -> Self {
+        self.supports_fast_mode = supports_fast_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn supports_auto_mode(mut self, supports_auto_mode: Option<bool>) -> Self {
+        self.supports_auto_mode = supports_auto_mode;
         self
     }
 }
@@ -701,6 +878,84 @@ impl PermissionOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub option_id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub preview: Option<String>,
+}
+
+impl QuestionOption {
+    #[must_use]
+    pub fn new(option_id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self { option_id: option_id.into(), label: label.into(), description: None, preview: None }
+    }
+
+    #[must_use]
+    pub fn description(mut self, description: Option<String>) -> Self {
+        self.description = description;
+        self
+    }
+
+    #[must_use]
+    pub fn preview(mut self, preview: Option<String>) -> Self {
+        self.preview = preview;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionPrompt {
+    pub question: String,
+    pub header: String,
+    pub multi_select: bool,
+    pub options: Vec<QuestionOption>,
+}
+
+impl QuestionPrompt {
+    #[must_use]
+    pub fn new(
+        question: impl Into<String>,
+        header: impl Into<String>,
+        multi_select: bool,
+        options: Vec<QuestionOption>,
+    ) -> Self {
+        Self { question: question.into(), header: header.into(), multi_select, options }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionAnnotation {
+    pub preview: Option<String>,
+    pub notes: Option<String>,
+}
+
+impl QuestionAnnotation {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { preview: None, notes: None }
+    }
+
+    #[must_use]
+    pub fn preview(mut self, preview: Option<String>) -> Self {
+        self.preview = preview;
+        self
+    }
+
+    #[must_use]
+    pub fn notes(mut self, notes: Option<String>) -> Self {
+        self.notes = notes;
+        self
+    }
+}
+
+impl Default for QuestionAnnotation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectedPermissionOutcome {
     pub option_id: String,
 }
@@ -719,6 +974,31 @@ pub enum RequestPermissionOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnsweredQuestionOutcome {
+    pub selected_option_ids: Vec<String>,
+    pub annotation: Option<QuestionAnnotation>,
+}
+
+impl AnsweredQuestionOutcome {
+    #[must_use]
+    pub fn new(selected_option_ids: Vec<String>) -> Self {
+        Self { selected_option_ids, annotation: None }
+    }
+
+    #[must_use]
+    pub fn annotation(mut self, annotation: Option<QuestionAnnotation>) -> Self {
+        self.annotation = annotation;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestQuestionOutcome {
+    Answered(AnsweredQuestionOutcome),
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestPermissionResponse {
     pub outcome: RequestPermissionOutcome,
 }
@@ -726,6 +1006,18 @@ pub struct RequestPermissionResponse {
 impl RequestPermissionResponse {
     #[must_use]
     pub fn new(outcome: RequestPermissionOutcome) -> Self {
+        Self { outcome }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestQuestionResponse {
+    pub outcome: RequestQuestionOutcome,
+}
+
+impl RequestQuestionResponse {
+    #[must_use]
+    pub fn new(outcome: RequestQuestionOutcome) -> Self {
         Self { outcome }
     }
 }
@@ -745,5 +1037,27 @@ impl RequestPermissionRequest {
         options: Vec<PermissionOption>,
     ) -> Self {
         Self { session_id: session_id.into(), tool_call, options }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestQuestionRequest {
+    pub session_id: SessionId,
+    pub tool_call: ToolCallUpdate,
+    pub prompt: QuestionPrompt,
+    pub question_index: usize,
+    pub total_questions: usize,
+}
+
+impl RequestQuestionRequest {
+    #[must_use]
+    pub fn new(
+        session_id: impl Into<SessionId>,
+        tool_call: ToolCallUpdate,
+        prompt: QuestionPrompt,
+        question_index: usize,
+        total_questions: usize,
+    ) -> Self {
+        Self { session_id: session_id.into(), tool_call, prompt, question_index, total_questions }
     }
 }

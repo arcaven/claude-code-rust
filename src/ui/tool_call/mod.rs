@@ -19,19 +19,19 @@
 //! Submodules handle specific rendering concerns:
 //! - [`standard`] -- non-Execute tool calls (Read, Write, Glob, etc.)
 //! - [`execute`] -- Execute/Bash two-layer bordered rendering
-//! - [`permissions`] -- inline permission UI (approve/deny, questions, plan)
+//! - [`interactions`] -- inline permissions, questions, and plan approvals
 //! - [`errors`] -- error rendering and tool-use error extraction
 
 mod errors;
 mod execute;
-mod permissions;
+mod interactions;
 mod standard;
 
 use crate::agent::model;
 use crate::app::ToolCallInfo;
 use crate::ui::markdown;
 use crate::ui::theme;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -269,6 +269,33 @@ fn truncate_spans_to_width(spans: Vec<Span<'static>>, max_width: usize) -> Vec<S
     out
 }
 
+fn tool_output_badge_spans(tc: &ToolCallInfo) -> Vec<Span<'static>> {
+    let mut badges = Vec::new();
+
+    if tc.assistant_auto_backgrounded() {
+        badges.push(Span::styled(
+            "  [assistant backgrounded]",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if tc.is_ultraplan() {
+        badges.push(Span::styled(
+            "  [ultraplan]",
+            Style::default().fg(theme::RUST_ORANGE).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if tc.verification_nudge_needed() {
+        badges.push(Span::styled(
+            "  [verification needed]",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    badges
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -289,6 +316,7 @@ mod tests {
             title: id.to_owned(),
             sdk_tool_name: sdk_tool_name.to_owned(),
             raw_input: None,
+            output_metadata: None,
             status,
             content: Vec::new(),
             collapsed: false,
@@ -307,6 +335,7 @@ mod tests {
             last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
+            pending_question: None,
         }
     }
 
@@ -402,6 +431,7 @@ mod tests {
                 .into(),
             sdk_tool_name: "Bash".into(),
             raw_input: None,
+            output_metadata: None,
             status: model::ToolCallStatus::Pending,
             content: Vec::new(),
             collapsed: false,
@@ -420,11 +450,26 @@ mod tests {
             last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
+            pending_question: None,
         };
 
         let rendered = execute::render_execute_with_borders(&tc, &[], 80, 0);
         let top = rendered.first().expect("top border line");
         assert!(spans_width(&top.spans) <= 80);
+    }
+
+    #[test]
+    fn execute_title_renders_assistant_backgrounded_badge() {
+        let mut tc = test_tool_call("tc-bash-bg", "Bash", model::ToolCallStatus::Completed);
+        tc.output_metadata =
+            Some(model::ToolOutputMetadata::new().bash(Some(
+                model::BashOutputMetadata::new().assistant_auto_backgrounded(Some(true)),
+            )));
+
+        let rendered = execute::render_execute_with_borders(&tc, &[], 100, 0);
+        let top = rendered.first().expect("top border line");
+        let text: String = top.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("[assistant backgrounded]"));
     }
 
     #[test]
@@ -467,6 +512,83 @@ mod tests {
         tc.mark_tool_call_layout_dirty();
         let (_, recompute_lines) = measure_tool_call_height_cached(&mut tc, 80, 0, 1);
         assert!(recompute_lines > 0);
+    }
+
+    #[test]
+    fn exit_plan_mode_title_renders_ultraplan_badge() {
+        let mut tc = test_tool_call("tc-plan", "ExitPlanMode", model::ToolCallStatus::Completed);
+        tc.output_metadata =
+            Some(model::ToolOutputMetadata::new().exit_plan_mode(Some(
+                model::ExitPlanModeOutputMetadata::new().ultraplan(Some(true)),
+            )));
+
+        let rendered = standard::render_tool_call_title(&tc, 80, 0);
+        let text: String = rendered.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("[ultraplan]"));
+    }
+
+    #[test]
+    fn todo_write_title_renders_verification_badge() {
+        let mut tc = test_tool_call("tc-todo", "TodoWrite", model::ToolCallStatus::Completed);
+        tc.output_metadata = Some(model::ToolOutputMetadata::new().todo_write(Some(
+            model::TodoWriteOutputMetadata::new().verification_nudge_needed(Some(true)),
+        )));
+
+        let rendered = standard::render_tool_call_title(&tc, 80, 0);
+        let text: String = rendered.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("[verification needed]"));
+    }
+
+    #[test]
+    fn mcp_resource_body_renders_saved_path_hint_when_text_omits_it() {
+        let mut tc =
+            test_tool_call("tc-mcp-resource", "ReadMcpResource", model::ToolCallStatus::Completed);
+        tc.content = vec![model::ToolCallContent::McpResource(
+            model::McpResource::new("file://manual.pdf")
+                .mime_type(Some("application/pdf".to_owned()))
+                .text(Some("Binary resource downloaded successfully.".to_owned()))
+                .blob_saved_to(Some("C:\\tmp\\manual.pdf".to_owned())),
+        )];
+
+        let body = standard::render_tool_call_body(&tc);
+        let rendered: Vec<String> = body
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+
+        assert!(
+            rendered.iter().any(|line| line.contains("Binary resource downloaded successfully."))
+        );
+        assert!(rendered.iter().any(|line| line.contains("Saved to: C:\\tmp\\manual.pdf")));
+    }
+
+    #[test]
+    fn mcp_resource_body_avoids_duplicate_saved_path_hint_when_text_already_mentions_it() {
+        let mut tc = test_tool_call(
+            "tc-mcp-resource-dupe",
+            "ReadMcpResource",
+            model::ToolCallStatus::Completed,
+        );
+        tc.content = vec![model::ToolCallContent::McpResource(
+            model::McpResource::new("file://manual.pdf")
+                .mime_type(Some("application/pdf".to_owned()))
+                .text(Some(
+                    "[Resource from docs at file://manual.pdf] Saved to C:\\tmp\\manual.pdf"
+                        .to_owned(),
+                ))
+                .blob_saved_to(Some("C:\\tmp\\manual.pdf".to_owned())),
+        )];
+
+        let body = standard::render_tool_call_body(&tc);
+        let rendered: Vec<String> = body
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+
+        assert_eq!(
+            rendered.iter().filter(|line| line.contains("Saved to: C:\\tmp\\manual.pdf")).count(),
+            0
+        );
     }
 
     #[test]
@@ -521,6 +643,7 @@ mod tests {
             title: "Bash".into(),
             sdk_tool_name: "Bash".into(),
             raw_input: None,
+            output_metadata: None,
             status: model::ToolCallStatus::Completed,
             content: Vec::new(),
             collapsed: true,
@@ -539,6 +662,7 @@ mod tests {
             last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
+            pending_question: None,
         };
         assert_eq!(content_summary(&tc), "done");
     }
@@ -550,6 +674,7 @@ mod tests {
             title: "Bash".into(),
             sdk_tool_name: "Bash".into(),
             raw_input: None,
+            output_metadata: None,
             status: model::ToolCallStatus::Failed,
             content: Vec::new(),
             collapsed: true,
@@ -568,6 +693,7 @@ mod tests {
             last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
+            pending_question: None,
         };
         assert_eq!(content_summary(&tc), "bad");
     }
@@ -579,6 +705,7 @@ mod tests {
             title: "Bash".into(),
             sdk_tool_name: "Bash".into(),
             raw_input: None,
+            output_metadata: None,
             status: model::ToolCallStatus::Failed,
             content: Vec::new(),
             collapsed: true,
@@ -599,6 +726,7 @@ mod tests {
             last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
+            pending_question: None,
         };
         assert_eq!(content_summary(&tc), "Exit code 1");
     }
@@ -610,6 +738,7 @@ mod tests {
             title: "Bash".into(),
             sdk_tool_name: "Bash".into(),
             raw_input: None,
+            output_metadata: None,
             status: model::ToolCallStatus::Failed,
             content: Vec::new(),
             collapsed: false,
@@ -630,6 +759,7 @@ mod tests {
             last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
+            pending_question: None,
         };
 
         let lines = execute::render_execute_content(&tc);

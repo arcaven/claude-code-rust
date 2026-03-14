@@ -116,6 +116,9 @@ pub fn handle_client_event(app: &mut App, event: ClientEvent) {
         ClientEvent::PermissionRequest { request, response_tx } => {
             turn::handle_permission_request_event(app, request, response_tx);
         }
+        ClientEvent::QuestionRequest { request, response_tx } => {
+            turn::handle_question_request_event(app, request, response_tx);
+        }
         ClientEvent::TurnCancelled => turn::handle_turn_cancelled_event(app),
         ClientEvent::TurnComplete => turn::handle_turn_complete_event(app),
         ClientEvent::TurnError(msg) => turn::handle_turn_error_event(app, &msg, None),
@@ -404,6 +407,7 @@ mod tests {
             title: id.into(),
             sdk_tool_name: "Read".into(),
             raw_input: None,
+            output_metadata: None,
             status,
             content: vec![],
             collapsed: false,
@@ -422,6 +426,7 @@ mod tests {
             last_measured_layout_generation: 0,
             cache: BlockCache::default(),
             pending_permission: None,
+            pending_question: None,
         }
     }
 
@@ -1362,6 +1367,94 @@ mod tests {
 
         assert!(matches!(app.status, AppStatus::Ready));
         assert!(app.resuming_session_id.is_none());
+    }
+
+    #[test]
+    fn sessions_listed_completes_pending_session_rename() {
+        let mut app = make_test_app();
+        app.config.pending_session_title_change =
+            Some(crate::app::config::PendingSessionTitleChangeState {
+                session_id: "session-1".to_owned(),
+                kind: crate::app::config::PendingSessionTitleChangeKind::Rename {
+                    requested_title: Some("Renamed session".to_owned()),
+                },
+            });
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionsListed {
+                sessions: vec![crate::agent::types::SessionListEntry {
+                    session_id: "session-1".to_owned(),
+                    summary: "Renamed session".to_owned(),
+                    last_modified_ms: 1,
+                    file_size_bytes: 2,
+                    cwd: Some("/test".to_owned()),
+                    git_branch: None,
+                    custom_title: Some("Renamed session".to_owned()),
+                    first_prompt: Some("prompt".to_owned()),
+                }],
+            },
+        );
+
+        assert!(app.config.pending_session_title_change.is_none());
+        assert_eq!(
+            app.config.status_message.as_deref(),
+            Some("Renamed session to Renamed session")
+        );
+        assert!(app.config.last_error.is_none());
+        assert_eq!(app.recent_sessions.len(), 1);
+    }
+
+    #[test]
+    fn slash_command_error_for_pending_session_rename_stays_in_config_feedback() {
+        let mut app = make_test_app();
+        app.config.pending_session_title_change =
+            Some(crate::app::config::PendingSessionTitleChangeState {
+                session_id: "session-1".to_owned(),
+                kind: crate::app::config::PendingSessionTitleChangeKind::Rename {
+                    requested_title: Some("Renamed session".to_owned()),
+                },
+            });
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::SlashCommandError("failed to rename session: boom".into()),
+        );
+
+        assert!(app.config.pending_session_title_change.is_none());
+        assert_eq!(app.config.last_error.as_deref(), Some("failed to rename session: boom"));
+        assert!(app.config.status_message.is_none());
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn sessions_listed_completes_pending_session_title_generation() {
+        let mut app = make_test_app();
+        app.config.pending_session_title_change =
+            Some(crate::app::config::PendingSessionTitleChangeState {
+                session_id: "session-1".to_owned(),
+                kind: crate::app::config::PendingSessionTitleChangeKind::Generate,
+            });
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionsListed {
+                sessions: vec![crate::agent::types::SessionListEntry {
+                    session_id: "session-1".to_owned(),
+                    summary: "Generated session".to_owned(),
+                    last_modified_ms: 1,
+                    file_size_bytes: 2,
+                    cwd: Some("/test".to_owned()),
+                    git_branch: None,
+                    custom_title: Some("Generated session".to_owned()),
+                    first_prompt: Some("prompt".to_owned()),
+                }],
+            },
+        );
+
+        assert!(app.config.pending_session_title_change.is_none());
+        assert_eq!(app.config.status_message.as_deref(), Some("Generated session title"));
+        assert!(app.config.last_error.is_none());
     }
 
     #[test]
