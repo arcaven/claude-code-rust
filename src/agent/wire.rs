@@ -106,8 +106,45 @@ pub enum BridgeCommand {
         tool_call_id: String,
         outcome: types::QuestionOutcome,
     },
+    ElicitationResponse {
+        session_id: String,
+        elicitation_request_id: String,
+        action: types::ElicitationAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<serde_json::Value>,
+    },
     GetStatusSnapshot {
         session_id: String,
+    },
+    GetMcpSnapshot {
+        session_id: String,
+    },
+    McpReconnect {
+        session_id: String,
+        server_name: String,
+    },
+    McpToggle {
+        session_id: String,
+        server_name: String,
+        enabled: bool,
+    },
+    McpSetServers {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        servers: BTreeMap<String, types::McpServerConfig>,
+    },
+    McpAuthenticate {
+        session_id: String,
+        server_name: String,
+    },
+    McpClearAuth {
+        session_id: String,
+        server_name: String,
+    },
+    McpOauthCallbackUrl {
+        session_id: String,
+        server_name: String,
+        callback_url: String,
     },
     Shutdown,
 }
@@ -151,6 +188,23 @@ pub enum BridgeEvent {
         session_id: String,
         request: types::QuestionRequest,
     },
+    ElicitationRequest {
+        session_id: String,
+        request: types::ElicitationRequest,
+    },
+    ElicitationComplete {
+        session_id: String,
+        elicitation_id: String,
+        server_name: Option<String>,
+    },
+    McpAuthRedirect {
+        session_id: String,
+        redirect: types::McpAuthRedirect,
+    },
+    McpOperationError {
+        session_id: String,
+        error: types::McpOperationError,
+    },
     TurnComplete {
         session_id: String,
     },
@@ -183,6 +237,12 @@ pub enum BridgeEvent {
     StatusSnapshot {
         session_id: String,
         account: types::AccountInfo,
+    },
+    McpSnapshot {
+        session_id: String,
+        #[serde(default)]
+        servers: Vec<types::McpServerStatus>,
+        error: Option<String>,
     },
 }
 

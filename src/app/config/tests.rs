@@ -3,6 +3,7 @@ use crate::agent::model::AvailableModel;
 use crate::agent::wire::BridgeCommand;
 use crate::app::AppStatus;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use tempfile::TempDir;
@@ -1225,6 +1226,163 @@ fn enter_closes_settings_without_editing_selected_row() {
 
     assert_eq!(app.active_view, ActiveView::Chat);
     assert!(!app.config.fast_mode_effective());
+}
+
+#[test]
+fn mcp_enter_opens_details_overlay_instead_of_closing_config() {
+    let (_dir, mut app) = open_settings_test_app();
+    app.config.active_tab = ConfigTab::Mcp;
+    app.session_id = Some(crate::agent::model::SessionId::new("session-1"));
+    app.mcp.servers = vec![crate::agent::types::McpServerStatus {
+        name: "filesystem".to_owned(),
+        status: crate::agent::types::McpServerConnectionStatus::Connected,
+        server_info: None,
+        error: None,
+        config: Some(crate::agent::types::McpServerStatusConfig::Stdio {
+            command: "npx".to_owned(),
+            args: vec!["@modelcontextprotocol/server-filesystem".to_owned()],
+            env: BTreeMap::new(),
+        }),
+        scope: Some("project".to_owned()),
+        tools: vec![],
+    }];
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert_eq!(app.active_view, ActiveView::Config);
+    assert_eq!(
+        app.config.mcp_details_overlay().map(|overlay| overlay.server_name.as_str()),
+        Some("filesystem")
+    );
+}
+
+#[test]
+fn mcp_details_overlay_enter_closes_overlay() {
+    let (_dir, mut app) = open_settings_test_app();
+    app.config.active_tab = ConfigTab::Mcp;
+    app.config.overlay = Some(ConfigOverlayState::McpDetails(McpDetailsOverlayState {
+        server_name: "filesystem".to_owned(),
+        selected_index: 0,
+    }));
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    assert!(app.config.overlay.is_none());
+    assert_eq!(app.active_view, ActiveView::Config);
+}
+
+#[test]
+fn mcp_tab_refresh_key_requests_snapshot() {
+    let (_dir, mut app) = open_settings_test_app();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.conn = Some(Rc::new(crate::agent::client::AgentConnection::new(tx)));
+    app.session_id = Some(crate::agent::model::SessionId::new("session-1"));
+    app.config.active_tab = ConfigTab::Mcp;
+    app.mcp.servers.push(crate::agent::types::McpServerStatus {
+        name: "stale".to_owned(),
+        status: crate::agent::types::McpServerConnectionStatus::NeedsAuth,
+        server_info: None,
+        error: None,
+        config: None,
+        scope: None,
+        tools: Vec::new(),
+    });
+
+    handle_key(&mut app, KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+
+    let envelope = rx.try_recv().expect("mcp snapshot command");
+    assert_eq!(
+        envelope.command,
+        BridgeCommand::GetMcpSnapshot { session_id: "session-1".to_owned() }
+    );
+    assert!(app.mcp.in_flight);
+    assert!(app.mcp.servers.is_empty());
+}
+
+#[test]
+fn request_mcp_snapshot_sends_outside_mcp_tab() {
+    let (_dir, mut app) = open_settings_test_app();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.conn = Some(Rc::new(crate::agent::client::AgentConnection::new(tx)));
+    app.session_id = Some(crate::agent::model::SessionId::new("session-1"));
+    app.config.active_tab = ConfigTab::Status;
+
+    super::mcp::request_mcp_snapshot(&mut app);
+
+    let envelope = rx.try_recv().expect("mcp snapshot command");
+    assert_eq!(
+        envelope.command,
+        BridgeCommand::GetMcpSnapshot { session_id: "session-1".to_owned() }
+    );
+    assert!(app.mcp.in_flight);
+}
+
+#[test]
+fn refresh_mcp_snapshot_clears_existing_servers_before_request() {
+    let (_dir, mut app) = open_settings_test_app();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.conn = Some(Rc::new(crate::agent::client::AgentConnection::new(tx)));
+    app.session_id = Some(crate::agent::model::SessionId::new("session-1"));
+    app.mcp.servers.push(crate::agent::types::McpServerStatus {
+        name: "stale".to_owned(),
+        status: crate::agent::types::McpServerConnectionStatus::Connected,
+        server_info: None,
+        error: None,
+        config: None,
+        scope: None,
+        tools: Vec::new(),
+    });
+
+    refresh_mcp_snapshot(&mut app);
+
+    let envelope = rx.try_recv().expect("mcp snapshot command");
+    assert_eq!(
+        envelope.command,
+        BridgeCommand::GetMcpSnapshot { session_id: "session-1".to_owned() }
+    );
+    assert!(app.mcp.servers.is_empty());
+    assert!(app.mcp.in_flight);
+}
+
+#[test]
+fn refresh_mcp_snapshot_if_needed_skips_outside_mcp_tab() {
+    let (_dir, mut app) = open_settings_test_app();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.conn = Some(Rc::new(crate::agent::client::AgentConnection::new(tx)));
+    app.session_id = Some(crate::agent::model::SessionId::new("session-1"));
+    app.config.active_tab = ConfigTab::Status;
+
+    super::mcp::refresh_mcp_snapshot_if_needed(&mut app);
+
+    assert!(rx.try_recv().is_err());
+    assert!(!app.mcp.in_flight);
+}
+
+#[test]
+fn claudeai_proxy_server_shows_disabled_authenticate_action() {
+    let server = crate::agent::types::McpServerStatus {
+        name: "claude.ai Google Calendar".to_owned(),
+        status: crate::agent::types::McpServerConnectionStatus::NeedsAuth,
+        server_info: None,
+        error: Some(
+            "MCP server requires authentication but no OAuth token is configured.".to_owned(),
+        ),
+        config: Some(crate::agent::types::McpServerStatusConfig::ClaudeaiProxy {
+            url: "https://mcp-proxy.anthropic.com/v1/mcp/server".to_owned(),
+            id: "mcpsrv_test".to_owned(),
+        }),
+        scope: Some("session".to_owned()),
+        tools: Vec::new(),
+    };
+
+    let actions = available_mcp_actions(&server);
+
+    assert!(actions.contains(&super::mcp::McpServerActionKind::Authenticate));
+    assert!(!super::mcp::is_mcp_action_available(
+        &server,
+        super::mcp::McpServerActionKind::Authenticate
+    ));
+    assert!(actions.contains(&super::mcp::McpServerActionKind::Reconnect));
 }
 
 #[test]

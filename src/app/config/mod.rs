@@ -15,6 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 mod edit;
+mod mcp;
+mod mcp_edit;
 mod resolve;
 pub mod store;
 
@@ -26,6 +28,12 @@ use std::path::PathBuf;
 
 pub(crate) use edit::{
     OverlayModelOption, model_overlay_options, supported_effort_levels_for_model,
+};
+pub(crate) use mcp::{
+    McpAuthRedirectOverlayState, McpCallbackUrlOverlayState, McpDetailsOverlayState,
+    McpElicitationOverlayState, available_mcp_actions, handle_mcp_elicitation_completed,
+    handle_mcp_operation_error, is_mcp_action_available, present_mcp_auth_redirect,
+    present_mcp_elicitation_request, refresh_mcp_snapshot,
 };
 pub(crate) use resolve::language_input_validation_message;
 use resolve::resolve_setting_document;
@@ -751,7 +759,7 @@ pub struct AddMarketplaceOverlayState {
     pub cursor: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConfigOverlayState {
     ModelAndEffort(ModelAndEffortOverlayState),
     OutputStyle(OutputStyleOverlayState),
@@ -761,6 +769,10 @@ pub enum ConfigOverlayState {
     PluginInstallActions(PluginInstallOverlayState),
     MarketplaceActions(MarketplaceActionsOverlayState),
     AddMarketplace(AddMarketplaceOverlayState),
+    McpDetails(McpDetailsOverlayState),
+    McpCallbackUrl(McpCallbackUrlOverlayState),
+    McpElicitation(McpElicitationOverlayState),
+    McpAuthRedirect(McpAuthRedirectOverlayState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -780,6 +792,7 @@ pub struct ConfigState {
     pub active_tab: ConfigTab,
     pub selected_setting_index: usize,
     pub settings_scroll_offset: usize,
+    pub mcp_selected_server_index: usize,
     pub overlay: Option<ConfigOverlayState>,
     pub committed_settings_document: Value,
     pub committed_local_settings_document: Value,
@@ -798,6 +811,7 @@ impl Default for ConfigState {
             active_tab: ConfigTab::Settings,
             selected_setting_index: 0,
             settings_scroll_offset: 0,
+            mcp_selected_server_index: 0,
             overlay: None,
             committed_settings_document: Value::Object(serde_json::Map::new()),
             committed_local_settings_document: Value::Object(serde_json::Map::new()),
@@ -911,7 +925,11 @@ impl ConfigState {
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -927,7 +945,11 @@ impl ConfigState {
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -944,7 +966,11 @@ impl ConfigState {
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -960,7 +986,11 @@ impl ConfigState {
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -977,7 +1007,11 @@ impl ConfigState {
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -993,7 +1027,11 @@ impl ConfigState {
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1010,7 +1048,11 @@ impl ConfigState {
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1026,7 +1068,11 @@ impl ConfigState {
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1043,7 +1089,11 @@ impl ConfigState {
                 | ConfigOverlayState::SessionRename(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1061,7 +1111,11 @@ impl ConfigState {
                 | ConfigOverlayState::SessionRename(_)
                 | ConfigOverlayState::PluginInstallActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1078,7 +1132,11 @@ impl ConfigState {
                 | ConfigOverlayState::SessionRename(_)
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1094,7 +1152,11 @@ impl ConfigState {
                 | ConfigOverlayState::SessionRename(_)
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::MarketplaceActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1111,7 +1173,11 @@ impl ConfigState {
                 | ConfigOverlayState::SessionRename(_)
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1129,7 +1195,11 @@ impl ConfigState {
                 | ConfigOverlayState::SessionRename(_)
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
-                | ConfigOverlayState::AddMarketplace(_),
+                | ConfigOverlayState::AddMarketplace(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1146,7 +1216,11 @@ impl ConfigState {
                 | ConfigOverlayState::SessionRename(_)
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
-                | ConfigOverlayState::MarketplaceActions(_),
+                | ConfigOverlayState::MarketplaceActions(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1162,7 +1236,11 @@ impl ConfigState {
                 | ConfigOverlayState::SessionRename(_)
                 | ConfigOverlayState::InstalledPluginActions(_)
                 | ConfigOverlayState::PluginInstallActions(_)
-                | ConfigOverlayState::MarketplaceActions(_),
+                | ConfigOverlayState::MarketplaceActions(_)
+                | ConfigOverlayState::McpDetails(_)
+                | ConfigOverlayState::McpCallbackUrl(_)
+                | ConfigOverlayState::McpElicitation(_)
+                | ConfigOverlayState::McpAuthRedirect(_),
             )
             | None => None,
         }
@@ -1210,6 +1288,7 @@ impl ConfigState {
         self.selected_setting_index =
             self.selected_setting_index.min(setting_specs().len().saturating_sub(1));
         self.settings_scroll_offset = self.settings_scroll_offset.min(self.selected_setting_index);
+        self.mcp_selected_server_index = 0;
         if !preserve_status {
             self.status_message = notice;
             self.last_error = None;
@@ -1359,6 +1438,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     if app.config.active_tab == ConfigTab::Plugins && crate::app::plugins::handle_key(app, key) {
         return;
     }
+    if mcp::handle_mcp_key(app, key) {
+        return;
+    }
 
     match (key.code, key.modifiers) {
         (KeyCode::Char(' '), KeyModifiers::NONE)
@@ -1437,6 +1519,7 @@ pub fn handle_paste(app: &mut App, text: &str) -> bool {
 
 fn request_active_tab_side_effects(app: &mut App) {
     request_status_snapshot_if_needed(app);
+    mcp::refresh_mcp_snapshot_if_needed(app);
     if app.config.active_tab == ConfigTab::Usage {
         crate::app::usage::request_refresh_if_needed(app);
     }

@@ -130,6 +130,9 @@ pub(super) fn step_setting(app: &mut App, spec: &SettingSpec, delta: isize) {
 }
 
 pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) {
+    if super::mcp_edit::handle_overlay_key(app, key) {
+        return;
+    }
     match app.config.overlay.clone() {
         Some(ConfigOverlayState::ModelAndEffort(_)) => match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::NONE) => confirm_model_and_effort_overlay(app),
@@ -159,13 +162,22 @@ pub(super) fn handle_overlay_key(app: &mut App, key: KeyEvent) {
         Some(ConfigOverlayState::AddMarketplace(_)) => {
             crate::app::plugins::handle_add_marketplace_overlay_key(app, key);
         }
+        Some(
+            ConfigOverlayState::McpDetails(_)
+            | ConfigOverlayState::McpCallbackUrl(_)
+            | ConfigOverlayState::McpAuthRedirect(_)
+            | ConfigOverlayState::McpElicitation(_),
+        )
+        | None => {}
         Some(ConfigOverlayState::Language(_)) => handle_language_overlay_key(app, key),
         Some(ConfigOverlayState::SessionRename(_)) => handle_session_rename_overlay_key(app, key),
-        None => {}
     }
 }
 
 pub(super) fn handle_overlay_paste(app: &mut App, text: &str) -> bool {
+    if super::mcp_edit::handle_overlay_paste(app, text) {
+        return true;
+    }
     match app.config.overlay {
         Some(ConfigOverlayState::Language(_)) => {
             insert_text_str(app.config.language_overlay_mut(), text);
@@ -184,7 +196,11 @@ pub(super) fn handle_overlay_paste(app: &mut App, text: &str) -> bool {
             | ConfigOverlayState::OutputStyle(_)
             | ConfigOverlayState::InstalledPluginActions(_)
             | ConfigOverlayState::PluginInstallActions(_)
-            | ConfigOverlayState::MarketplaceActions(_),
+            | ConfigOverlayState::MarketplaceActions(_)
+            | ConfigOverlayState::McpDetails(_)
+            | ConfigOverlayState::McpCallbackUrl(_)
+            | ConfigOverlayState::McpAuthRedirect(_)
+            | ConfigOverlayState::McpElicitation(_),
         )
         | None => false,
     }
@@ -555,7 +571,7 @@ fn handle_language_overlay_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn accepts_text_input(modifiers: KeyModifiers) -> bool {
+pub(super) fn accepts_text_input(modifiers: KeyModifiers) -> bool {
     modifiers.is_empty() || modifiers == KeyModifiers::SHIFT
 }
 
@@ -679,7 +695,7 @@ fn overlay_effort_for_model(app: &App, model_id: &str, current: EffortLevel) -> 
     supported.iter().copied().find(|level| *level == EffortLevel::Medium).unwrap_or(supported[0])
 }
 
-fn step_index_clamped(current: usize, delta: isize, len: usize) -> usize {
+pub(super) fn step_index_clamped(current: usize, delta: isize, len: usize) -> usize {
     if len == 0 {
         return 0;
     }
@@ -719,19 +735,22 @@ fn session_title_generation_description(app: &App, session_id: &str) -> Option<S
     .map(str::to_owned)
 }
 
-fn text_input_overlay_state<T>(draft: String, build: impl FnOnce(String, usize) -> T) -> T {
+pub(super) fn text_input_overlay_state<T>(
+    draft: String,
+    build: impl FnOnce(String, usize) -> T,
+) -> T {
     let cursor = draft.chars().count();
     build(draft, cursor)
 }
 
-fn move_text_cursor_left<T: TextInputOverlay>(overlay: Option<&mut T>) {
+pub(super) fn move_text_cursor_left<T: TextInputOverlay>(overlay: Option<&mut T>) {
     let Some(overlay) = overlay else {
         return;
     };
     *overlay.cursor_mut() = overlay.cursor().saturating_sub(1);
 }
 
-fn move_text_cursor_right<T: TextInputOverlay>(overlay: Option<&mut T>) {
+pub(super) fn move_text_cursor_right<T: TextInputOverlay>(overlay: Option<&mut T>) {
     let Some(overlay) = overlay else {
         return;
     };
@@ -739,21 +758,21 @@ fn move_text_cursor_right<T: TextInputOverlay>(overlay: Option<&mut T>) {
     *overlay.cursor_mut() = next;
 }
 
-fn move_text_cursor_to_end<T: TextInputOverlay>(overlay: Option<&mut T>) {
+pub(super) fn move_text_cursor_to_end<T: TextInputOverlay>(overlay: Option<&mut T>) {
     let Some(overlay) = overlay else {
         return;
     };
     *overlay.cursor_mut() = overlay.draft().chars().count();
 }
 
-fn set_text_cursor<T: TextInputOverlay>(overlay: Option<&mut T>, cursor: usize) {
+pub(super) fn set_text_cursor<T: TextInputOverlay>(overlay: Option<&mut T>, cursor: usize) {
     let Some(overlay) = overlay else {
         return;
     };
     *overlay.cursor_mut() = cursor.min(overlay.draft().chars().count());
 }
 
-fn insert_text_char<T: TextInputOverlay>(overlay: Option<&mut T>, ch: char) {
+pub(super) fn insert_text_char<T: TextInputOverlay>(overlay: Option<&mut T>, ch: char) {
     let Some(overlay) = overlay else {
         return;
     };
@@ -762,7 +781,7 @@ fn insert_text_char<T: TextInputOverlay>(overlay: Option<&mut T>, ch: char) {
     *overlay.cursor_mut() += 1;
 }
 
-fn insert_text_str<T: TextInputOverlay>(overlay: Option<&mut T>, text: &str) {
+pub(super) fn insert_text_str<T: TextInputOverlay>(overlay: Option<&mut T>, text: &str) {
     let Some(overlay) = overlay else {
         return;
     };
@@ -772,7 +791,7 @@ fn insert_text_str<T: TextInputOverlay>(overlay: Option<&mut T>, text: &str) {
     *overlay.cursor_mut() += normalized.chars().count();
 }
 
-fn delete_text_before_cursor<T: TextInputOverlay>(overlay: Option<&mut T>) {
+pub(super) fn delete_text_before_cursor<T: TextInputOverlay>(overlay: Option<&mut T>) {
     let Some(overlay) = overlay else {
         return;
     };
@@ -785,7 +804,7 @@ fn delete_text_before_cursor<T: TextInputOverlay>(overlay: Option<&mut T>) {
     *overlay.cursor_mut() -= 1;
 }
 
-fn delete_text_at_cursor<T: TextInputOverlay>(overlay: Option<&mut T>) {
+pub(super) fn delete_text_at_cursor<T: TextInputOverlay>(overlay: Option<&mut T>) {
     let Some(overlay) = overlay else {
         return;
     };
@@ -798,7 +817,7 @@ fn delete_text_at_cursor<T: TextInputOverlay>(overlay: Option<&mut T>) {
     overlay.draft_mut().replace_range(start..end, "");
 }
 
-trait TextInputOverlay {
+pub(super) trait TextInputOverlay {
     fn draft(&self) -> &str;
     fn draft_mut(&mut self) -> &mut String;
     fn cursor(&self) -> usize;

@@ -39,6 +39,14 @@ pub enum ClientEvent {
         request: model::RequestQuestionRequest,
         response_tx: tokio::sync::oneshot::Sender<model::RequestQuestionResponse>,
     },
+    /// MCP elicitation request that needs auth or other MCP input.
+    McpElicitationRequest { request: crate::agent::types::ElicitationRequest },
+    /// MCP elicitation completed in the SDK.
+    McpElicitationCompleted { elicitation_id: String, server_name: Option<String> },
+    /// MCP auth redirect returned directly by the SDK auth call.
+    McpAuthRedirect { redirect: crate::agent::types::McpAuthRedirect },
+    /// MCP operation failed and should be surfaced in the MCP config UI.
+    McpOperationError { error: crate::agent::types::McpOperationError },
     /// A prompt turn completed successfully.
     TurnComplete,
     /// `cancel` notification was accepted by the bridge.
@@ -83,6 +91,11 @@ pub enum ClientEvent {
     LogoutCompleted,
     /// Status snapshot received from bridge (account info).
     StatusSnapshotReceived { account: crate::agent::types::AccountInfo },
+    /// MCP server snapshot received from bridge.
+    McpSnapshotReceived {
+        servers: Vec<crate::agent::types::McpServerStatus>,
+        error: Option<String>,
+    },
     /// Usage refresh task started.
     UsageRefreshStarted,
     /// Usage refresh completed successfully.

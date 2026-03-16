@@ -40,6 +40,7 @@ struct ConnectedEventData {
     history_updates: Option<Vec<types::SessionUpdate>>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn handle_bridge_event(
     event_tx: &mpsc::UnboundedSender<ClientEvent>,
     cmd_tx: &mpsc::UnboundedSender<CommandEnvelope>,
@@ -92,6 +93,29 @@ pub(super) fn handle_bridge_event(
         crate::agent::wire::BridgeEvent::QuestionRequest { session_id, request } => {
             handle_question_request_event(event_tx, cmd_tx, session_id, request);
         }
+        crate::agent::wire::BridgeEvent::ElicitationRequest { session_id, request } => {
+            handle_elicitation_request_event(event_tx, &session_id, request);
+        }
+        crate::agent::wire::BridgeEvent::ElicitationComplete {
+            elicitation_id,
+            server_name,
+            ..
+        } => {
+            let _ =
+                event_tx.send(ClientEvent::McpElicitationCompleted { elicitation_id, server_name });
+        }
+        crate::agent::wire::BridgeEvent::McpAuthRedirect { redirect, .. } => {
+            let _ = event_tx.send(ClientEvent::McpAuthRedirect { redirect });
+        }
+        crate::agent::wire::BridgeEvent::McpOperationError { error, .. } => {
+            tracing::warn!(
+                "bridge mcp_operation_error: operation={} server={} message={}",
+                error.operation,
+                error.server_name.as_deref().unwrap_or("<none>"),
+                error.message
+            );
+            let _ = event_tx.send(ClientEvent::McpOperationError { error });
+        }
         crate::agent::wire::BridgeEvent::TurnComplete { .. } => {
             let _ = event_tx.send(ClientEvent::TurnComplete);
         }
@@ -142,6 +166,9 @@ pub(super) fn handle_bridge_event(
         crate::agent::wire::BridgeEvent::Initialized { .. } => {}
         crate::agent::wire::BridgeEvent::StatusSnapshot { account, .. } => {
             let _ = event_tx.send(ClientEvent::StatusSnapshotReceived { account });
+        }
+        crate::agent::wire::BridgeEvent::McpSnapshot { servers, error, .. } => {
+            let _ = event_tx.send(ClientEvent::McpSnapshotReceived { servers, error });
         }
     }
 }
@@ -222,6 +249,21 @@ fn handle_question_request_event(
     if event_tx.send(ClientEvent::QuestionRequest { request, response_tx }).is_ok() {
         spawn_question_response_forwarder(cmd_tx.clone(), response_rx, session_id, tool_call_id);
     }
+}
+
+fn handle_elicitation_request_event(
+    event_tx: &mpsc::UnboundedSender<ClientEvent>,
+    session_id: &str,
+    request: types::ElicitationRequest,
+) {
+    tracing::debug!(
+        "bridge elicitation_request: session_id={} request_id={} server_name={} mode={:?}",
+        session_id,
+        request.request_id,
+        request.server_name,
+        request.mode
+    );
+    let _ = event_tx.send(ClientEvent::McpElicitationRequest { request });
 }
 
 fn spawn_permission_response_forwarder(

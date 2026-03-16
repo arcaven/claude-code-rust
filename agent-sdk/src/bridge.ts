@@ -26,10 +26,22 @@ import {
   createSession,
   closeSession,
   closeAllSessions,
+  handleElicitationResponse,
   handlePermissionResponse,
   handleQuestionResponse,
 } from "./bridge/session_lifecycle.js";
 import { mapSessionMessagesToUpdates } from "./bridge/history.js";
+import {
+  MCP_STALE_STATUS_REVALIDATION_COOLDOWN_MS,
+  handleMcpAuthenticateCommand,
+  handleMcpClearAuthCommand,
+  handleMcpOauthCallbackUrlCommand,
+  handleMcpReconnectCommand,
+  handleMcpSetServersCommand,
+  handleMcpStatusCommand,
+  handleMcpToggleCommand,
+  staleMcpAuthCandidates,
+} from "./bridge/mcp.js";
 
 // Re-exports: all symbols that tests and external consumers import from bridge.js.
 export { AsyncQueue, logPermissionDebug } from "./bridge/shared.js";
@@ -61,6 +73,7 @@ export {
   parseRateLimitStatus,
   buildRateLimitUpdate,
 } from "./bridge/state_parsing.js";
+export { MCP_STALE_STATUS_REVALIDATION_COOLDOWN_MS, staleMcpAuthCandidates };
 export type {
   SessionState,
   ConnectEventKind,
@@ -356,12 +369,86 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
       return;
     }
 
+    case "mcp_status": {
+      const session = sessionById(command.session_id);
+      if (!session) {
+        slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
+        return;
+      }
+      await handleMcpStatusCommand(session, requestId);
+      return;
+    }
+
+    case "mcp_reconnect": {
+      const session = sessionById(command.session_id);
+      if (!session) {
+        slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
+        return;
+      }
+      await handleMcpReconnectCommand(session, command, requestId);
+      return;
+    }
+
+    case "mcp_toggle": {
+      const session = sessionById(command.session_id);
+      if (!session) {
+        slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
+        return;
+      }
+      await handleMcpToggleCommand(session, command, requestId);
+      return;
+    }
+
+    case "mcp_set_servers": {
+      const session = sessionById(command.session_id);
+      if (!session) {
+        slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
+        return;
+      }
+      await handleMcpSetServersCommand(session, command, requestId);
+      return;
+    }
+
+    case "mcp_authenticate": {
+      const session = sessionById(command.session_id);
+      if (!session) {
+        slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
+        return;
+      }
+      await handleMcpAuthenticateCommand(session, command, requestId);
+      return;
+    }
+
+    case "mcp_clear_auth": {
+      const session = sessionById(command.session_id);
+      if (!session) {
+        slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
+        return;
+      }
+      await handleMcpClearAuthCommand(session, command, requestId);
+      return;
+    }
+
+    case "mcp_oauth_callback_url": {
+      const session = sessionById(command.session_id);
+      if (!session) {
+        slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
+        return;
+      }
+      await handleMcpOauthCallbackUrlCommand(session, command, requestId);
+      return;
+    }
+
     case "permission_response":
       handlePermissionResponse(command);
       return;
 
     case "question_response":
       handleQuestionResponse(command);
+      return;
+
+    case "elicitation_response":
+      handleElicitationResponse(command);
       return;
 
     case "shutdown":
