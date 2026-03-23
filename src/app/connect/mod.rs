@@ -88,6 +88,8 @@ pub fn create_app(cli: &Cli) -> App {
             &cwd_display,
             &[],
         )],
+        message_retained_bytes: Vec::new(),
+        retained_history_bytes: 0,
         viewport: ChatViewport::new(),
         input: super::InputState::new(),
         status: AppStatus::Connecting,
@@ -166,6 +168,7 @@ pub fn create_app(cli: &Cli) -> App {
         is_compacting: false,
         account_info: None,
         terminal_tool_calls: Vec::new(),
+        terminal_tool_call_membership: HashSet::new(),
         needs_redraw: true,
         notifications: super::notify::NotificationManager::new(),
         perf: cli
@@ -173,6 +176,11 @@ pub fn create_app(cli: &Cli) -> App {
             .as_deref()
             .and_then(|path| crate::perf::PerfLogger::open(path, cli.perf_append)),
         render_cache_budget: RenderCacheBudget::default(),
+        render_cache_slots: Vec::new(),
+        render_cache_total_bytes: 0,
+        render_cache_protected_bytes: 0,
+        render_cache_evictable: std::collections::BTreeSet::new(),
+        render_cache_tail_msg_idx: None,
         history_retention: HistoryRetentionPolicy::default(),
         history_retention_stats: HistoryRetentionStats::default(),
         cache_metrics: CacheMetrics::default(),
@@ -190,6 +198,8 @@ pub fn create_app(cli: &Cli) -> App {
         app.config.last_error = Some(err);
     }
 
+    app.rebuild_history_retention_accounting();
+    app.rebuild_render_cache_accounting();
     trust::initialize(&mut app);
     app.refresh_git_branch();
     app

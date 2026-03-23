@@ -70,7 +70,9 @@ pub(super) fn handle_permission_request_event(
     }
 
     if layout_dirty {
-        app.invalidate_layout(InvalidationLevel::Single(mi));
+        app.sync_render_cache_slot(mi, bi);
+        app.recompute_message_retained_bytes(mi);
+        app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
     }
 }
 
@@ -131,7 +133,9 @@ pub(super) fn handle_question_request_event(
     }
 
     if layout_dirty {
-        app.invalidate_layout(InvalidationLevel::Single(mi));
+        app.sync_render_cache_slot(mi, bi);
+        app.recompute_message_retained_bytes(mi);
+        app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
     }
 }
 
@@ -276,7 +280,7 @@ pub(super) fn handle_turn_error_event(
 }
 
 fn push_interrupted_hint(app: &mut App) {
-    app.messages.push(ChatMessage {
+    app.push_message_tracked(ChatMessage {
         role: MessageRole::System(Some(SystemSeverity::Info)),
         blocks: vec![MessageBlock::Text(TextBlock::from_complete(CONVERSATION_INTERRUPTED_HINT))],
         usage: None,
@@ -290,7 +294,7 @@ fn mark_turn_exit_assistant_layout_dirty(app: &mut App, idx: Option<usize>) {
         return;
     };
     if app.messages.get(idx).is_some_and(|msg| matches!(msg.role, MessageRole::Assistant)) {
-        app.invalidate_layout(InvalidationLevel::Single(idx));
+        app.invalidate_layout(InvalidationLevel::MessageChanged(idx));
     }
 }
 

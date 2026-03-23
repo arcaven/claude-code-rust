@@ -297,7 +297,9 @@ fn respond_permission(app: &mut App, override_index: Option<usize>) {
         invalidated = true;
     }
     if invalidated {
-        app.invalidate_layout(InvalidationLevel::Single(mi));
+        app.sync_render_cache_slot(mi, bi);
+        app.recompute_message_retained_bytes(mi);
+        app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
     }
 
     focus_next_inline_interaction(app);
@@ -324,7 +326,9 @@ fn respond_permission_cancel(app: &mut App) {
             model::RequestPermissionOutcome::Cancelled,
         ));
         tc.mark_tool_call_layout_dirty();
-        app.invalidate_layout(InvalidationLevel::Single(mi));
+        app.sync_render_cache_slot(mi, bi);
+        app.recompute_message_retained_bytes(mi);
+        app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
     }
 
     focus_next_inline_interaction(app);
@@ -346,10 +350,10 @@ mod tests {
             title: format!("Tool {id}"),
             sdk_tool_name: "Read".to_owned(),
             raw_input: None,
+            raw_input_bytes: 0,
             output_metadata: None,
             status: model::ToolCallStatus::InProgress,
             content: Vec::new(),
-            collapsed: false,
             hidden: false,
             terminal_id: None,
             terminal_command: None,

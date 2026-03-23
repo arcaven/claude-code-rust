@@ -41,8 +41,10 @@ pub(super) fn invalidate_if_changed(
     dirty_idx: Option<(usize, usize)>,
     changed: bool,
 ) {
-    if changed && let Some((mi, _)) = dirty_idx {
-        app.invalidate_layout(InvalidationLevel::Single(mi));
+    if changed && let Some((mi, bi)) = dirty_idx {
+        app.sync_render_cache_slot(mi, bi);
+        app.recompute_message_retained_bytes(mi);
+        app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
     }
 }
 
@@ -74,7 +76,8 @@ pub(super) fn set_interaction_focused(app: &mut App, queue_index: usize, focused
         }
     }
     if invalidated {
-        app.invalidate_layout(InvalidationLevel::Single(mi));
+        app.sync_render_cache_slot(mi, bi);
+        app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
     }
 }
 

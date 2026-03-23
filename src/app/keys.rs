@@ -4,8 +4,8 @@
 use super::dialog::DialogState;
 use super::paste_burst::CharAction;
 use super::{
-    App, AppStatus, CancelOrigin, FocusOwner, FocusTarget, HelpView, InvalidationLevel,
-    MessageBlock, ModeInfo, ModeState,
+    App, AppStatus, CancelOrigin, FocusOwner, FocusTarget, HelpView, InvalidationLevel, ModeInfo,
+    ModeState,
 };
 use crate::app::inline_interactions::handle_inline_interaction_key;
 use crate::app::selection::clear_selection;
@@ -820,20 +820,9 @@ fn handle_subagent_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
-/// Toggle the session-level collapsed preference and apply to all tool calls.
+/// Toggle the session-level collapsed preference for non-Execute tool calls.
 pub(super) fn toggle_all_tool_calls(app: &mut App) {
     app.tools_collapsed = !app.tools_collapsed;
-    for msg in &mut app.messages {
-        for block in &mut msg.blocks {
-            if let MessageBlock::ToolCall(tc) = block {
-                let tc = tc.as_mut();
-                if tc.collapsed != app.tools_collapsed {
-                    tc.collapsed = app.tools_collapsed;
-                    tc.mark_tool_call_layout_dirty();
-                }
-            }
-        }
-    }
     app.invalidate_layout(InvalidationLevel::Global);
 }
 
