@@ -43,6 +43,7 @@ pub use focus::{FocusManager, FocusOwner, FocusTarget};
 pub use input::InputState;
 pub(crate) use selection::normalize_selection;
 pub use service_status_check::start_service_status_check;
+pub(crate) use state::MarkdownRenderKey;
 pub(crate) use state::cache_metrics;
 pub use state::{
     App, AppStatus, BlockCache, CacheMetrics, CancelOrigin, ChatMessage, ChatViewport, ExtraUsage,
@@ -238,7 +239,7 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
     // --- Graceful shutdown ---
 
     // Dismiss all pending inline permissions (reject via last option)
-    for tool_id in std::mem::take(&mut app.pending_permission_ids) {
+    for tool_id in std::mem::take(&mut app.pending_interaction_ids) {
         if let Some((mi, bi)) = app.tool_call_index.get(&tool_id).copied()
             && let Some(MessageBlock::ToolCall(tc)) =
                 app.messages.get_mut(mi).and_then(|m| m.blocks.get_mut(bi))
@@ -731,6 +732,29 @@ mod tests {
         assert!(app.pending_submit.is_none());
         assert_eq!(app.pending_paste_text, "pasted");
         assert_eq!(app.input.text(), "draft");
+    }
+
+    #[test]
+    fn esc_cancels_deferred_submit_snapshot_before_finalize() {
+        let (mut app, mut rx) = app_with_connection();
+        app.input.set_text("draft");
+
+        events::handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(app.pending_submit.is_some());
+
+        events::handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+
+        assert!(app.pending_submit.is_none());
+        finalize_deferred_submit(&mut app);
+        assert_eq!(app.input.text(), "draft");
+        assert!(app.messages.is_empty());
+        assert!(rx.try_recv().is_err(), "Esc should prevent deferred submit dispatch");
     }
 
     #[test]

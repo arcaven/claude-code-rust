@@ -40,19 +40,36 @@ pub fn handle_terminal_event(app: &mut App, event: Event) {
             app.notifications.on_focus_lost();
             true
         }
-        Event::Resize(_, _) => {
-            // Force a full terminal clear on resize. Without this, terminal
-            // emulators (especially on Windows) corrupt their scrollback buffer
-            // when the alternate screen is resized, causing the visible area to
-            // shift even though ratatui paints the correct content. The clear
-            // resets the terminal's internal state.
-            app.force_redraw = true;
+        Event::Resize(width, height) => {
+            handle_resize(app, width, height);
             true
         }
         // Non-press key events (Release, Repeat) -- ignored.
         Event::Key(_) => false,
     };
     app.needs_redraw |= changed;
+}
+
+fn handle_resize(app: &mut App, width: u16, height: u16) {
+    // Force a full terminal clear on resize. Without this, terminal
+    // emulators (especially on Windows) corrupt their scrollback buffer
+    // when the alternate screen is resized, causing the visible area to
+    // shift even though ratatui paints the correct content. The clear
+    // resets the terminal's internal state.
+    app.force_redraw = true;
+
+    // Interaction-facing geometry is stale until the next frame computes the
+    // new layout. Invalidate it immediately so mouse/selection logic cannot
+    // keep using old hitboxes after a resize event.
+    app.cached_frame_area = ratatui::layout::Rect::new(0, 0, width, height);
+    app.rendered_chat_area = ratatui::layout::Rect::default();
+    app.rendered_input_area = ratatui::layout::Rect::default();
+    app.rendered_chat_lines.clear();
+    app.rendered_input_lines.clear();
+    app.selection = None;
+    app.scrollbar_drag = None;
+
+    crate::ui::help::sync_geometry_state(app, width);
 }
 
 fn dispatch_key_by_view(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
@@ -299,15 +316,18 @@ mod tests {
     use crate::agent::error_handling::TurnErrorClass;
     use crate::agent::events::ClientEvent;
     use crate::agent::events::ServiceStatusSeverity;
+    use crate::agent::events::TerminalProcess;
+    use crate::app::slash::{SlashCandidate, SlashContext, SlashState};
     use crate::app::{
         ActiveView, BlockCache, CancelOrigin, FocusOwner, FocusTarget, HelpView, InlinePermission,
         SelectionKind, SelectionPoint, SelectionState, TextBlockSpacing, TodoItem, TodoStatus,
-        ToolCallInfo, ToolCallScope, mention,
+        ToolCallInfo, ToolCallScope, UsageSnapshot, UsageSourceKind, mention,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use pretty_assertions::assert_eq;
     use ratatui::layout::Rect;
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::sync::oneshot;
 
@@ -735,6 +755,130 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_update_with_same_terminal_content_still_invalidates_command_changes() {
+        let mut app = make_test_app();
+        let tc = model::ToolCall::new("tc-exec-terminal", "Terminal")
+            .kind(model::ToolKind::Execute)
+            .status(model::ToolCallStatus::InProgress)
+            .content(vec![model::ToolCallContent::Terminal(model::TerminalToolCallContent::new(
+                "term-1",
+            ))]);
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::ToolCall(tc)),
+        );
+
+        app.terminals.borrow_mut().insert(
+            "term-1".to_owned(),
+            TerminalProcess {
+                child: None,
+                output_buffer: Arc::new(Mutex::new(Vec::new())),
+                command: "echo refreshed".to_owned(),
+            },
+        );
+
+        let (mi, bi) = app.lookup_tool_call("tc-exec-terminal").expect("tool call not indexed");
+        let before_layout = match &app.messages[mi].blocks[bi] {
+            MessageBlock::ToolCall(tc) => tc.layout_epoch,
+            _ => panic!("expected tool call block"),
+        };
+
+        let update = model::ToolCallUpdate::new(
+            "tc-exec-terminal",
+            model::ToolCallUpdateFields::new().content(vec![model::ToolCallContent::Terminal(
+                model::TerminalToolCallContent::new("term-1"),
+            )]),
+        );
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::ToolCallUpdate(update)),
+        );
+
+        let MessageBlock::ToolCall(tc) = &app.messages[mi].blocks[bi] else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tc.terminal_command.as_deref(), Some("echo refreshed"));
+        assert!(tc.layout_epoch > before_layout);
+        assert_eq!(app.viewport.oldest_stale_index(), Some(mi));
+    }
+
+    #[test]
+    fn late_tool_update_for_removed_tool_does_not_corrupt_active_subagent_set() {
+        let mut app = make_test_app();
+        app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tool_call(
+            "tool-stale",
+            model::ToolCallStatus::Completed,
+        )))]));
+        app.index_tool_call("tool-stale".into(), 0, 0);
+        app.register_tool_call_scope("tool-stale".into(), ToolCallScope::Subagent);
+
+        let removed = app.remove_message_tracked(0);
+        assert!(removed.is_some());
+        assert_eq!(app.tool_call_scope("tool-stale"), None);
+
+        let update = model::ToolCallUpdate::new(
+            "tool-stale",
+            model::ToolCallUpdateFields::new().status(model::ToolCallStatus::InProgress),
+        );
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::ToolCallUpdate(update)),
+        );
+
+        assert!(app.active_subagent_tool_ids.is_empty());
+        assert!(app.active_task_ids.is_empty());
+    }
+
+    #[test]
+    fn repeated_tool_call_updates_existing_execute_snapshot_state() {
+        let mut app = make_test_app();
+        app.terminals.borrow_mut().insert(
+            "term-2".to_owned(),
+            TerminalProcess {
+                child: None,
+                output_buffer: Arc::new(Mutex::new(Vec::new())),
+                command: "echo second".to_owned(),
+            },
+        );
+
+        let first = model::ToolCall::new("tc-dup", "Terminal")
+            .kind(model::ToolKind::Execute)
+            .status(model::ToolCallStatus::InProgress)
+            .content(vec![model::ToolCallContent::Terminal(model::TerminalToolCallContent::new(
+                "term-1",
+            ))])
+            .raw_output(serde_json::json!("first"));
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::ToolCall(first)),
+        );
+
+        let second = model::ToolCall::new("tc-dup", "Terminal")
+            .kind(model::ToolKind::Execute)
+            .status(model::ToolCallStatus::InProgress)
+            .content(vec![model::ToolCallContent::Terminal(model::TerminalToolCallContent::new(
+                "term-2",
+            ))])
+            .raw_output(serde_json::json!("second"));
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::ToolCall(second)),
+        );
+
+        let (mi, bi) = app.lookup_tool_call("tc-dup").expect("tool call not indexed");
+        let MessageBlock::ToolCall(tc) = &app.messages[mi].blocks[bi] else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tc.terminal_output.as_deref(), Some("second"));
+        assert_eq!(tc.terminal_id.as_deref(), Some("term-2"));
+        assert_eq!(tc.terminal_command.as_deref(), Some("echo second"));
+        assert!(app.terminal_tool_calls.iter().any(|entry| entry.terminal_id == "term-2"
+            && entry.msg_idx == mi
+            && entry.block_idx == bi));
+        assert!(app.terminal_tool_calls.iter().all(|entry| entry.terminal_id != "term-1"));
+    }
+
+    #[test]
     fn tool_call_update_noop_does_not_bump_epochs() {
         let mut app = make_test_app();
         let tc = model::ToolCall::new("tc-noop", "Read file")
@@ -846,6 +990,7 @@ mod tests {
             "tc1",
             model::ToolCallStatus::Pending,
         )))]));
+        app.bind_active_turn_assistant_to_tail();
         assert!(tool_calls::has_in_progress_tool_calls(&app));
     }
 
@@ -856,6 +1001,7 @@ mod tests {
             "tc1",
             model::ToolCallStatus::InProgress,
         )))]));
+        app.bind_active_turn_assistant_to_tail();
         assert!(tool_calls::has_in_progress_tool_calls(&app));
     }
 
@@ -888,23 +1034,21 @@ mod tests {
         assert!(!tool_calls::has_in_progress_tool_calls(&app));
     }
 
-    /// Only the LAST message matters - earlier assistant messages are ignored.
+    /// Without an explicit owner, in-progress tools do not count even if the last assistant has them.
     #[test]
-    fn has_in_progress_only_checks_last_message() {
+    fn has_in_progress_requires_explicit_owner() {
         let mut app = make_test_app();
-        // First assistant message has in-progress tool
         app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tool_call(
             "tc1",
             model::ToolCallStatus::InProgress,
         )))]));
-        // Last message is user - should be false
         app.messages.push(user_msg("thanks"));
         assert!(!tool_calls::has_in_progress_tool_calls(&app));
     }
 
-    /// Earlier assistant with in-progress, last assistant all completed.
+    /// The owned assistant decides the result even when another assistant trails later.
     #[test]
-    fn has_in_progress_ignores_earlier_assistant() {
+    fn has_in_progress_uses_owned_assistant_not_latest_assistant() {
         let mut app = make_test_app();
         app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tool_call(
             "tc1",
@@ -915,7 +1059,8 @@ mod tests {
             "tc2",
             model::ToolCallStatus::Completed,
         )))]));
-        assert!(!tool_calls::has_in_progress_tool_calls(&app));
+        app.bind_active_turn_assistant(0);
+        assert!(tool_calls::has_in_progress_tool_calls(&app));
     }
 
     #[test]
@@ -925,6 +1070,7 @@ mod tests {
             MessageBlock::ToolCall(Box::new(tool_call("tc1", model::ToolCallStatus::Completed))),
             MessageBlock::ToolCall(Box::new(tool_call("tc2", model::ToolCallStatus::InProgress))),
         ]));
+        app.bind_active_turn_assistant_to_tail();
         assert!(tool_calls::has_in_progress_tool_calls(&app));
     }
 
@@ -957,6 +1103,7 @@ mod tests {
             model::ToolCallStatus::Pending,
         ))));
         app.messages.push(assistant_msg(blocks));
+        app.bind_active_turn_assistant_to_tail();
         assert!(tool_calls::has_in_progress_tool_calls(&app));
     }
 
@@ -1008,7 +1155,7 @@ mod tests {
         assert!(!app.should_quit);
         assert!(app.session_id.is_none());
         assert_eq!(app.files_accessed, 0);
-        assert!(app.pending_permission_ids.is_empty());
+        assert!(app.pending_interaction_ids.is_empty());
         assert!(!app.tools_collapsed);
         assert!(!app.force_redraw);
         assert!(app.todos.is_empty());
@@ -1173,6 +1320,33 @@ mod tests {
     }
 
     #[test]
+    fn connected_reconciles_trust_for_new_cwd() {
+        let mut app = make_test_app();
+        app.trust.status = crate::app::trust::TrustStatus::Trusted;
+        app.config.committed_preferences_document = serde_json::json!({
+            "projects": {}
+        });
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::Connected {
+                session_id: model::SessionId::new("session-trust"),
+                cwd: "/untrusted".into(),
+                model_name: "claude-updated".into(),
+                available_models: Vec::new(),
+                mode: None,
+                history_updates: Vec::new(),
+            },
+        );
+
+        assert_eq!(app.trust.status, crate::app::trust::TrustStatus::Untrusted);
+        assert_eq!(
+            app.trust.project_key,
+            crate::app::trust::store::normalize_project_key(std::path::Path::new("/untrusted"))
+        );
+    }
+
+    #[test]
     fn connected_updates_welcome_once_even_after_chat_started() {
         let mut app = make_test_app();
         app.welcome_model_resolved = false;
@@ -1189,6 +1363,96 @@ mod tests {
         };
         assert_eq!(welcome.model_name, "claude-updated");
         assert!(app.welcome_model_resolved);
+    }
+
+    #[test]
+    fn persisted_model_change_reopens_welcome_model_reconciliation() {
+        let mut app = make_test_app();
+        app.session_id = Some(model::SessionId::new("session-1"));
+        app.model_name = "default".into();
+        app.messages = vec![ChatMessage::welcome("default", "/test")];
+        crate::app::config::store::set_model(
+            &mut app.config.committed_settings_document,
+            Some("default"),
+        );
+
+        app.update_welcome_model_once();
+        assert!(app.welcome_model_resolved);
+
+        crate::app::config::store::set_model(
+            &mut app.config.committed_settings_document,
+            Some("haiku"),
+        );
+        app.reconcile_runtime_from_persisted_settings_change();
+        assert!(!app.welcome_model_resolved);
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::ConfigOptionUpdate(
+                model::ConfigOptionUpdate {
+                    option_id: "model".into(),
+                    value: serde_json::Value::String("claude-opus-4-6".into()),
+                },
+            )),
+        );
+
+        let Some(MessageBlock::Welcome(welcome)) = app.messages[0].blocks.first() else {
+            panic!("expected welcome block");
+        };
+        assert_eq!(welcome.model_name, "claude-opus-4-6");
+        assert!(app.welcome_model_resolved);
+    }
+
+    #[test]
+    fn connected_resets_session_scoped_view_data() {
+        let mut app = make_test_app();
+        app.messages.push(user_msg("hello"));
+        app.status = AppStatus::Running;
+        app.files_accessed = 9;
+        app.usage.snapshot = Some(UsageSnapshot {
+            source: UsageSourceKind::Oauth,
+            fetched_at: std::time::SystemTime::now(),
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            extra_usage: None,
+        });
+        app.account_info = Some(crate::agent::types::AccountInfo {
+            email: Some("old@example.com".into()),
+            organization: None,
+            subscription_type: None,
+            token_source: None,
+            api_key_source: None,
+        });
+        app.plugins.installed.push(crate::app::plugins::InstalledPluginEntry {
+            id: "old-plugin".into(),
+            version: None,
+            scope: "user".into(),
+            enabled: true,
+            installed_at: None,
+            last_updated: None,
+            project_path: None,
+            capability: crate::app::plugins::PluginCapability::Skill,
+        });
+        app.plugins.last_inventory_refresh_at = Some(Instant::now());
+        app.config.pending_session_title_change =
+            Some(crate::app::config::PendingSessionTitleChangeState {
+                session_id: "old-session".into(),
+                kind: crate::app::config::PendingSessionTitleChangeKind::Generate,
+            });
+
+        handle_client_event(&mut app, connected_event("claude-updated"));
+
+        assert!(matches!(app.status, AppStatus::Ready));
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(app.messages[0].role, MessageRole::Welcome));
+        assert_eq!(app.files_accessed, 0);
+        assert!(app.usage.snapshot.is_none());
+        assert!(app.account_info.is_none());
+        assert!(app.plugins.installed.is_empty());
+        assert!(app.plugins.last_inventory_refresh_at.is_none());
+        assert!(app.config.pending_session_title_change.is_none());
     }
 
     #[test]
@@ -1326,7 +1590,7 @@ mod tests {
             .push(assistant_msg(vec![MessageBlock::Text(TextBlock::from_complete("world"))]));
         app.status = AppStatus::Running;
         app.files_accessed = 9;
-        app.pending_permission_ids.push("perm-1".into());
+        app.pending_interaction_ids.push("perm-1".into());
         app.todo_selected = 2;
         app.show_todo_panel = true;
         app.todos.push(TodoItem {
@@ -1366,7 +1630,7 @@ mod tests {
         assert_eq!(app.messages.len(), 1);
         assert!(matches!(app.messages[0].role, MessageRole::Welcome));
         assert_eq!(app.files_accessed, 0);
-        assert!(app.pending_permission_ids.is_empty());
+        assert!(app.pending_interaction_ids.is_empty());
         assert!(app.todos.is_empty());
         assert!(!app.show_todo_panel);
         assert!(app.mention.is_none());
@@ -1414,6 +1678,156 @@ mod tests {
         );
         assert!(app.mcp.in_flight);
         assert!(app.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn connected_requests_status_snapshot_when_status_tab_is_open() {
+        let (mut app, mut rx) = app_with_bridge_connection();
+        app.active_view = ActiveView::Config;
+        app.config.active_tab = crate::app::config::ConfigTab::Status;
+
+        handle_client_event(&mut app, connected_event("claude-updated"));
+
+        let status = rx.try_recv().expect("status snapshot command");
+        assert_eq!(
+            status.command,
+            crate::agent::wire::BridgeCommand::GetStatusSnapshot {
+                session_id: "test-session".to_owned(),
+            }
+        );
+        let mcp = rx.try_recv().expect("mcp snapshot command");
+        assert_eq!(
+            mcp.command,
+            crate::agent::wire::BridgeCommand::GetMcpSnapshot {
+                session_id: "test-session".to_owned(),
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connected_requests_usage_refresh_when_usage_tab_is_open() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut app = make_test_app();
+                app.active_view = ActiveView::Config;
+                app.config.active_tab = crate::app::ConfigTab::Usage;
+
+                handle_client_event(&mut app, connected_event("claude-updated"));
+
+                assert!(app.usage.in_flight);
+            })
+            .await;
+    }
+
+    #[test]
+    fn stale_status_snapshot_for_old_session_is_ignored() {
+        let mut app = make_test_app();
+        app.session_id = Some(model::SessionId::new("current-session"));
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::StatusSnapshotReceived {
+                session_id: "old-session".into(),
+                account: crate::agent::types::AccountInfo {
+                    email: Some("old@example.com".into()),
+                    organization: None,
+                    subscription_type: None,
+                    token_source: None,
+                    api_key_source: None,
+                },
+            },
+        );
+
+        assert!(app.account_info.is_none());
+    }
+
+    #[test]
+    fn stale_mcp_snapshot_for_old_session_is_ignored() {
+        let mut app = make_test_app();
+        app.session_id = Some(model::SessionId::new("current-session"));
+        app.mcp.servers.push(crate::agent::types::McpServerStatus {
+            name: "current".into(),
+            status: crate::agent::types::McpServerConnectionStatus::Connected,
+            server_info: None,
+            error: None,
+            config: None,
+            scope: None,
+            tools: Vec::new(),
+        });
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::McpSnapshotReceived {
+                session_id: "old-session".into(),
+                servers: vec![crate::agent::types::McpServerStatus {
+                    name: "stale".into(),
+                    status: crate::agent::types::McpServerConnectionStatus::Connected,
+                    server_info: None,
+                    error: None,
+                    config: None,
+                    scope: None,
+                    tools: Vec::new(),
+                }],
+                error: None,
+            },
+        );
+
+        assert_eq!(app.mcp.servers.len(), 1);
+        assert_eq!(app.mcp.servers[0].name, "current");
+    }
+
+    #[test]
+    fn stale_usage_refresh_result_for_old_epoch_is_ignored() {
+        let mut app = make_test_app();
+        app.session_scope_epoch = 5;
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::UsageSnapshotReceived {
+                epoch: 4,
+                snapshot: UsageSnapshot {
+                    source: UsageSourceKind::Oauth,
+                    fetched_at: std::time::SystemTime::now(),
+                    five_hour: None,
+                    seven_day: None,
+                    seven_day_opus: None,
+                    seven_day_sonnet: None,
+                    extra_usage: None,
+                },
+            },
+        );
+
+        assert!(app.usage.snapshot.is_none());
+    }
+
+    #[test]
+    fn stale_plugin_inventory_result_for_old_cwd_is_ignored() {
+        let mut app = make_test_app();
+        app.cwd_raw = "/current".into();
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::PluginsInventoryUpdated {
+                cwd_raw: "/old".into(),
+                snapshot: crate::app::plugins::PluginsInventorySnapshot {
+                    installed: vec![crate::app::plugins::InstalledPluginEntry {
+                        id: "stale-plugin".into(),
+                        version: None,
+                        scope: "user".into(),
+                        enabled: true,
+                        installed_at: None,
+                        last_updated: None,
+                        project_path: None,
+                        capability: crate::app::plugins::PluginCapability::Skill,
+                    }],
+                    marketplace: Vec::new(),
+                    marketplaces: Vec::new(),
+                },
+                claude_path: std::path::PathBuf::from("claude"),
+            },
+        );
+
+        assert!(app.plugins.installed.is_empty());
     }
 
     #[test]
@@ -1722,6 +2136,54 @@ mod tests {
     }
 
     #[test]
+    fn resume_history_clears_active_turn_owner_after_replay() {
+        let mut app = make_test_app();
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionReplaced {
+                session_id: model::SessionId::new("active-790"),
+                cwd: "/replacement".into(),
+                model_name: "new-model".into(),
+                available_models: Vec::new(),
+                mode: None,
+                history_updates: vec![model::SessionUpdate::AgentMessageChunk(
+                    model::ContentChunk::new(model::ContentBlock::Text(model::TextContent::new(
+                        "assistant reply",
+                    ))),
+                )],
+            },
+        );
+
+        assert_eq!(app.active_turn_assistant_idx(), None);
+    }
+
+    #[test]
+    fn resume_history_clears_tool_scope_tracking_after_replay() {
+        let mut app = make_test_app();
+        let task_tool = model::ToolCall::new("resume-task", "Run subagent")
+            .kind(model::ToolKind::Think)
+            .status(model::ToolCallStatus::InProgress)
+            .meta(serde_json::json!({"claudeCode": {"toolName": "Task"}}));
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionReplaced {
+                session_id: model::SessionId::new("active-791"),
+                cwd: "/replacement".into(),
+                model_name: "new-model".into(),
+                available_models: Vec::new(),
+                mode: None,
+                history_updates: vec![model::SessionUpdate::ToolCall(task_tool)],
+            },
+        );
+
+        assert!(app.active_task_ids.is_empty());
+        assert!(app.active_subagent_tool_ids.is_empty());
+        assert_eq!(app.tool_call_scope("resume-task"), None);
+    }
+
+    #[test]
     fn turn_complete_without_cancel_does_not_render_interrupted_hint() {
         let mut app = make_test_app();
         handle_client_event(&mut app, ClientEvent::TurnComplete);
@@ -1814,8 +2276,18 @@ mod tests {
 
         assert!(!app.pending_compact_clear);
         assert!(matches!(app.status, AppStatus::Error));
-        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages.len(), 3);
         assert!(matches!(app.messages[0].role, MessageRole::User));
+        let Some(ChatMessage {
+            role: MessageRole::System(Some(SystemSeverity::Info)), blocks, ..
+        }) = app.messages.get(1)
+        else {
+            panic!("expected compaction success system message");
+        };
+        let Some(MessageBlock::Text(block)) = blocks.first() else {
+            panic!("expected text block");
+        };
+        assert_eq!(block.text, "Session successfully compacted.");
         let Some(ChatMessage { role: MessageRole::System(_), blocks, .. }) = app.messages.last()
         else {
             panic!("expected system error message");
@@ -1825,6 +2297,40 @@ mod tests {
         };
         assert!(block.text.contains("Turn failed: adapter failed"));
         assert!(block.text.contains("Press Ctrl+Q to quit and try again"));
+    }
+
+    #[test]
+    fn turn_cancel_keeps_manual_compaction_success_pending_until_exit() {
+        let mut app = make_test_app();
+        app.pending_compact_clear = true;
+        app.is_compacting = true;
+
+        handle_client_event(&mut app, ClientEvent::TurnCancelled);
+
+        assert!(app.pending_compact_clear);
+        assert!(app.is_compacting);
+    }
+
+    #[test]
+    fn turn_error_after_cancel_keeps_compaction_success_before_interrupted_hint() {
+        let mut app = make_test_app();
+        app.messages.push(user_msg("/compact"));
+        app.pending_compact_clear = true;
+        app.is_compacting = true;
+
+        handle_client_event(&mut app, ClientEvent::TurnCancelled);
+        handle_client_event(&mut app, ClientEvent::TurnError("cancelled".into()));
+
+        assert_eq!(app.messages.len(), 3);
+        assert!(matches!(app.messages[1].role, MessageRole::System(Some(SystemSeverity::Info))));
+        let Some(MessageBlock::Text(block)) = app.messages[1].blocks.first() else {
+            panic!("expected text block");
+        };
+        assert_eq!(block.text, "Session successfully compacted.");
+        let Some(MessageBlock::Text(block)) = app.messages[2].blocks.first() else {
+            panic!("expected text block");
+        };
+        assert_eq!(block.text, "Conversation interrupted. Tell the model how to proceed.");
     }
 
     #[test]
@@ -1891,6 +2397,95 @@ mod tests {
     }
 
     #[test]
+    fn turn_error_clears_tool_scope_tracking() {
+        let mut app = make_test_app();
+        app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tool_call(
+            "task-1",
+            model::ToolCallStatus::InProgress,
+        )))]));
+        app.register_tool_call_scope("task-1".into(), ToolCallScope::Task);
+        app.insert_active_task("task-1".into());
+
+        handle_client_event(&mut app, ClientEvent::TurnError("boom".into()));
+
+        assert!(app.active_task_ids.is_empty());
+        assert!(app.active_subagent_tool_ids.is_empty());
+        assert_eq!(app.tool_call_scope("task-1"), None);
+    }
+
+    #[test]
+    fn auth_required_clears_active_turn_runtime_tracking() {
+        let mut app = make_test_app();
+        app.status = AppStatus::Running;
+        app.session_id = Some(model::SessionId::new("session-auth"));
+        app.model_name = "claude-old".into();
+        app.mode = Some(crate::app::ModeState {
+            current_mode_id: "plan".into(),
+            current_mode_name: "Plan".into(),
+            available_modes: vec![crate::app::ModeInfo { id: "plan".into(), name: "Plan".into() }],
+        });
+        app.fast_mode_state = model::FastModeState::On;
+        app.cached_header_line = Some(ratatui::text::Line::from("cached header"));
+        app.cached_footer_line = Some(ratatui::text::Line::from("cached footer"));
+        app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tool_call(
+            "task-1",
+            model::ToolCallStatus::InProgress,
+        )))]));
+        app.bind_active_turn_assistant(0);
+        app.register_tool_call_scope("task-1".into(), ToolCallScope::Task);
+        app.insert_active_task("task-1".into());
+        app.pending_interaction_ids.push("task-1".into());
+        app.claim_focus_target(FocusTarget::Permission);
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::AuthRequired {
+                method_name: "oauth".into(),
+                method_description: "Open browser".into(),
+            },
+        );
+
+        assert_eq!(app.active_turn_assistant_idx(), None);
+        assert!(app.active_task_ids.is_empty());
+        assert!(app.pending_interaction_ids.is_empty());
+        assert_ne!(app.focus_owner(), FocusOwner::Permission);
+        let Some(MessageBlock::ToolCall(tc)) = app.messages[0].blocks.first() else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tc.status, model::ToolCallStatus::Failed);
+        assert!(app.session_id.is_none());
+        assert_eq!(app.model_name, "Connecting...");
+        assert!(app.mode.is_none());
+        assert_eq!(app.fast_mode_state, model::FastModeState::Off);
+        assert!(app.cached_header_line.is_none());
+        assert!(app.cached_footer_line.is_none());
+    }
+
+    #[test]
+    fn logout_completed_clears_session_runtime_identity_caches() {
+        let mut app = make_test_app();
+        app.session_id = Some(model::SessionId::new("session-x"));
+        app.model_name = "claude-old".into();
+        app.mode = Some(crate::app::ModeState {
+            current_mode_id: "plan".into(),
+            current_mode_name: "Plan".into(),
+            available_modes: vec![crate::app::ModeInfo { id: "plan".into(), name: "Plan".into() }],
+        });
+        app.fast_mode_state = model::FastModeState::On;
+        app.cached_header_line = Some(ratatui::text::Line::from("cached header"));
+        app.cached_footer_line = Some(ratatui::text::Line::from("cached footer"));
+
+        handle_client_event(&mut app, ClientEvent::LogoutCompleted);
+
+        assert!(app.session_id.is_none());
+        assert_eq!(app.model_name, "Connecting...");
+        assert!(app.mode.is_none());
+        assert_eq!(app.fast_mode_state, model::FastModeState::Off);
+        assert!(app.cached_header_line.is_none());
+        assert!(app.cached_footer_line.is_none());
+    }
+
+    #[test]
     fn fatal_event_sets_exit_error_and_quits() {
         let mut app = make_test_app();
 
@@ -1902,6 +2497,53 @@ mod tests {
         assert!(matches!(app.status, AppStatus::Error));
         assert!(app.should_quit);
         assert_eq!(app.exit_error, Some(crate::error::AppError::ConnectionFailed));
+    }
+
+    #[test]
+    fn connection_failed_clears_active_turn_runtime_tracking() {
+        let mut app = make_test_app();
+        app.status = AppStatus::Running;
+        app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tool_call(
+            "task-1",
+            model::ToolCallStatus::InProgress,
+        )))]));
+        app.bind_active_turn_assistant(0);
+        app.register_tool_call_scope("task-1".into(), ToolCallScope::Task);
+        app.insert_active_task("task-1".into());
+
+        handle_client_event(&mut app, ClientEvent::ConnectionFailed("bridge down".into()));
+
+        assert_eq!(app.active_turn_assistant_idx(), None);
+        assert!(app.active_task_ids.is_empty());
+        let Some(MessageBlock::ToolCall(tc)) = app.messages[0].blocks.first() else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tc.status, model::ToolCallStatus::Failed);
+    }
+
+    #[test]
+    fn fatal_event_clears_active_turn_runtime_tracking() {
+        let mut app = make_test_app();
+        app.status = AppStatus::Running;
+        app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tool_call(
+            "task-1",
+            model::ToolCallStatus::InProgress,
+        )))]));
+        app.bind_active_turn_assistant(0);
+        app.register_tool_call_scope("task-1".into(), ToolCallScope::Task);
+        app.insert_active_task("task-1".into());
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::FatalError(crate::error::AppError::ConnectionFailed),
+        );
+
+        assert_eq!(app.active_turn_assistant_idx(), None);
+        assert!(app.active_task_ids.is_empty());
+        let Some(MessageBlock::ToolCall(tc)) = app.messages[0].blocks.first() else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tc.status, model::ToolCallStatus::Failed);
     }
 
     #[test]
@@ -2240,6 +2882,7 @@ mod tests {
     fn help_overlay_left_right_switches_help_view_tab() {
         let mut app = make_test_app();
         app.input.set_text("?");
+        app.help_open = true;
         app.help_view = HelpView::Keys;
 
         dispatch_key_by_focus(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
@@ -2359,14 +3002,14 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
         );
 
-        assert_eq!(app.pending_permission_ids, vec!["perm-b", "perm-a"]);
+        assert_eq!(app.pending_interaction_ids, vec!["perm-b", "perm-a"]);
         assert_eq!(app.todo_selected, 0);
     }
 
     #[test]
     fn permission_focus_allows_typing_for_non_permission_keys() {
         let mut app = make_test_app();
-        app.pending_permission_ids.push("perm-1".into());
+        app.pending_interaction_ids.push("perm-1".into());
         app.claim_focus_target(FocusTarget::Permission);
 
         handle_terminal_event(
@@ -2380,7 +3023,7 @@ mod tests {
     #[test]
     fn permission_focus_allows_ctrl_t_toggle_todos() {
         let mut app = make_test_app();
-        app.pending_permission_ids.push("perm-1".into());
+        app.pending_interaction_ids.push("perm-1".into());
         app.claim_focus_target(FocusTarget::Permission);
         app.todos.push(TodoItem {
             content: "Task".into(),
@@ -2394,6 +3037,108 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
         );
         assert!(app.show_todo_panel);
+    }
+
+    #[test]
+    fn permission_focus_ctrl_t_moves_focus_to_todo_list() {
+        let mut app = make_test_app();
+        let _response_rx = attach_pending_permission(
+            &mut app,
+            "perm-1",
+            vec![
+                model::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    model::PermissionOptionKind::AllowOnce,
+                ),
+                model::PermissionOption::new(
+                    "deny",
+                    "Deny",
+                    model::PermissionOptionKind::RejectOnce,
+                ),
+            ],
+            true,
+        );
+        app.todos.push(TodoItem {
+            content: "Task".into(),
+            status: TodoStatus::Pending,
+            active_form: String::new(),
+        });
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+        );
+
+        assert!(app.show_todo_panel);
+        assert_eq!(app.focus_owner(), FocusOwner::TodoList);
+    }
+
+    #[test]
+    fn stale_inline_interaction_queue_head_is_pruned_before_enter_response() {
+        let mut app = make_test_app();
+        let mut response_rx = attach_pending_permission(
+            &mut app,
+            "perm-1",
+            vec![
+                model::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    model::PermissionOptionKind::AllowOnce,
+                ),
+                model::PermissionOption::new(
+                    "deny",
+                    "Deny",
+                    model::PermissionOptionKind::RejectOnce,
+                ),
+            ],
+            false,
+        );
+        app.pending_interaction_ids.insert(0, "stale-id".into());
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        let response = response_rx.try_recv().expect("permission response");
+        assert!(matches!(response.outcome, model::RequestPermissionOutcome::Selected(_)));
+        assert!(app.pending_interaction_ids.is_empty());
+    }
+
+    #[test]
+    fn permission_focus_tab_moves_focus_to_todo_list() {
+        let mut app = make_test_app();
+        let _response_rx = attach_pending_permission(
+            &mut app,
+            "perm-1",
+            vec![
+                model::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    model::PermissionOptionKind::AllowOnce,
+                ),
+                model::PermissionOption::new(
+                    "deny",
+                    "Deny",
+                    model::PermissionOptionKind::RejectOnce,
+                ),
+            ],
+            true,
+        );
+        app.todos.push(TodoItem {
+            content: "Task".into(),
+            status: TodoStatus::Pending,
+            active_form: String::new(),
+        });
+        app.show_todo_panel = true;
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(app.focus_owner(), FocusOwner::TodoList);
     }
 
     #[test]
@@ -2448,7 +3193,7 @@ mod tests {
         app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tc))]));
         let msg_idx = app.messages.len().saturating_sub(1);
         app.index_tool_call(tool_id.into(), msg_idx, 0);
-        app.pending_permission_ids.push(tool_id.into());
+        app.pending_interaction_ids.push(tool_id.into());
         app.claim_focus_target(FocusTarget::Permission);
         response_rx
     }
@@ -2498,7 +3243,7 @@ mod tests {
             panic!("expected selected permission response");
         };
         assert_eq!(selected.option_id.clone(), "allow");
-        assert!(app.pending_permission_ids.is_empty());
+        assert!(app.pending_interaction_ids.is_empty());
     }
 
     #[test]
@@ -2538,7 +3283,7 @@ mod tests {
             panic!("expected selected permission response");
         };
         assert_eq!(selected.option_id.clone(), "allow-always");
-        assert!(app.pending_permission_ids.is_empty());
+        assert!(app.pending_interaction_ids.is_empty());
     }
 
     #[test]
@@ -2562,7 +3307,18 @@ mod tests {
             true,
         );
 
-        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
+        app.slash = Some(SlashState {
+            trigger_row: 0,
+            trigger_col: 0,
+            query: String::new(),
+            context: SlashContext::CommandName,
+            candidates: vec![SlashCandidate {
+                insert_value: "/config".into(),
+                primary: "/config".into(),
+                secondary: Some("Open settings".into()),
+            }],
+            dialog: crate::app::dialog::DialogState::default(),
+        });
         app.claim_focus_target(FocusTarget::Mention);
         assert_eq!(app.focus_owner(), FocusOwner::Mention);
 
@@ -2576,12 +3332,14 @@ mod tests {
             panic!("expected selected permission response");
         };
         assert_eq!(selected.option_id.clone(), "deny");
-        assert!(app.pending_permission_ids.is_empty());
+        assert!(app.pending_interaction_ids.is_empty());
     }
 
     #[test]
     fn connecting_state_ctrl_c_with_non_empty_selection_does_not_quit() {
         let mut app = make_test_app();
+        let _clipboard =
+            crate::app::keys::override_test_clipboard(crate::app::keys::TestClipboardMode::Succeed);
         app.status = AppStatus::Connecting;
         app.rendered_input_lines = vec!["copy".to_owned()];
         app.selection = Some(crate::app::SelectionState {
@@ -2598,6 +3356,56 @@ mod tests {
 
         assert!(!app.should_quit);
         assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn second_esc_after_permission_rejection_requests_turn_cancel() {
+        let (mut app, mut rx) = app_with_bridge_connection();
+        app.status = AppStatus::Running;
+        app.session_id = Some(model::SessionId::new("session-1"));
+        let mut response_rx = attach_pending_permission(
+            &mut app,
+            "perm-1",
+            vec![
+                model::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    model::PermissionOptionKind::AllowOnce,
+                ),
+                model::PermissionOption::new(
+                    "deny",
+                    "Deny",
+                    model::PermissionOptionKind::RejectOnce,
+                ),
+            ],
+            true,
+        );
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+
+        let response = response_rx.try_recv().expect("first Esc should answer permission");
+        let model::RequestPermissionOutcome::Selected(selected) = response.outcome else {
+            panic!("expected selected permission response");
+        };
+        assert_eq!(selected.option_id.clone(), "deny");
+        assert!(app.pending_interaction_ids.is_empty());
+        assert_eq!(app.pending_cancel_origin, None);
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+
+        assert_eq!(app.pending_cancel_origin, Some(CancelOrigin::Manual));
+        let envelope = rx.try_recv().expect("second Esc should send turn cancel");
+        assert!(matches!(
+            envelope.command,
+            crate::agent::wire::BridgeCommand::CancelTurn { session_id }
+                if session_id == "session-1"
+        ));
     }
 
     #[test]
@@ -2666,6 +3474,8 @@ mod tests {
     #[test]
     fn ctrl_c_with_non_empty_selection_does_not_quit_and_clears_selection() {
         let mut app = make_test_app();
+        let _clipboard =
+            crate::app::keys::override_test_clipboard(crate::app::keys::TestClipboardMode::Succeed);
         app.rendered_input_lines = vec!["copy".to_owned()];
         app.selection = Some(crate::app::SelectionState {
             kind: crate::app::SelectionKind::Input,
@@ -2699,6 +3509,8 @@ mod tests {
     #[test]
     fn ctrl_c_second_press_after_copy_quits() {
         let mut app = make_test_app();
+        let _clipboard =
+            crate::app::keys::override_test_clipboard(crate::app::keys::TestClipboardMode::Succeed);
         app.rendered_input_lines = vec!["copy".to_owned()];
         app.selection = Some(crate::app::SelectionState {
             kind: crate::app::SelectionKind::Input,
@@ -2719,6 +3531,28 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         );
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_with_clipboard_failure_preserves_selection_without_quitting() {
+        let mut app = make_test_app();
+        let _clipboard =
+            crate::app::keys::override_test_clipboard(crate::app::keys::TestClipboardMode::Fail);
+        app.rendered_input_lines = vec!["copy".to_owned()];
+        app.selection = Some(crate::app::SelectionState {
+            kind: crate::app::SelectionKind::Input,
+            start: crate::app::SelectionPoint { row: 0, col: 0 },
+            end: crate::app::SelectionPoint { row: 0, col: 4 },
+            dragging: false,
+        });
+
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        );
+
+        assert!(!app.should_quit);
+        assert!(app.selection.is_some());
     }
 
     #[test]
@@ -2743,6 +3577,8 @@ mod tests {
     #[test]
     fn ctrl_c_with_whitespace_selection_copies_and_clears_selection() {
         let mut app = make_test_app();
+        let _clipboard =
+            crate::app::keys::override_test_clipboard(crate::app::keys::TestClipboardMode::Succeed);
         app.rendered_input_lines = vec!["   ".to_owned()];
         app.selection = Some(crate::app::SelectionState {
             kind: crate::app::SelectionKind::Input,
@@ -2966,7 +3802,18 @@ mod tests {
         });
         app.show_todo_panel = true;
         app.claim_focus_target(FocusTarget::TodoList);
-        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
+        app.slash = Some(SlashState {
+            trigger_row: 0,
+            trigger_col: 0,
+            query: String::new(),
+            context: SlashContext::CommandName,
+            candidates: vec![SlashCandidate {
+                insert_value: "/config".into(),
+                primary: "/config".into(),
+                secondary: Some("Open settings".into()),
+            }],
+            dialog: crate::app::dialog::DialogState::default(),
+        });
         app.claim_focus_target(FocusTarget::Mention);
 
         handle_terminal_event(

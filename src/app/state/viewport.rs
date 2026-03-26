@@ -13,7 +13,7 @@ pub enum LayoutInvalidation {
     MessageChanged(usize),
     /// Messages from `start` onward may have changed structurally (insert/remove/reindex).
     MessagesFrom(usize),
-    /// Terminal width changed. Handled internally by `on_frame()`.
+    /// Terminal geometry changed. Handled internally by `on_frame()`.
     /// Included for completeness; not dispatched through `App::invalidate_layout()`.
     Resize,
     /// Global layout change (for example, tool collapse toggle).
@@ -27,6 +27,19 @@ pub enum LayoutRemeasureReason {
     MessagesFrom,
     Resize,
     Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameGeometryChange {
+    pub width_changed: bool,
+    pub height_changed: bool,
+}
+
+impl FrameGeometryChange {
+    #[must_use]
+    pub fn resized(self) -> bool {
+        self.width_changed || self.height_changed
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +138,8 @@ pub struct ChatViewport {
     // --- Layout ---
     /// Current terminal width. Set by `on_frame()` each render cycle.
     pub width: u16,
+    /// Current terminal height. Set by `on_frame()` each render cycle.
+    pub height: u16,
     /// Monotonic layout generation for width/global layout-affecting changes.
     /// Tool-call measurement cache keys include this to avoid stale heights.
     pub layout_generation: u64,
@@ -167,6 +182,7 @@ impl ChatViewport {
             scrollbar_thumb_size: 0.0,
             auto_scroll: true,
             width: 0,
+            height: 0,
             layout_generation: 1,
             message_heights: Vec::new(),
             message_heights_width: 0,
@@ -180,31 +196,40 @@ impl ChatViewport {
         }
     }
 
-    /// Called at top of each render frame. Detects width change and invalidates
-    /// all cached heights so they get re-measured at the new width.
+    /// Called at top of each render frame.
     ///
-    /// Returns `true` if a resize was detected (width changed).
-    pub fn on_frame(&mut self, width: u16) -> bool {
-        let resized = self.width != 0 && self.width != width;
-        if resized {
+    /// Width and height are tracked through the same entry point, but only width
+    /// changes invalidate message layout. Height changes are viewport-only.
+    #[must_use]
+    pub fn on_frame(&mut self, width: u16, height: u16) -> FrameGeometryChange {
+        let change = FrameGeometryChange {
+            width_changed: self.width != 0 && self.width != width,
+            height_changed: self.height != 0 && self.height != height,
+        };
+        if change.resized() {
             tracing::debug!(
-                "RESIZE: width {} -> {}, scroll_target={}, auto_scroll={}",
+                "RESIZE: width {} -> {}, height {} -> {}, scroll_target={}, auto_scroll={}",
                 self.width,
                 width,
+                self.height,
+                height,
                 self.scroll_target,
                 self.auto_scroll
             );
-            self.handle_resize();
+        }
+        if change.width_changed {
+            self.handle_width_resize();
         }
         self.width = width;
-        resized
+        self.height = height;
+        change
     }
 
-    /// Invalidate height caches on terminal resize.
+    /// Invalidate message layout caches when terminal width changes.
     ///
     /// Old message heights remain as approximations so the next frame can keep
     /// using a stable estimated prefix-sum model while queued remeasurement converges.
-    fn handle_resize(&mut self) {
+    fn handle_width_resize(&mut self) {
         if self.message_heights.is_empty() {
             self.message_heights_width = 0;
             self.prefix_sums_width = 0;
@@ -437,6 +462,45 @@ impl ChatViewport {
         ));
     }
 
+    /// Capture the current message-local scroll anchor when manual scrolling is active.
+    #[must_use]
+    pub fn capture_manual_scroll_anchor(&self) -> Option<(usize, usize)> {
+        (!self.auto_scroll && !self.message_heights.is_empty())
+            .then(|| self.current_scroll_anchor())
+    }
+
+    /// Preserve a message-local anchor across topology or lifecycle-driven layout changes.
+    pub fn preserve_scroll_anchor(
+        &mut self,
+        reason: LayoutRemeasureReason,
+        anchor_index: usize,
+        anchor_offset: usize,
+    ) {
+        if self.message_heights.is_empty() {
+            self.remeasure_plan = None;
+            return;
+        }
+
+        let anchor = PreservedScrollAnchor {
+            reason,
+            index: anchor_index.min(self.message_heights.len().saturating_sub(1)),
+            offset: anchor_offset,
+        };
+
+        if let Some(plan) = self.remeasure_plan.as_mut() {
+            plan.preserved_scroll_anchor = Some(anchor);
+            return;
+        }
+
+        self.remeasure_plan = Some(LayoutRemeasurePlan::from_scroll_anchor(
+            reason,
+            anchor.index,
+            anchor.offset,
+            Some(anchor),
+            self.message_heights.len(),
+        ));
+    }
+
     /// Reset the outward expansion frontiers around the current visible window.
     pub fn ensure_remeasure_anchor(
         &mut self,
@@ -470,8 +534,13 @@ impl ChatViewport {
 
     /// Resume outward remeasurement from the current visible anchor.
     pub fn next_remeasure_index(&mut self, message_count: usize) -> Option<usize> {
+        let prioritize_above_for_anchor = self.remeasure_plan.is_some_and(|plan| {
+            plan.preserved_scroll_anchor
+                .is_some_and(|anchor| !self.prefix_is_exact_through(anchor.index))
+        });
         let plan = self.remeasure_plan.as_mut()?;
         let choose_above = match (plan.next_above, plan.next_below < message_count) {
+            (Some(_), true) if prioritize_above_for_anchor => true,
             (Some(_), true) => {
                 let choose = plan.prefer_above;
                 plan.prefer_above = !plan.prefer_above;
@@ -504,7 +573,17 @@ impl ChatViewport {
         })
     }
 
-    /// Return the preserved pre-resize scroll anchor.
+    /// Return the preserved scroll anchor only once rows above it are exact.
+    #[must_use]
+    pub fn ready_scroll_anchor_to_restore(&self) -> Option<(usize, usize)> {
+        self.remeasure_plan.and_then(|plan| {
+            plan.preserved_scroll_anchor.and_then(|anchor| {
+                self.prefix_is_exact_through(anchor.index).then_some((anchor.index, anchor.offset))
+            })
+        })
+    }
+
+    /// Return the preserved pre-width-resize scroll anchor.
     #[must_use]
     pub fn resize_scroll_anchor(&self) -> Option<(usize, usize)> {
         self.remeasure_plan.and_then(|plan| {
@@ -704,17 +783,37 @@ impl ChatViewport {
         self.message_heights.iter().take(idx).copied().sum()
     }
 
+    fn prefix_is_exact_through(&self, idx: usize) -> bool {
+        if self.message_heights.is_empty() {
+            return false;
+        }
+        let end = idx.min(self.message_heights.len().saturating_sub(1));
+        if self.message_heights_width == self.width {
+            return !self.stale_message_heights.iter().take(end + 1).any(|stale| *stale);
+        }
+        !(0..=end).any(|message_idx| {
+            self.stale_message_heights.get(message_idx).copied().unwrap_or(true)
+                || self.measured_message_widths.get(message_idx).copied().unwrap_or(0) != self.width
+        })
+    }
+
     // --- Scroll ---
 
     /// Scroll up by `lines`. Disables auto-scroll.
+    #[allow(clippy::cast_precision_loss)]
     pub fn scroll_up(&mut self, lines: usize) {
         self.scroll_target = self.scroll_target.saturating_sub(lines);
         self.auto_scroll = false;
+        self.scroll_pos = self.scroll_target as f32;
+        self.scroll_offset = self.scroll_target;
     }
 
     /// Scroll down by `lines`. Auto-scroll re-engagement handled by render.
+    #[allow(clippy::cast_precision_loss)]
     pub fn scroll_down(&mut self, lines: usize) {
         self.scroll_target = self.scroll_target.saturating_add(lines);
+        self.scroll_pos = self.scroll_target as f32;
+        self.scroll_offset = self.scroll_target;
     }
 
     /// Re-engage auto-scroll (stick to bottom).

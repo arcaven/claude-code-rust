@@ -3,7 +3,7 @@
 
 use super::inline_interactions::{
     focus_next_inline_interaction, focused_interaction, focused_interaction_dirty_idx,
-    get_focused_interaction_tc, invalidate_if_changed,
+    get_focused_interaction_tc, invalidate_if_changed, pop_next_valid_interaction_id,
 };
 use super::{App, InvalidationLevel, MessageBlock};
 use crate::agent::model;
@@ -263,10 +263,9 @@ fn question_annotation(
 }
 
 fn respond_question(app: &mut App) {
-    if app.pending_permission_ids.is_empty() {
+    let Some(tool_id) = pop_next_valid_interaction_id(app) else {
         return;
-    }
-    let tool_id = app.pending_permission_ids.remove(0);
+    };
 
     let Some((mi, bi)) = app.tool_call_index.get(&tool_id).copied() else {
         return;
@@ -317,10 +316,9 @@ fn respond_question(app: &mut App) {
 }
 
 fn respond_question_cancel(app: &mut App) {
-    if app.pending_permission_ids.is_empty() {
+    let Some(tool_id) = pop_next_valid_interaction_id(app) else {
         return;
-    }
-    let tool_id = app.pending_permission_ids.remove(0);
+    };
 
     let Some((mi, bi)) = app.tool_call_index.get(&tool_id).copied() else {
         return;
@@ -514,7 +512,7 @@ mod tests {
                 total_questions: 1,
             });
         }
-        app.pending_permission_ids.push(tool_id.to_owned());
+        app.pending_interaction_ids.push(tool_id.to_owned());
         rx
     }
 
@@ -545,7 +543,7 @@ mod tests {
 
         assert_eq!(consumed_right, Some(true));
         assert_eq!(consumed_enter, Some(true));
-        assert!(app.pending_permission_ids.is_empty());
+        assert!(app.pending_interaction_ids.is_empty());
 
         let resp = rx.try_recv().expect("question should be answered");
         let model::RequestQuestionOutcome::Answered(answered) = resp.outcome else {

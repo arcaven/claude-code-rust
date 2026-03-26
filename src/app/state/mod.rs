@@ -13,6 +13,7 @@ pub mod viewport;
 // Re-export all public types so external `use crate::app::state::X` paths still work.
 pub use block_cache::BlockCache;
 pub use cache_metrics::CacheMetrics;
+pub(crate) use messages::MarkdownRenderKey;
 pub use messages::{
     ChatMessage, IncrementalMarkdown, MessageBlock, MessageRole, SystemSeverity, TextBlock,
     TextBlockSpacing, WelcomeBlock,
@@ -35,7 +36,7 @@ pub use viewport::{
 use crate::agent::events::ClientEvent;
 use crate::agent::model;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -65,6 +66,13 @@ impl TerminalToolCallRef {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutocompleteKind {
+    Mention,
+    Slash,
+    Subagent,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub active_view: ActiveView,
@@ -92,6 +100,8 @@ pub struct App {
     pub session_id: Option<model::SessionId>,
     /// Agent connection handle. `None` while connecting (before bridge is ready).
     pub conn: Option<Rc<crate::agent::client::AgentConnection>>,
+    /// Monotonic session authority epoch used to ignore stale async view data.
+    pub session_scope_epoch: u64,
     pub model_name: String,
     /// True once the welcome banner has captured its one-time session model label.
     pub welcome_model_resolved: bool,
@@ -108,15 +118,17 @@ pub struct App {
     pub pending_compact_clear: bool,
     /// Active help overlay view when `?` help is open.
     pub help_view: HelpView,
+    /// Whether the help overlay is explicitly open.
+    pub help_open: bool,
     /// Scroll/selection state for the Slash and Subagents help tabs.
     pub help_dialog: dialog::DialogState,
     /// Number of items that currently fit in the help viewport (updated each render).
     /// Used by key handlers for accurate scroll step size.
     pub help_visible_count: usize,
-    /// Tool call IDs with pending permission prompts, ordered by arrival.
-    /// The first entry is the "focused" permission that receives keyboard input.
+    /// Tool call IDs with pending inline interactions, ordered by arrival.
+    /// The first entry is the focused interaction that receives keyboard input.
     /// Up / Down arrow keys cycle focus through the list.
-    pub pending_permission_ids: Vec<String>,
+    pub pending_interaction_ids: Vec<String>,
     /// Set when a cancel notification succeeds; consumed on `TurnComplete`
     /// to render a red interruption hint in chat.
     pub cancelled_turn_pending_hint: bool,
@@ -129,6 +141,8 @@ pub struct App {
     pub event_rx: mpsc::UnboundedReceiver<ClientEvent>,
     pub spinner_frame: usize,
     pub spinner_last_advance_at: Option<Instant>,
+    /// Message index that owns the current main-assistant turn indicators.
+    pub active_turn_assistant_message_idx: Option<usize>,
     /// Session-level preference for collapsing non-Execute tool call bodies.
     /// Toggled by Ctrl+O and applied at render/layout time.
     pub tools_collapsed: bool,
@@ -371,7 +385,6 @@ impl App {
             ),
         );
         self.welcome_model_resolved = self.model_name_is_authoritative();
-        self.invalidate_layout(InvalidationLevel::MessagesFrom(0));
     }
 
     fn model_name_is_authoritative(&self) -> bool {
@@ -472,6 +485,17 @@ impl App {
         self.tool_call_scopes.get(id).copied()
     }
 
+    #[must_use]
+    pub(crate) fn tracked_terminal_id_for_tool(tc: &ToolCallInfo) -> Option<String> {
+        (tc.is_execute_tool()
+            && matches!(
+                tc.status,
+                model::ToolCallStatus::Pending | model::ToolCallStatus::InProgress
+            ))
+        .then(|| tc.terminal_id.clone())
+        .flatten()
+    }
+
     pub fn mark_subagent_tool_started(&mut self, id: &str) {
         self.active_subagent_tool_ids.insert(id.to_owned());
         self.subagent_idle_since = None;
@@ -556,6 +580,12 @@ impl App {
         self.terminal_tool_call_membership.clear();
     }
 
+    pub(crate) fn sync_after_message_blocks_changed(&mut self, msg_idx: usize) {
+        self.note_render_cache_structure_changed();
+        self.sync_render_cache_message(msg_idx);
+        self.recompute_message_retained_bytes(msg_idx);
+    }
+
     /// Invalidate message layout caches at the given level.
     ///
     /// Single entry point for all layout invalidation. Replaces the former
@@ -580,6 +610,17 @@ impl App {
                 // for exhaustiveness; production code should not reach it.
                 debug_assert!(false, "Resize should not be dispatched through invalidate_layout");
             }
+        }
+    }
+
+    pub(crate) fn invalidate_message_set<I>(&mut self, indices: I)
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let unique: BTreeSet<_> =
+            indices.into_iter().filter(|&idx| idx < self.messages.len()).collect();
+        for idx in unique {
+            self.viewport.invalidate_message(idx);
         }
     }
 
@@ -613,7 +654,6 @@ impl App {
     pub fn finalize_in_progress_tool_calls(&mut self, new_status: model::ToolCallStatus) -> usize {
         let mut changed = 0usize;
         let mut cleared_interaction = false;
-        let mut first_changed_idx: Option<usize> = None;
         let mut changed_message_indices = Vec::new();
         let mut changed_slots = Vec::new();
         let mut detached_terminal = false;
@@ -641,8 +681,6 @@ impl App {
                         if changed_message_indices.last().copied() != Some(msg_idx) {
                             changed_message_indices.push(msg_idx);
                         }
-                        first_changed_idx =
-                            Some(first_changed_idx.map_or(msg_idx, |prev| prev.min(msg_idx)));
                         changed += 1;
                     }
                 }
@@ -657,19 +695,76 @@ impl App {
             self.sync_render_cache_slot(msg_idx, block_idx);
         }
 
-        for msg_idx in changed_message_indices {
+        for msg_idx in changed_message_indices.iter().copied() {
             self.recompute_message_retained_bytes(msg_idx);
         }
 
         if changed > 0 || cleared_interaction {
-            if let Some(msg_idx) = first_changed_idx {
-                self.invalidate_layout(InvalidationLevel::MessageChanged(msg_idx));
-            }
-            self.pending_permission_ids.clear();
+            self.invalidate_message_set(changed_message_indices.iter().copied());
+            self.pending_interaction_ids.clear();
             self.release_focus_target(FocusTarget::Permission);
         }
 
         changed
+    }
+
+    /// Clear any inline permission/question UI still attached to tool calls.
+    /// Returns the number of tool call blocks that changed.
+    pub fn clear_inline_tool_interactions(&mut self) -> usize {
+        let mut changed = 0usize;
+        let mut changed_message_indices = Vec::new();
+        let mut changed_slots = Vec::new();
+
+        for (msg_idx, msg) in self.messages.iter_mut().enumerate() {
+            for (block_idx, block) in msg.blocks.iter_mut().enumerate() {
+                let MessageBlock::ToolCall(tc) = block else {
+                    continue;
+                };
+                let tc = tc.as_mut();
+                let mut block_changed = false;
+                if tc.pending_permission.take().is_some() {
+                    block_changed = true;
+                }
+                if tc.pending_question.take().is_some() {
+                    block_changed = true;
+                }
+                if !block_changed {
+                    continue;
+                }
+                tc.mark_tool_call_layout_dirty();
+                changed_slots.push((msg_idx, block_idx));
+                if changed_message_indices.last().copied() != Some(msg_idx) {
+                    changed_message_indices.push(msg_idx);
+                }
+                changed += 1;
+            }
+        }
+
+        for (msg_idx, block_idx) in changed_slots {
+            self.sync_render_cache_slot(msg_idx, block_idx);
+        }
+
+        for msg_idx in changed_message_indices.iter().copied() {
+            self.recompute_message_retained_bytes(msg_idx);
+        }
+
+        if changed > 0 {
+            self.invalidate_message_set(changed_message_indices.iter().copied());
+        }
+
+        if changed > 0 || !self.pending_interaction_ids.is_empty() {
+            self.pending_interaction_ids.clear();
+            self.release_focus_target(FocusTarget::Permission);
+        }
+
+        changed
+    }
+
+    /// Clear runtime-only turn tracking while preserving the message history itself.
+    pub fn finalize_turn_runtime_artifacts(&mut self, new_status: model::ToolCallStatus) {
+        let _ = self.finalize_in_progress_tool_calls(new_status);
+        let _ = self.clear_inline_tool_interactions();
+        self.clear_tool_scope_tracking();
     }
 
     /// Build a minimal `App` for unit/integration tests.
@@ -697,6 +792,7 @@ impl App {
             exit_error: None,
             session_id: None,
             conn: None,
+            session_scope_epoch: 0,
             model_name: "test-model".into(),
             welcome_model_resolved: true,
             cwd: "/test".into(),
@@ -707,9 +803,10 @@ impl App {
             login_hint: None,
             pending_compact_clear: false,
             help_view: HelpView::Keys,
+            help_open: false,
             help_dialog: dialog::DialogState::default(),
-            help_visible_count: 5,
-            pending_permission_ids: Vec::new(),
+            help_visible_count: 0,
+            pending_interaction_ids: Vec::new(),
             cancelled_turn_pending_hint: false,
             pending_cancel_origin: None,
             pending_auto_submit_after_cancel: false,
@@ -717,6 +814,7 @@ impl App {
             event_rx: rx,
             spinner_frame: 0,
             spinner_last_advance_at: None,
+            active_turn_assistant_message_idx: None,
             tools_collapsed: false,
             active_task_ids: HashSet::default(),
             tool_call_scopes: HashMap::default(),
@@ -816,8 +914,144 @@ impl App {
     }
 
     #[must_use]
+    pub fn active_turn_assistant_idx(&self) -> Option<usize> {
+        self.active_turn_assistant_message_idx.filter(|&idx| {
+            self.messages.get(idx).is_some_and(|msg| matches!(msg.role, MessageRole::Assistant))
+        })
+    }
+
+    pub fn bind_active_turn_assistant(&mut self, idx: usize) {
+        self.active_turn_assistant_message_idx = self
+            .messages
+            .get(idx)
+            .is_some_and(|msg| matches!(msg.role, MessageRole::Assistant))
+            .then_some(idx);
+    }
+
+    pub fn bind_active_turn_assistant_to_tail(&mut self) {
+        if let Some(idx) = self.messages.len().checked_sub(1) {
+            self.bind_active_turn_assistant(idx);
+        } else {
+            self.clear_active_turn_assistant();
+        }
+    }
+
+    pub fn clear_active_turn_assistant(&mut self) {
+        self.active_turn_assistant_message_idx = None;
+    }
+
+    pub fn bump_session_scope_epoch(&mut self) {
+        self.session_scope_epoch = self.session_scope_epoch.saturating_add(1);
+    }
+
+    pub fn clear_session_runtime_identity(&mut self) {
+        self.session_id = None;
+        "Connecting...".clone_into(&mut self.model_name);
+        self.mode = None;
+        self.fast_mode_state = model::FastModeState::Off;
+        self.welcome_model_resolved = false;
+        self.cached_header_line = None;
+        self.cached_footer_line = None;
+    }
+
+    pub fn reconcile_trust_state_from_preferences_and_cwd(&mut self) {
+        let lookup = crate::app::trust::store::read_status(
+            &self.config.committed_preferences_document,
+            Path::new(&self.cwd_raw),
+        );
+        self.trust.project_key = lookup.project_key;
+        self.trust.status = if lookup.trusted {
+            crate::app::trust::TrustStatus::Trusted
+        } else {
+            crate::app::trust::TrustStatus::Untrusted
+        };
+        self.trust.selection = crate::app::trust::TrustSelection::Yes;
+        self.trust.last_error = self
+            .config
+            .preferences_path
+            .is_none()
+            .then(|| "Trust preferences path is not available".to_owned());
+    }
+
+    pub fn reconcile_runtime_from_persisted_settings_change(&mut self) {
+        self.welcome_model_resolved = false;
+        self.reconcile_trust_state_from_preferences_and_cwd();
+        self.update_welcome_model_once();
+    }
+
+    pub(crate) fn shift_active_turn_assistant_for_insert(&mut self, idx: usize) {
+        if let Some(owner_idx) = self.active_turn_assistant_message_idx
+            && idx <= owner_idx
+        {
+            self.active_turn_assistant_message_idx = Some(owner_idx.saturating_add(1));
+        }
+    }
+
+    pub(crate) fn shift_active_turn_assistant_for_remove(&mut self, idx: usize) {
+        let Some(owner_idx) = self.active_turn_assistant_message_idx else {
+            return;
+        };
+        self.active_turn_assistant_message_idx = match idx.cmp(&owner_idx) {
+            std::cmp::Ordering::Less => Some(owner_idx.saturating_sub(1)),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(owner_idx),
+        };
+    }
+
+    #[must_use]
+    pub fn active_autocomplete_kind(&self) -> Option<AutocompleteKind> {
+        if self.mention.is_some() {
+            Some(AutocompleteKind::Mention)
+        } else if self.slash.is_some() {
+            Some(AutocompleteKind::Slash)
+        } else if self.subagent.is_some() {
+            Some(AutocompleteKind::Subagent)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
     pub fn is_help_active(&self) -> bool {
-        self.input.text().trim() == "?"
+        self.help_open
+    }
+
+    #[must_use]
+    pub fn autocomplete_focus_available(&self) -> bool {
+        self.mention.as_ref().is_some_and(mention::MentionState::has_selectable_candidates)
+            || self.slash.is_some()
+            || self.subagent.is_some()
+    }
+
+    pub fn rebuild_chat_focus_from_state(&mut self) {
+        if self.active_view != ActiveView::Chat {
+            return;
+        }
+
+        self.normalize_focus_stack();
+
+        if self.pending_interaction_ids.is_empty() {
+            self.release_focus_target(FocusTarget::Permission);
+        } else {
+            self.claim_focus_target(FocusTarget::Permission);
+        }
+
+        if self.autocomplete_focus_available() {
+            self.claim_focus_target(FocusTarget::Mention);
+        } else {
+            self.release_focus_target(FocusTarget::Mention);
+        }
+
+        if self.is_help_active()
+            && self.pending_interaction_ids.is_empty()
+            && !self.autocomplete_focus_available()
+        {
+            self.claim_focus_target(FocusTarget::Help);
+        } else {
+            self.release_focus_target(FocusTarget::Help);
+        }
+
+        self.normalize_focus_stack();
     }
 
     /// Claim key routing for a navigation target.
@@ -843,8 +1077,8 @@ impl App {
     fn focus_context(&self) -> FocusContext {
         FocusContext::new(
             self.show_todo_panel && !self.todos.is_empty(),
-            self.mention.is_some() || self.slash.is_some() || self.subagent.is_some(),
-            !self.pending_permission_ids.is_empty(),
+            self.autocomplete_focus_available(),
+            !self.pending_interaction_ids.is_empty(),
         )
         .with_help(self.is_help_active())
     }
@@ -873,6 +1107,8 @@ mod tests {
     // =====
 
     use super::*;
+    use crate::app::dialog;
+    use crate::app::slash::{SlashCandidate, SlashContext, SlashState};
     use pretty_assertions::assert_eq;
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
@@ -1430,6 +1666,48 @@ mod tests {
     }
 
     #[test]
+    fn enforce_render_cache_budget_protects_active_streaming_owner_not_physical_tail() {
+        let mut app = make_test_app();
+        app.status = AppStatus::Running;
+        app.messages = vec![
+            ChatMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![assistant_text_block("old message")],
+                usage: None,
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![assistant_text_block("active streaming owner")],
+                usage: None,
+            },
+            ChatMessage {
+                role: MessageRole::System(Some(SystemSeverity::Info)),
+                blocks: vec![assistant_text_block("late trailing system row")],
+                usage: None,
+            },
+        ];
+        app.bind_active_turn_assistant(1);
+
+        if let MessageBlock::Text(block) = &mut app.messages[0].blocks[0] {
+            block.cache.store(vec![Line::from("x".repeat(2000))]);
+        }
+        let protected_bytes = if let MessageBlock::Text(block) = &mut app.messages[1].blocks[0] {
+            block.cache.store(vec![Line::from("y".repeat(4000))]);
+            block.cache.cached_bytes()
+        } else {
+            0
+        };
+        if let MessageBlock::Text(block) = &mut app.messages[2].blocks[0] {
+            block.cache.store(vec![Line::from("z".repeat(5000))]);
+        }
+
+        app.render_cache_budget.max_bytes = 64;
+        let stats = app.enforce_render_cache_budget();
+
+        assert_eq!(stats.protected_bytes, protected_bytes);
+    }
+
+    #[test]
     fn enforce_render_cache_budget_evicts_when_budgeted_over_limit() {
         let mut app = make_test_app();
         app.status = AppStatus::Running;
@@ -1620,6 +1898,48 @@ mod tests {
     }
 
     #[test]
+    fn enforce_history_retention_preserves_active_turn_assistant_message() {
+        let mut app = make_test_app();
+        app.status = AppStatus::Thinking;
+        app.messages = vec![
+            ChatMessage::welcome("model", "/cwd"),
+            user_text_message("drop this"),
+            ChatMessage { role: MessageRole::Assistant, blocks: Vec::new(), usage: None },
+        ];
+        app.bind_active_turn_assistant(2);
+        app.history_retention.max_bytes = 1;
+
+        let stats = app.enforce_history_retention();
+
+        assert_eq!(stats.dropped_messages, 1);
+        assert_eq!(app.active_turn_assistant_idx(), Some(2));
+        assert!(matches!(app.messages[2].role, MessageRole::Assistant));
+    }
+
+    #[test]
+    fn enforce_history_retention_remaps_active_turn_assistant_after_prune() {
+        let mut app = make_test_app();
+        app.status = AppStatus::Thinking;
+        app.messages = vec![
+            user_text_message("drop this"),
+            ChatMessage {
+                role: MessageRole::Assistant,
+                blocks: vec![assistant_text_block("streaming reply")],
+                usage: None,
+            },
+        ];
+        app.bind_active_turn_assistant(1);
+        app.history_retention.max_bytes = App::measure_message_bytes(&app.messages[1]);
+
+        let stats = app.enforce_history_retention();
+
+        assert_eq!(stats.dropped_messages, 1);
+        assert_eq!(app.active_turn_assistant_idx(), Some(1));
+        assert!(App::is_history_hidden_marker_message(&app.messages[0]));
+        assert!(matches!(app.messages[1].role, MessageRole::Assistant));
+    }
+
+    #[test]
     fn enforce_history_retention_keeps_single_marker_on_repeat() {
         let mut app = make_test_app();
         app.messages = vec![ChatMessage::welcome("model", "/cwd"), user_text_message("drop me")];
@@ -1633,6 +1953,38 @@ mod tests {
         assert_eq!(first.dropped_messages, 1);
         assert_eq!(second.dropped_messages, 0);
         assert_eq!(marker_count, 1);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    #[test]
+    fn enforce_history_retention_preserves_manual_scroll_anchor_across_drop_and_marker_insert() {
+        let mut app = make_test_app();
+        app.messages = vec![
+            ChatMessage::welcome("model", "/cwd"),
+            user_text_message("drop me first"),
+            user_text_message("keep this anchored"),
+            user_text_message("tail"),
+        ];
+        let _ = app.viewport.on_frame(40, 12);
+        app.viewport.sync_message_count(app.messages.len());
+        for idx in 0..app.messages.len() {
+            app.viewport.set_message_height(idx, 4);
+        }
+        app.viewport.mark_heights_valid();
+        app.viewport.rebuild_prefix_sums();
+
+        app.viewport.auto_scroll = false;
+        app.viewport.scroll_offset = 9;
+        app.viewport.scroll_target = 9;
+        app.viewport.scroll_pos = 9.0;
+        app.history_retention.max_bytes = app
+            .measure_history_bytes()
+            .saturating_sub(App::measure_message_bytes(&app.messages[1]));
+
+        let _ = app.enforce_history_retention();
+
+        assert!(app.messages.iter().any(App::is_history_hidden_marker_message));
+        assert_eq!(app.viewport.scroll_anchor_to_restore(), Some((2, 1)));
     }
 
     #[test]
@@ -1797,11 +2149,143 @@ mod tests {
         assert_eq!(tc.terminal_id, None);
     }
 
+    #[test]
+    fn insert_message_tracked_nontail_rebuilds_tool_indices_and_invalidates_suffix() {
+        let mut app = make_test_app();
+        app.messages.push(user_text_message("before"));
+        app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::Completed));
+        app.messages.push(user_text_message("after"));
+        app.index_tool_call("tool-1".to_owned(), 1, 0);
+
+        let _ = app.viewport.on_frame(80, 24);
+        app.viewport.sync_message_count(3);
+        app.viewport.mark_heights_valid();
+        app.viewport.rebuild_prefix_sums();
+
+        app.insert_message_tracked(1, user_text_message("inserted"));
+        app.viewport.sync_message_count(app.messages.len());
+
+        assert_eq!(app.lookup_tool_call("tool-1"), Some((2, 0)));
+        assert_eq!(app.viewport.oldest_stale_index(), Some(1));
+        assert_eq!(app.viewport.prefix_dirty_from(), Some(1));
+    }
+
+    #[test]
+    fn remove_message_tracked_nontail_rebuilds_tool_indices_and_invalidates_suffix() {
+        let mut app = make_test_app();
+        app.messages.push(user_text_message("before"));
+        app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::Completed));
+        app.messages.push(user_text_message("after"));
+        app.index_tool_call("tool-1".to_owned(), 1, 0);
+
+        let _ = app.viewport.on_frame(80, 24);
+        app.viewport.sync_message_count(3);
+        app.viewport.mark_heights_valid();
+        app.viewport.rebuild_prefix_sums();
+
+        let removed = app.remove_message_tracked(0);
+        app.viewport.sync_message_count(app.messages.len());
+
+        assert!(removed.is_some());
+        assert_eq!(app.lookup_tool_call("tool-1"), Some((0, 0)));
+        assert_eq!(app.viewport.oldest_stale_index(), Some(0));
+        assert_eq!(app.viewport.prefix_dirty_from(), Some(0));
+    }
+
+    #[test]
+    fn remove_message_tracked_tail_removes_orphaned_tool_indices() {
+        let mut app = make_test_app();
+        app.messages.push(user_text_message("before"));
+        app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::Completed));
+        app.index_tool_call("tool-1".to_owned(), 1, 0);
+
+        let removed = app.remove_message_tracked(1);
+
+        assert!(removed.is_some());
+        assert!(app.lookup_tool_call("tool-1").is_none());
+    }
+
+    #[test]
+    fn remove_message_tracked_prunes_tool_scope_entries() {
+        let mut app = make_test_app();
+        app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::Completed));
+        app.index_tool_call("tool-1".to_owned(), 0, 0);
+        app.register_tool_call_scope("tool-1".to_owned(), ToolCallScope::Subagent);
+
+        let removed = app.remove_message_tracked(0);
+
+        assert!(removed.is_some());
+        assert_eq!(app.tool_call_scope("tool-1"), None);
+    }
+
+    #[test]
+    fn clear_messages_tracked_clears_tool_and_terminal_tracking() {
+        let mut app = make_test_app();
+        app.messages.push(assistant_bash_tool_message(
+            "bash-1",
+            model::ToolCallStatus::InProgress,
+            "term-1",
+        ));
+        app.index_tool_call("bash-1".to_owned(), 0, 0);
+        app.sync_terminal_tool_call("term-1".to_owned(), 0, 0);
+        app.pending_interaction_ids.push("bash-1".into());
+
+        app.clear_messages_tracked();
+
+        assert!(app.messages.is_empty());
+        assert!(app.tool_call_index.is_empty());
+        assert!(app.terminal_tool_calls.is_empty());
+        assert!(app.terminal_tool_call_membership.is_empty());
+        assert!(app.pending_interaction_ids.is_empty());
+    }
+
+    #[test]
+    fn rebuild_tool_indices_skips_completed_terminal_refs() {
+        let mut app = make_test_app();
+        app.messages.push(assistant_bash_tool_message(
+            "bash-1",
+            model::ToolCallStatus::Completed,
+            "term-1",
+        ));
+        app.index_tool_call("bash-1".to_owned(), 0, 0);
+        app.sync_terminal_tool_call("term-1".to_owned(), 0, 0);
+
+        app.rebuild_tool_indices_and_terminal_refs();
+
+        assert!(app.terminal_tool_calls.is_empty());
+        assert!(app.terminal_tool_call_membership.is_empty());
+    }
+
+    #[test]
+    fn finalize_in_progress_tool_calls_invalidates_all_changed_messages() {
+        let mut app = make_test_app();
+        app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::InProgress));
+        app.messages.push(user_text_message("gap"));
+        app.messages.push(assistant_tool_message("tool-2", model::ToolCallStatus::InProgress));
+
+        let _ = app.viewport.on_frame(80, 24);
+        app.viewport.sync_message_count(3);
+        app.viewport.mark_heights_valid();
+        app.viewport.rebuild_prefix_sums();
+
+        let changed = app.finalize_in_progress_tool_calls(model::ToolCallStatus::Completed);
+
+        assert_eq!(changed, 2);
+        assert!(!app.viewport.message_height_is_current(0));
+        assert!(app.viewport.message_height_is_current(1));
+        assert!(!app.viewport.message_height_is_current(2));
+        assert_eq!(app.viewport.oldest_stale_index(), Some(0));
+    }
+
     // IncrementalMarkdown
 
     /// Simple render function for tests: wraps each line in a `Line`.
     fn test_render(src: &str) -> Vec<Line<'static>> {
         src.lines().map(|l| Line::from(l.to_owned())).collect()
+    }
+
+    fn test_render_key() -> super::messages::MarkdownRenderKey {
+        super::messages::MarkdownRenderKey { width: 80, bg: None, preserve_newlines: false }
     }
 
     #[test]
@@ -1850,25 +2334,60 @@ mod tests {
     fn incr_lines_renders_all() {
         let mut incr = IncrementalMarkdown::default();
         incr.append("line1\n\nline2\n\nline3");
-        let lines = incr.lines(&test_render);
+        let lines = incr.lines(test_render_key(), &test_render);
         // test_render maps each source line to one output line
         assert_eq!(lines.len(), 5);
     }
 
     #[test]
-    fn incr_ensure_rendered_noop_preserves_text() {
+    fn incr_ensure_rendered_preserves_text() {
         let mut incr = IncrementalMarkdown::default();
         incr.append("p1\n\np2\n\ntail");
-        incr.ensure_rendered(&test_render);
+        incr.ensure_rendered(test_render_key(), &test_render);
         assert_eq!(incr.full_text(), "p1\n\np2\n\ntail");
     }
 
     #[test]
-    fn incr_invalidate_renders_noop_preserves_text() {
+    fn incr_invalidate_renders_preserves_text() {
         let mut incr = IncrementalMarkdown::default();
         incr.append("p1\n\np2\n\ntail");
         incr.invalidate_renders();
         assert_eq!(incr.full_text(), "p1\n\np2\n\ntail");
+    }
+
+    #[test]
+    fn incr_reuses_rendered_prefix_chunks() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0usize);
+        let render = |src: &str| -> Vec<Line<'static>> {
+            calls.set(calls.get() + 1);
+            test_render(src)
+        };
+
+        let mut incr = IncrementalMarkdown::default();
+        incr.append("p1\n\np2");
+        let _ = incr.lines(test_render_key(), &render);
+        assert_eq!(calls.get(), 2);
+
+        incr.append(" tail");
+        let _ = incr.lines(test_render_key(), &render);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn incr_does_not_split_inside_fenced_code_blocks() {
+        let calls = std::cell::Cell::new(0usize);
+        let render = |src: &str| -> Vec<Line<'static>> {
+            calls.set(calls.get() + 1);
+            test_render(src)
+        };
+
+        let mut incr = IncrementalMarkdown::default();
+        incr.append("```rust\nfn main() {\n\nprintln!(\"hi\");\n}\n```\n\nafter");
+        let _ = incr.lines(test_render_key(), &render);
+
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]
@@ -1900,21 +2419,22 @@ mod tests {
     #[test]
     fn viewport_on_frame_sets_width() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         assert_eq!(vp.width, 80);
+        assert_eq!(vp.height, 24);
     }
 
     #[test]
     fn viewport_on_frame_resize_invalidates() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.set_message_height(0, 10);
         vp.set_message_height(1, 20);
         vp.rebuild_prefix_sums();
 
         // Resize: old heights are kept as approximations,
         // but width markers are invalidated so re-measurement happens.
-        vp.on_frame(120);
+        let _ = vp.on_frame(120, 24);
         assert_eq!(vp.message_height(0), 10); // kept, not zeroed
         assert_eq!(vp.message_height(1), 20); // kept, not zeroed
         assert_eq!(vp.message_heights_width, 0); // forces re-measure
@@ -1924,16 +2444,38 @@ mod tests {
     #[test]
     fn viewport_on_frame_same_width_no_invalidation() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.set_message_height(0, 10);
-        vp.on_frame(80); // same width
+        let _ = vp.on_frame(80, 24); // same width
         assert_eq!(vp.message_height(0), 10); // not zeroed
+    }
+
+    #[test]
+    fn viewport_on_frame_height_change_preserves_message_measurements() {
+        let mut vp = ChatViewport::new();
+        let _ = vp.on_frame(80, 24);
+        vp.sync_message_count(2);
+        vp.set_message_height(0, 10);
+        vp.set_message_height(1, 20);
+        vp.mark_heights_valid();
+        vp.rebuild_prefix_sums();
+
+        let change = vp.on_frame(80, 12);
+
+        assert!(!change.width_changed);
+        assert!(change.height_changed);
+        assert_eq!(vp.height, 12);
+        assert_eq!(vp.message_heights_width, 80);
+        assert_eq!(vp.prefix_sums_width, 80);
+        assert!(!vp.resize_remeasure_active());
+        assert!(vp.message_height_is_current(0));
+        assert!(vp.message_height_is_current(1));
     }
 
     #[test]
     fn viewport_message_height_set_and_get() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.set_message_height(0, 5);
         vp.set_message_height(1, 10);
         assert_eq!(vp.message_height(0), 5);
@@ -1944,7 +2486,7 @@ mod tests {
     #[test]
     fn viewport_message_height_grows_vec() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.set_message_height(5, 42);
         assert_eq!(vp.message_heights.len(), 6);
         assert_eq!(vp.message_height(5), 42);
@@ -1965,7 +2507,7 @@ mod tests {
     #[test]
     fn viewport_mark_heights_valid_clears_dirty_index() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.sync_message_count(2);
         vp.mark_heights_valid();
         vp.invalidate_message(1);
@@ -1977,14 +2519,14 @@ mod tests {
     #[test]
     fn viewport_resize_remeasure_tracks_partial_exactness() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.sync_message_count(3);
         vp.set_message_height(0, 4);
         vp.set_message_height(1, 5);
         vp.set_message_height(2, 6);
         vp.mark_heights_valid();
 
-        vp.on_frame(120);
+        let _ = vp.on_frame(120, 24);
         assert!(vp.resize_remeasure_active());
         assert!(!vp.message_height_is_current(0));
 
@@ -2001,17 +2543,17 @@ mod tests {
     #[test]
     fn viewport_resize_remeasure_expands_outward_from_anchor() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.sync_message_count(6);
         vp.mark_heights_valid();
 
-        vp.on_frame(100);
+        let _ = vp.on_frame(100, 24);
         vp.ensure_resize_remeasure_anchor(2, 3, 6);
 
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(4));
         assert_eq!(vp.next_resize_remeasure_index(6), Some(1));
-        assert_eq!(vp.next_resize_remeasure_index(6), Some(5));
         assert_eq!(vp.next_resize_remeasure_index(6), Some(0));
+        assert_eq!(vp.next_resize_remeasure_index(6), Some(4));
+        assert_eq!(vp.next_resize_remeasure_index(6), Some(5));
         assert_eq!(vp.next_resize_remeasure_index(6), None);
         assert!(!vp.resize_remeasure_active());
     }
@@ -2020,7 +2562,7 @@ mod tests {
     #[test]
     fn viewport_restore_resize_anchor_keeps_same_message_visible() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.sync_message_count(4);
         for idx in 0..4 {
             vp.set_message_height(idx, 5);
@@ -2033,7 +2575,7 @@ mod tests {
         vp.scroll_target = 7;
         vp.scroll_pos = 7.0;
 
-        vp.on_frame(40);
+        let _ = vp.on_frame(40, 24);
         let (anchor_idx, anchor_offset) =
             vp.resize_scroll_anchor().expect("resize should snapshot a scroll anchor");
         assert_eq!((anchor_idx, anchor_offset), (1, 2));
@@ -2054,7 +2596,7 @@ mod tests {
     #[test]
     fn viewport_preserves_resize_anchor_when_followup_remeasure_replaces_plan() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.sync_message_count(4);
         for idx in 0..4 {
             vp.set_message_height(idx, 5);
@@ -2067,7 +2609,7 @@ mod tests {
         vp.scroll_target = 7;
         vp.scroll_pos = 7.0;
 
-        vp.on_frame(40);
+        let _ = vp.on_frame(40, 24);
         let resize_anchor = vp.resize_scroll_anchor().expect("resize should preserve an anchor");
         assert_eq!(resize_anchor, (1, 2));
         assert_eq!(vp.remeasure_reason(), Some(LayoutRemeasureReason::Resize));
@@ -2081,9 +2623,70 @@ mod tests {
 
     #[allow(clippy::cast_precision_loss)]
     #[test]
+    fn viewport_delays_anchor_restore_until_prefix_above_is_exact() {
+        let mut vp = ChatViewport::new();
+        let _ = vp.on_frame(80, 24);
+        vp.sync_message_count(4);
+        for idx in 0..4 {
+            vp.set_message_height(idx, 5);
+        }
+        vp.mark_heights_valid();
+        vp.rebuild_prefix_sums();
+
+        vp.auto_scroll = false;
+        vp.scroll_offset = 12;
+        vp.scroll_target = 12;
+        vp.scroll_pos = 12.0;
+
+        let _ = vp.on_frame(40, 24);
+        let anchor = vp.resize_scroll_anchor().expect("resize should preserve an anchor");
+        assert_eq!(anchor, (2, 2));
+        assert_eq!(vp.scroll_anchor_to_restore(), Some(anchor));
+        assert_eq!(vp.ready_scroll_anchor_to_restore(), None);
+
+        vp.set_message_height(2, 9);
+        vp.mark_message_height_measured(2);
+        vp.rebuild_prefix_sums();
+        assert_eq!(vp.ready_scroll_anchor_to_restore(), None);
+
+        vp.set_message_height(0, 11);
+        vp.mark_message_height_measured(0);
+        vp.set_message_height(1, 8);
+        vp.mark_message_height_measured(1);
+        vp.rebuild_prefix_sums();
+
+        assert_eq!(vp.ready_scroll_anchor_to_restore(), Some(anchor));
+    }
+
+    #[test]
+    fn viewport_prioritizes_rows_above_preserved_anchor_until_restore_is_exact() {
+        let mut vp = ChatViewport::new();
+        let _ = vp.on_frame(80, 24);
+        vp.sync_message_count(6);
+        for idx in 0..6 {
+            vp.set_message_height(idx, 5);
+        }
+        vp.mark_heights_valid();
+        vp.rebuild_prefix_sums();
+
+        vp.auto_scroll = false;
+        vp.scroll_offset = 12;
+        vp.scroll_target = 12;
+        vp.scroll_pos = 12.0;
+
+        let _ = vp.on_frame(40, 24);
+        vp.ensure_resize_remeasure_anchor(2, 3, 6);
+
+        assert_eq!(vp.next_resize_remeasure_index(6), Some(1));
+        assert_eq!(vp.next_resize_remeasure_index(6), Some(0));
+        assert_eq!(vp.next_resize_remeasure_index(6), Some(4));
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    #[test]
     fn viewport_global_remeasure_preserves_anchor_while_prefix_above_converges() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.sync_message_count(6);
         for idx in 0..6 {
             vp.set_message_height(idx, 5);
@@ -2123,7 +2726,7 @@ mod tests {
     #[test]
     fn viewport_prefix_sums_basic() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.set_message_height(0, 5);
         vp.set_message_height(1, 10);
         vp.set_message_height(2, 3);
@@ -2137,7 +2740,7 @@ mod tests {
     #[test]
     fn viewport_prefix_sums_streaming_fast_path() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.set_message_height(0, 5);
         vp.set_message_height(1, 10);
         vp.rebuild_prefix_sums();
@@ -2153,7 +2756,7 @@ mod tests {
     #[test]
     fn viewport_find_first_visible() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.set_message_height(0, 10);
         vp.set_message_height(1, 10);
         vp.set_message_height(2, 10);
@@ -2168,7 +2771,7 @@ mod tests {
     #[test]
     fn viewport_find_first_visible_handles_offsets_before_first_boundary() {
         let mut vp = ChatViewport::new();
-        vp.on_frame(80);
+        let _ = vp.on_frame(80, 24);
         vp.set_message_height(0, 10);
         vp.set_message_height(1, 10);
         vp.rebuild_prefix_sums();
@@ -2182,14 +2785,20 @@ mod tests {
     fn viewport_scroll_up_down() {
         let mut vp = ChatViewport::new();
         vp.scroll_target = 20;
+        vp.scroll_pos = 20.0;
+        vp.scroll_offset = 20;
         vp.auto_scroll = true;
 
         vp.scroll_up(5);
         assert_eq!(vp.scroll_target, 15);
+        assert!((vp.scroll_pos - 15.0).abs() < f32::EPSILON);
+        assert_eq!(vp.scroll_offset, 15);
         assert!(!vp.auto_scroll); // disabled on manual scroll
 
         vp.scroll_down(3);
         assert_eq!(vp.scroll_target, 18);
+        assert!((vp.scroll_pos - 18.0).abs() < f32::EPSILON);
+        assert_eq!(vp.scroll_offset, 18);
         assert!(!vp.auto_scroll); // not re-engaged by scroll_down
     }
 
@@ -2197,8 +2806,12 @@ mod tests {
     fn viewport_scroll_up_saturates() {
         let mut vp = ChatViewport::new();
         vp.scroll_target = 2;
+        vp.scroll_pos = 2.0;
+        vp.scroll_offset = 2;
         vp.scroll_up(10);
         assert_eq!(vp.scroll_target, 0);
+        assert!(vp.scroll_pos.abs() < f32::EPSILON);
+        assert_eq!(vp.scroll_offset, 0);
     }
 
     #[test]
@@ -2247,7 +2860,7 @@ mod tests {
         });
         app.show_todo_panel = true;
         app.claim_focus_target(FocusTarget::TodoList);
-        app.pending_permission_ids.push("perm-1".into());
+        app.pending_interaction_ids.push("perm-1".into());
         app.claim_focus_target(FocusTarget::Permission);
         assert_eq!(app.focus_owner(), FocusOwner::Permission);
     }
@@ -2262,9 +2875,20 @@ mod tests {
         });
         app.show_todo_panel = true;
         app.claim_focus_target(FocusTarget::TodoList);
-        app.pending_permission_ids.push("perm-1".into());
+        app.pending_interaction_ids.push("perm-1".into());
         app.claim_focus_target(FocusTarget::Permission);
-        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
+        app.slash = Some(SlashState {
+            trigger_row: 0,
+            trigger_col: 0,
+            query: String::new(),
+            context: SlashContext::CommandName,
+            candidates: vec![SlashCandidate {
+                insert_value: "/config".into(),
+                primary: "/config".into(),
+                secondary: Some("Open settings".into()),
+            }],
+            dialog: dialog::DialogState::default(),
+        });
         app.claim_focus_target(FocusTarget::Mention);
         assert_eq!(app.focus_owner(), FocusOwner::Mention);
     }
@@ -2300,8 +2924,19 @@ mod tests {
             active_form: String::new(),
         });
         app.show_todo_panel = true;
-        app.mention = Some(mention::MentionState::new(0, 0, String::new(), Vec::new()));
-        app.pending_permission_ids.push("perm-1".into());
+        app.slash = Some(SlashState {
+            trigger_row: 0,
+            trigger_col: 0,
+            query: String::new(),
+            context: SlashContext::CommandName,
+            candidates: vec![SlashCandidate {
+                insert_value: "/config".into(),
+                primary: "/config".into(),
+                secondary: Some("Open settings".into()),
+            }],
+            dialog: dialog::DialogState::default(),
+        });
+        app.pending_interaction_ids.push("perm-1".into());
 
         app.claim_focus_target(FocusTarget::TodoList);
         assert_eq!(app.focus_owner(), FocusOwner::TodoList);
@@ -2324,7 +2959,7 @@ mod tests {
         app.messages.push(user_text_message("a"));
         app.messages.push(user_text_message("b"));
         app.messages.push(user_text_message("c"));
-        app.viewport.on_frame(80);
+        let _ = app.viewport.on_frame(80, 24);
         app.viewport.set_message_height(0, 5);
         app.viewport.set_message_height(1, 10);
         app.viewport.set_message_height(2, 3);
@@ -2344,7 +2979,7 @@ mod tests {
         app.messages.push(user_text_message("a"));
         app.messages.push(user_text_message("b"));
         app.messages.push(user_text_message("c"));
-        app.viewport.on_frame(80);
+        let _ = app.viewport.on_frame(80, 24);
         app.viewport.set_message_height(0, 5);
         app.viewport.set_message_height(1, 10);
         app.viewport.set_message_height(2, 3);
@@ -2364,7 +2999,7 @@ mod tests {
         app.messages.push(user_text_message("a"));
         app.messages.push(user_text_message("b"));
         app.messages.push(user_text_message("c"));
-        app.viewport.on_frame(80);
+        let _ = app.viewport.on_frame(80, 24);
         app.viewport.set_message_height(0, 5);
         app.viewport.set_message_height(1, 10);
         app.viewport.set_message_height(2, 3);
@@ -2386,7 +3021,7 @@ mod tests {
         app.messages.push(user_text_message("a"));
         app.messages.push(user_text_message("b"));
         app.messages.push(user_text_message("c"));
-        app.viewport.on_frame(80);
+        let _ = app.viewport.on_frame(80, 24);
         app.viewport.set_message_height(0, 5);
         app.viewport.set_message_height(1, 10);
         app.viewport.set_message_height(2, 3);
@@ -2406,7 +3041,7 @@ mod tests {
         app.messages.push(user_text_message("a"));
         app.messages.push(user_text_message("b"));
         app.messages.push(user_text_message("c"));
-        app.viewport.on_frame(80);
+        let _ = app.viewport.on_frame(80, 24);
         app.viewport.sync_message_count(3);
         app.viewport.mark_heights_valid();
         app.viewport.rebuild_prefix_sums();

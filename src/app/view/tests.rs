@@ -1,4 +1,5 @@
 use super::*;
+use crate::app::config::{ConfigOverlayState, OutputStyle, OutputStyleOverlayState};
 use crate::app::dialog::DialogState;
 use crate::app::slash::{SlashContext, SlashState};
 use crate::app::state::types::ScrollbarDragState;
@@ -53,7 +54,7 @@ fn busy_view_test_app() -> App {
         active_form: "todo".to_owned(),
     }];
     app.claim_focus_target(FocusTarget::TodoList);
-    app.pending_permission_ids.push("perm-1".to_owned());
+    app.pending_interaction_ids.push("perm-1".to_owned());
     app.claim_focus_target(FocusTarget::Permission);
     app
 }
@@ -102,4 +103,49 @@ fn set_active_view_same_view_is_noop() {
     assert!(!app.pending_paste_text.is_empty());
     assert!(app.pending_submit.is_some());
     assert!(!app.needs_redraw);
+}
+
+#[test]
+fn set_active_view_restores_permission_focus_when_returning_to_chat() {
+    let mut app = busy_view_test_app();
+
+    set_active_view(&mut app, ActiveView::Trusted);
+    assert_eq!(app.active_view, ActiveView::Trusted);
+
+    set_active_view(&mut app, ActiveView::Chat);
+
+    assert_eq!(app.active_view, ActiveView::Chat);
+    assert_eq!(app.focus_owner(), crate::app::FocusOwner::Permission);
+}
+
+#[test]
+fn set_active_view_closes_help_without_clearing_question_mark_draft() {
+    let mut app = App::test_default();
+    app.input.set_text("?");
+    app.help_open = true;
+    app.help_view = crate::app::HelpView::Subagents;
+    app.help_visible_count = 7;
+
+    set_active_view(&mut app, ActiveView::Trusted);
+    assert_eq!(app.input.text(), "?");
+    assert!(!app.is_help_active());
+    assert_eq!(app.help_view, crate::app::HelpView::Keys);
+    assert_eq!(app.help_visible_count, 0);
+
+    set_active_view(&mut app, ActiveView::Chat);
+    assert_eq!(app.input.text(), "?");
+    assert!(!app.is_help_active());
+}
+
+#[test]
+fn leaving_config_clears_config_overlay() {
+    let mut app = App::test_default();
+    app.active_view = ActiveView::Config;
+    app.config.overlay = Some(ConfigOverlayState::OutputStyle(OutputStyleOverlayState {
+        selected: OutputStyle::Default,
+    }));
+
+    set_active_view(&mut app, ActiveView::Trusted);
+
+    assert!(app.config.overlay.is_none());
 }

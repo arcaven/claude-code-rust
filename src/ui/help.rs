@@ -19,6 +19,7 @@ const SUBAGENT_NAME_MIN_WIDTH: usize = 12;
 const SUBAGENT_NAME_MAX_WIDTH: usize = 28;
 const SUBAGENT_NAME_MAX_SHARE_NUM: usize = 2;
 const SUBAGENT_NAME_MAX_SHARE_DEN: usize = 5;
+const HELP_PANEL_HEIGHT: u16 = 14;
 
 pub fn is_active(app: &App) -> bool {
     app.is_help_active()
@@ -34,9 +35,21 @@ pub fn compute_height(app: &App, _area_width: u16) -> u16 {
     if !is_active(app) {
         return 0;
     }
-    // Fixed height for all tabs so the panel does not jump when switching.
-    // MAX_ROWS content lines + vertical padding + border top/bottom.
-    (MAX_ROWS + HELP_VERTICAL_PADDING_LINES * 2) as u16 + 2
+    HELP_PANEL_HEIGHT
+}
+
+pub(crate) fn sync_geometry_state(app: &mut App, panel_width: u16) {
+    if !is_active(app) || panel_width == 0 {
+        app.help_visible_count = 0;
+        return;
+    }
+
+    let items = build_help_items(app);
+    let visible_count = visible_count_for_view(app, &items, panel_width);
+    if matches!(app.help_view, HelpView::SlashCommands | HelpView::Subagents) {
+        app.help_dialog.clamp(items.len(), visible_count);
+    }
+    app.help_visible_count = visible_count;
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -119,28 +132,8 @@ fn render_two_column_help(
     items: &[(String, String)],
 ) {
     let inner_width = area.width.saturating_sub(2) as usize;
-    // Compute column widths from ALL items so they stay stable while scrolling.
     let (name_width, desc_width) = help_item_column_widths(items, inner_width);
-
-    // Available content lines after borders and vertical padding.
-    let available_lines =
-        area.height.saturating_sub(2).saturating_sub(HELP_VERTICAL_PADDING_LINES as u16 * 2)
-            as usize;
-
-    // Dynamically compute how many items fit from the current scroll offset,
-    // accounting for each item's actual wrapped height and spacer lines.
-    let visible_count = compute_visible_count(
-        items,
-        app.help_dialog.scroll_offset,
-        available_lines,
-        name_width,
-        desc_width,
-    );
-
-    // Clamp scroll/selection with the dynamic viewport size and cache it
-    // so the key handler uses the same value on the next keypress.
-    app.help_dialog.clamp(items.len(), visible_count);
-    app.help_visible_count = visible_count;
+    let visible_count = visible_count_for_view(app, items, area.width);
 
     let start = app.help_dialog.scroll_offset;
     let end = (start + visible_count).min(items.len());
@@ -202,6 +195,27 @@ fn render_two_column_help(
     .block(block);
 
     frame.render_widget(table, area);
+}
+
+fn visible_count_for_view(app: &App, items: &[(String, String)], panel_width: u16) -> usize {
+    if items.is_empty() || panel_width == 0 {
+        return 0;
+    }
+
+    match app.help_view {
+        HelpView::Keys => items.len().div_ceil(2).min(MAX_ROWS),
+        HelpView::SlashCommands | HelpView::Subagents => {
+            let inner_width = panel_width.saturating_sub(2) as usize;
+            let (name_width, desc_width) = help_item_column_widths(items, inner_width);
+            compute_visible_count(
+                items,
+                app.help_dialog.scroll_offset,
+                MAX_ROWS,
+                name_width,
+                desc_width,
+            )
+        }
+    }
 }
 
 fn build_help_items(app: &App) -> Vec<(String, String)> {
@@ -291,8 +305,8 @@ fn build_key_help_items(app: &App) -> Vec<(String, String)> {
     }
 
     // Inline interactions (permissions or questions)
-    if !app.pending_permission_ids.is_empty() && focus_owner == FocusOwner::Permission {
-        if app.pending_permission_ids.len() > 1 {
+    if !app.pending_interaction_ids.is_empty() && focus_owner == FocusOwner::Permission {
+        if app.pending_interaction_ids.len() > 1 {
             items.push(("Up/Down".to_owned(), "Switch prompt focus".to_owned()));
         }
         if focused_question_prompt(app) {
@@ -315,7 +329,7 @@ fn build_key_help_items(app: &App) -> Vec<(String, String)> {
 }
 
 fn focused_question_prompt(app: &App) -> bool {
-    let Some(tool_id) = app.pending_permission_ids.first() else {
+    let Some(tool_id) = app.pending_interaction_ids.first() else {
         return false;
     };
     let Some((mi, bi)) = app.lookup_tool_call(tool_id) else {
@@ -734,7 +748,7 @@ mod tests {
     #[test]
     fn permission_navigation_only_shown_when_permission_has_focus() {
         let mut app = App::test_default();
-        app.pending_permission_ids = vec!["perm-1".into(), "perm-2".into()];
+        app.pending_interaction_ids = vec!["perm-1".into(), "perm-2".into()];
 
         // Without permission focus claim, do not show permission-only arrows.
         let items = build_help_items(&app);

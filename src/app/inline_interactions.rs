@@ -7,7 +7,18 @@ use super::{
 use crossterm::event::{KeyCode, KeyEvent};
 
 pub(super) fn focused_interaction_id(app: &App) -> Option<&str> {
-    app.pending_permission_ids.first().map(String::as_str)
+    app.pending_interaction_ids.first().map(String::as_str)
+}
+
+fn interaction_id_is_valid(app: &App, tool_id: &str) -> bool {
+    let Some((mi, bi)) = app.lookup_tool_call(tool_id) else {
+        return false;
+    };
+    matches!(
+        app.messages.get(mi).and_then(|msg| msg.blocks.get(bi)),
+        Some(MessageBlock::ToolCall(tc))
+            if tc.pending_permission.is_some() || tc.pending_question.is_some()
+    )
 }
 
 pub(super) fn focused_interaction(app: &App) -> Option<&ToolCallInfo> {
@@ -49,7 +60,7 @@ pub(super) fn invalidate_if_changed(
 }
 
 pub(super) fn set_interaction_focused(app: &mut App, queue_index: usize, focused: bool) {
-    let Some(tool_id) = app.pending_permission_ids.get(queue_index) else {
+    let Some(tool_id) = app.pending_interaction_ids.get(queue_index) else {
         return;
     };
     let Some((mi, bi)) = app.tool_call_index.get(tool_id).copied() else {
@@ -89,12 +100,45 @@ pub(super) fn focused_interaction_is_active(app: &App) -> bool {
 }
 
 pub(super) fn focus_next_inline_interaction(app: &mut App) {
+    normalize_pending_interaction_queue(app);
     set_interaction_focused(app, 0, true);
-    if app.pending_permission_ids.is_empty() {
+    if app.pending_interaction_ids.is_empty() {
         app.release_focus_target(FocusTarget::Permission);
     } else {
         app.claim_focus_target(FocusTarget::Permission);
     }
+}
+
+pub(super) fn normalize_pending_interaction_queue(app: &mut App) {
+    let previous = std::mem::take(&mut app.pending_interaction_ids);
+    let previous_order = previous.clone();
+    let mut queue = Vec::with_capacity(previous.len());
+    for id in previous {
+        if interaction_id_is_valid(app, &id) {
+            queue.push(id);
+        }
+    }
+    let changed = queue != previous_order;
+    app.pending_interaction_ids = queue;
+
+    if app.pending_interaction_ids.is_empty() {
+        app.release_focus_target(FocusTarget::Permission);
+        app.normalize_focus_stack();
+        return;
+    }
+
+    if changed {
+        for idx in 0..app.pending_interaction_ids.len() {
+            set_interaction_focused(app, idx, idx == 0);
+        }
+    }
+    app.claim_focus_target(FocusTarget::Permission);
+    app.normalize_focus_stack();
+}
+
+pub(super) fn pop_next_valid_interaction_id(app: &mut App) -> Option<String> {
+    normalize_pending_interaction_queue(app);
+    (!app.pending_interaction_ids.is_empty()).then(|| app.pending_interaction_ids.remove(0))
 }
 
 pub(super) fn handle_interaction_focus_cycle(
@@ -109,7 +153,7 @@ pub(super) fn handle_interaction_focus_cycle(
     if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
         return None;
     }
-    if app.pending_permission_ids.len() <= 1 {
+    if app.pending_interaction_ids.len() <= 1 {
         if blocks_vertical_navigation {
             return None;
         }
@@ -119,13 +163,13 @@ pub(super) fn handle_interaction_focus_cycle(
     set_interaction_focused(app, 0, false);
 
     if key.code == KeyCode::Down {
-        let first = app.pending_permission_ids.remove(0);
-        app.pending_permission_ids.push(first);
+        let first = app.pending_interaction_ids.remove(0);
+        app.pending_interaction_ids.push(first);
     } else {
-        let Some(last) = app.pending_permission_ids.pop() else {
+        let Some(last) = app.pending_interaction_ids.pop() else {
             return Some(false);
         };
-        app.pending_permission_ids.insert(0, last);
+        app.pending_interaction_ids.insert(0, last);
     }
 
     set_interaction_focused(app, 0, true);
@@ -134,6 +178,7 @@ pub(super) fn handle_interaction_focus_cycle(
 }
 
 pub(super) fn handle_inline_interaction_key(app: &mut App, key: KeyEvent) -> bool {
+    normalize_pending_interaction_queue(app);
     let interaction_has_focus = focused_interaction_is_active(app);
     let has_question = questions::has_focused_question(app);
     let plan_approval = permissions::focused_permission_is_plan_approval(app);

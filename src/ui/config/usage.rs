@@ -4,7 +4,7 @@ use crate::app::{App, ExtraUsage, UsageWindow};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Wrap};
 
 pub(super) fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -19,17 +19,19 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &App) {
     if windows.is_empty() {
         constraints.push(Constraint::Min(3));
     } else {
-        for _ in &windows {
-            constraints.push(Constraint::Length(3));
+        for window in &windows {
+            constraints.push(Constraint::Length(window_height(window, content_area.width)));
             constraints.push(Constraint::Length(1));
         }
-        if app.usage.snapshot.as_ref().and_then(|snapshot| snapshot.extra_usage.as_ref()).is_some()
+        if let Some(extra_usage) =
+            app.usage.snapshot.as_ref().and_then(|snapshot| snapshot.extra_usage.as_ref())
         {
-            constraints.push(Constraint::Length(3));
+            constraints
+                .push(Constraint::Length(extra_usage_height(extra_usage, content_area.width)));
             constraints.push(Constraint::Length(1));
         }
-        if app.usage.last_error.is_some() {
-            constraints.push(Constraint::Length(3));
+        if let Some(error) = app.usage.last_error.as_deref() {
+            constraints.push(Constraint::Length(error_height(error, content_area.width)));
         }
         constraints.push(Constraint::Min(0));
     }
@@ -109,9 +111,26 @@ fn render_window(frame: &mut Frame, area: Rect, window: &UsageWindow) {
         Span::styled(window.label.to_owned(), Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(format!("   {}", window_detail_text(window)), Style::default().fg(theme::DIM)),
     ]);
-    frame.render_widget(Paragraph::new(label_line), Rect { height: 1, ..area });
+    let label_height = wrapped_height(Text::from(vec![label_line.clone()]), area.width);
+    let reset_line = usage::format_window_reset(window).unwrap_or_default();
+    let reset_height = wrapped_height(
+        Text::from(vec![Line::from(Span::styled(
+            reset_line.clone(),
+            Style::default().fg(theme::DIM),
+        ))]),
+        area.width,
+    );
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(label_height),
+            Constraint::Length(1),
+            Constraint::Length(reset_height),
+        ])
+        .split(area);
+    frame.render_widget(Paragraph::new(label_line).wrap(Wrap { trim: false }), sections[0]);
 
-    let gauge_area = Rect { y: area.y.saturating_add(1), height: 1, ..area };
+    let gauge_area = sections[1];
     let gauge_style = gauge_style(window.utilization);
     frame.render_widget(
         Gauge::default()
@@ -121,11 +140,10 @@ fn render_window(frame: &mut Frame, area: Rect, window: &UsageWindow) {
         gauge_area,
     );
 
-    let reset_area = Rect { y: area.y.saturating_add(2), height: 1, ..area };
-    let reset_line = usage::format_window_reset(window).unwrap_or_default();
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(reset_line, Style::default().fg(theme::DIM)))),
-        reset_area,
+        Paragraph::new(Line::from(Span::styled(reset_line, Style::default().fg(theme::DIM))))
+            .wrap(Wrap { trim: false }),
+        sections[2],
     );
 }
 
@@ -138,7 +156,8 @@ fn render_extra_usage(frame: &mut Frame, area: Rect, extra_usage: &ExtraUsage) {
     frame.render_widget(block.clone(), area);
     let inner = area.inner(Margin { vertical: 1, horizontal: 2 });
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(detail, Style::default().fg(Color::White)))),
+        Paragraph::new(Line::from(Span::styled(detail, Style::default().fg(Color::White))))
+            .wrap(Wrap { trim: false }),
         inner,
     );
 }
@@ -183,6 +202,43 @@ fn format_extra_usage(extra_usage: &ExtraUsage) -> String {
     }
 }
 
+fn window_height(window: &UsageWindow, width: u16) -> u16 {
+    let label_line = Line::from(vec![
+        Span::styled(window.label.to_owned(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("   {}", window_detail_text(window)), Style::default().fg(theme::DIM)),
+    ]);
+    let reset_line = Line::from(Span::styled(
+        usage::format_window_reset(window).unwrap_or_default(),
+        Style::default().fg(theme::DIM),
+    ));
+    wrapped_height(Text::from(vec![label_line]), width)
+        .saturating_add(1)
+        .saturating_add(wrapped_height(Text::from(vec![reset_line]), width))
+}
+
+fn extra_usage_height(extra_usage: &ExtraUsage, width: u16) -> u16 {
+    let inner_width = width.saturating_sub(4);
+    wrapped_height(
+        Text::from(vec![Line::from(Span::styled(
+            format_extra_usage(extra_usage),
+            Style::default().fg(Color::White),
+        ))]),
+        inner_width,
+    )
+    .saturating_add(2)
+}
+
+fn error_height(error: &str, width: u16) -> u16 {
+    let inner_width = width.saturating_sub(4);
+    wrapped_height(Text::from(error.to_owned()), inner_width).saturating_add(2)
+}
+
+fn wrapped_height(text: Text<'static>, width: u16) -> u16 {
+    u16::try_from(Paragraph::new(text).wrap(Wrap { trim: false }).line_count(width))
+        .unwrap_or(u16::MAX)
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,8 +247,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::time::SystemTime;
 
-    fn render_usage(app: &App) -> String {
-        let backend = TestBackend::new(100, 24);
+    fn render_usage_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| {
@@ -204,8 +260,11 @@ mod tests {
             .content
             .chunks(usize::from(buffer.area.width))
             .map(|row| row.iter().map(ratatui::buffer::Cell::symbol).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect()
+    }
+
+    fn render_usage(app: &App) -> String {
+        render_usage_rows(app, 100, 24).join("\n")
     }
 
     fn usage_app() -> App {
@@ -280,5 +339,35 @@ mod tests {
             .position(|line| line.contains("resets in 2h 14m"))
             .expect("reset line");
         assert!(rendered_lines[first_reset_index + 1].trim().is_empty());
+    }
+
+    #[test]
+    fn extra_usage_wraps_inside_card_on_narrow_widths() {
+        let mut app = usage_app();
+        app.usage.snapshot = Some(UsageSnapshot {
+            source: UsageSourceKind::Oauth,
+            fetched_at: SystemTime::now(),
+            five_hour: Some(UsageWindow {
+                label: "5-hour",
+                utilization: 47.0,
+                resets_at: None,
+                reset_description: Some("resets soon".to_owned()),
+            }),
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            extra_usage: Some(ExtraUsage {
+                monthly_limit: Some(100.0),
+                used_credits: Some(99.99),
+                utilization: Some(99.0),
+                currency: Some("USD".to_owned()),
+            }),
+        });
+
+        let rows = render_usage_rows(&app, 20, 18);
+        assert!(rows.iter().any(|row| row.contains("Extra credits")));
+        assert!(rows.iter().any(|row| row.contains("99.99")));
+        assert!(rows.iter().any(|row| row.contains("USD")));
+        assert!(rows.iter().any(|row| row.contains("used")));
     }
 }
