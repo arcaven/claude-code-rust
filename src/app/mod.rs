@@ -51,15 +51,17 @@ pub use service_status_check::start_service_status_check;
 pub(crate) use state::MarkdownRenderKey;
 pub(crate) use state::cache_metrics;
 pub use state::{
-    App, AppStatus, BlockCache, CacheMetrics, CancelOrigin, ChatMessage, ChatViewport, ExtraUsage,
-    HelpView, IncrementalMarkdown, InlinePermission, InlineQuestion, InvalidationLevel,
-    LayoutInvalidation, LoginHint, McpState, MessageBlock, MessageRole, MessageUsage, ModeInfo,
-    ModeState, NoticeBlock, NoticeDedupKey, NoticeStage, PasteSessionState, PendingCommandAck,
-    RateLimitIncidentKey, RecentSessionInfo, SelectionKind, SelectionPoint, SelectionState,
-    SessionPickerState, SessionUsageState, SystemSeverity, TerminalSnapshotMode, TextBlock,
-    TextBlockSpacing, TodoItem, TodoStatus, ToolCallInfo, ToolCallScope, TurnNoticeLocation,
-    TurnNoticeRef, UsageSnapshot, UsageSourceKind, UsageSourceMode, UsageState, UsageWindow,
-    WelcomeBlock, is_execute_tool_name,
+    App, AppStatus, BlockCache, CacheMetrics, CachedMessageSegment, CancelOrigin, ChatMessage,
+    ChatRenderTraceState, ChatViewport, ExtraUsage, HelpView, IncrementalMarkdown,
+    InlinePermission, InlineQuestion, InvalidationLevel, LayoutInvalidation, LoginHint, McpState,
+    MessageBlock, MessageBlockRenderSignature, MessageRenderCache, MessageRenderCacheKey,
+    MessageRenderSignature, MessageRole, MessageUsage, ModeInfo, ModeState, NoticeBlock,
+    NoticeDedupKey, NoticeStage, PasteSessionState, PendingCommandAck, RateLimitIncidentKey,
+    RecentSessionInfo, SelectionKind, SelectionPoint, SelectionState, SessionPickerState,
+    SessionUsageState, SystemSeverity, TerminalSnapshotMode, TextBlock, TextBlockSpacing, TodoItem,
+    TodoStatus, ToolCallInfo, ToolCallScope, TurnNoticeLocation, TurnNoticeRef, UsageSnapshot,
+    UsageSourceKind, UsageSourceMode, UsageState, UsageWindow, WelcomeBlock,
+    hash_text_block_content, hash_welcome_block_content, is_execute_tool_name,
 };
 pub use trust::TrustSelection;
 pub use update_check::start_update_check;
@@ -139,7 +141,13 @@ pub async fn run_tui(app: &mut App) -> anyhow::Result<()> {
             }
             shutdown = &mut os_shutdown => {
                 if let Err(err) = shutdown {
-                    tracing::warn!(%err, "OS shutdown signal listener failed");
+                    tracing::warn!(
+                        target: crate::logging::targets::APP_LIFECYCLE,
+                        event_name = "os_shutdown_listener_failed",
+                        message = "OS shutdown signal listener failed",
+                        outcome = "failure",
+                        error_message = %err,
+                    );
                 }
                 app.should_quit = true;
             }
@@ -333,13 +341,7 @@ fn finalize_pending_paste_event(app: &mut App) {
     if pasted.is_empty() {
         return;
     }
-    tracing::debug!(
-        text = %debug_paste_text(&pasted),
-        len = pasted.chars().count(),
-        cursor_row = app.input.cursor_row(),
-        cursor_col = app.input.cursor_col(),
-        "paste_finalize: begin"
-    );
+    let pasted_chars = pasted.chars().count();
 
     let session = app.pending_paste_session.take().unwrap_or_else(|| {
         let id = app.next_paste_session_id;
@@ -350,21 +352,10 @@ fn finalize_pending_paste_event(app: &mut App) {
             placeholder_index: None,
         }
     });
-    tracing::debug!(
-        session_id = session.id,
-        start_row = session.start.row,
-        start_col = session.start.col,
-        placeholder_index = ?session.placeholder_index,
-        "paste_finalize: session"
-    );
+    let session_id = session.id;
 
     if session.placeholder_index.is_none() {
         let end = SelectionPoint { row: app.input.cursor_row(), col: app.input.cursor_col() };
-        tracing::debug!(
-            end_row = end.row,
-            end_col = end.col,
-            "paste_finalize: strip leaked inline range"
-        );
         strip_input_range(app, session.start, end);
     }
 
@@ -381,7 +372,14 @@ fn finalize_pending_paste_event(app: &mut App) {
     if appended {
         app.active_paste_session = Some(session);
         app.needs_redraw = true;
-        tracing::debug!("paste_finalize: appended to active placeholder");
+        tracing::debug!(
+            target: crate::logging::targets::APP_PASTE,
+            event_name = "paste_placeholder_appended",
+            message = "paste content appended to an active placeholder",
+            outcome = "success",
+            session_id,
+            pasted_chars,
+        );
         return;
     }
 
@@ -393,14 +391,28 @@ fn finalize_pending_paste_event(app: &mut App) {
         });
         app.active_paste_session =
             Some(state::PasteSessionState { placeholder_index: idx, ..session });
-        tracing::debug!(char_count, placeholder_index = ?idx, "paste_finalize: inserted placeholder");
+        tracing::debug!(
+            target: crate::logging::targets::APP_PASTE,
+            event_name = "paste_placeholder_inserted",
+            message = "paste content inserted as a placeholder block",
+            outcome = "success",
+            session_id,
+            pasted_chars,
+            char_count,
+            placeholder_index = ?idx,
+        );
     } else {
         app.input.insert_str(&pasted);
         app.active_paste_session = None;
         tracing::debug!(
+            target: crate::logging::targets::APP_PASTE,
+            event_name = "paste_inline_inserted",
+            message = "paste content inserted inline",
+            outcome = "success",
+            session_id,
+            pasted_chars,
             char_count,
             lines = app.input.lines().len(),
-            "paste_finalize: inserted inline text"
         );
     }
     app.needs_redraw = true;
@@ -457,22 +469,6 @@ fn apply_merged_input_snapshot(app: &mut App, merged: &str, cursor_offset: usize
     }
 
     app.input.replace_lines_and_cursor(lines, cursor.row, cursor.col);
-}
-
-fn debug_paste_text(text: &str) -> String {
-    const MAX_CHARS: usize = 60;
-    let mut out = String::new();
-    let mut iter = text.chars();
-    for _ in 0..MAX_CHARS {
-        let Some(ch) = iter.next() else {
-            return out;
-        };
-        out.extend(ch.escape_default());
-    }
-    if iter.next().is_some() {
-        out.push_str("...");
-    }
-    out
 }
 
 fn strip_input_range(app: &mut App, start: SelectionPoint, end: SelectionPoint) {

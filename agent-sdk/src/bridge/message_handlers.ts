@@ -2,10 +2,16 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AvailableCommand, BridgeCommand, ToolCallUpdateFields } from "../types.js";
 import { asRecordOrNull } from "./shared.js";
 import { toPermissionMode, buildModeState } from "./commands.js";
-import { writeEvent, emitSessionUpdate, emitConnectEvent, refreshSessionsList } from "./events.js";
+import {
+  writeEvent,
+  emitSessionUpdate,
+  emitConnectEvent,
+  emitSessionReplacedEvent,
+} from "./events.js";
 import { TOOL_RESULT_TYPES, unwrapToolUseResult } from "./tooling.js";
 import {
   emitToolCall,
+  emitToolCallUpdate,
   emitPlanIfTodoWrite,
   emitToolResultUpdate,
   finalizeOpenToolCalls,
@@ -21,6 +27,7 @@ import { buildRateLimitUpdate, numberField } from "./state_parsing.js";
 import { looksLikeAuthRequired } from "./auth.js";
 import type { SessionState } from "./session_lifecycle.js";
 import { updateSessionId } from "./session_lifecycle.js";
+import { bridgeLogger, LOG_TARGETS } from "./logger.js";
 
 export function textFromPrompt(command: Extract<BridgeCommand, { command: "prompt" }>): string {
   const chunks = command.chunks ?? [];
@@ -77,11 +84,23 @@ export function contentFromPrompt(
       const data = typeof val.data === "string" ? val.data : "";
       const mimeType = typeof val.mime_type === "string" ? val.mime_type : "image/png";
       if (!SUPPORTED_IMAGE_MIME_TYPES.has(mimeType)) {
-        console.warn(`contentFromPrompt: skipping unsupported image type "${mimeType}"`);
+        bridgeLogger.warn({
+          target: LOG_TARGETS.BRIDGE_PROTOCOL,
+          eventName: "prompt_image_skipped",
+          message: "skipping unsupported prompt image type",
+          outcome: "skipped",
+          fields: { mime_type: mimeType },
+        });
         continue;
       }
       if (!isValidBase64(data)) {
-        console.warn("contentFromPrompt: skipping image with invalid base64 data");
+        bridgeLogger.warn({
+          target: LOG_TARGETS.BRIDGE_PROTOCOL,
+          eventName: "prompt_image_skipped",
+          message: "skipping prompt image with invalid base64 data",
+          outcome: "skipped",
+          fields: { mime_type: mimeType, reason: "invalid_base64" },
+        });
         continue;
       }
       content.push({
@@ -119,11 +138,7 @@ export function handleTaskSystemMessage(
 
   const toolCall = ensureToolCallVisible(session, toolUseId, "Agent", {});
   if (toolCall.status === "pending") {
-    toolCall.status = "in_progress";
-    emitSessionUpdate(session.sessionId, {
-      type: "tool_call_update",
-      tool_call_update: { tool_call_id: toolUseId, fields: { status: "in_progress" } },
-    });
+    emitToolCallUpdate(session, toolUseId, { status: "in_progress" }, "progress");
   }
 
   if (subtype === "task_started") {
@@ -131,17 +146,16 @@ export function handleTaskSystemMessage(
     if (!description) {
       return;
     }
-    emitSessionUpdate(session.sessionId, {
-      type: "tool_call_update",
-      tool_call_update: {
-        tool_call_id: toolUseId,
-        fields: {
-          status: "in_progress",
-          raw_output: description,
-          content: [{ type: "content", content: { type: "text", text: description } }],
-        },
+    emitToolCallUpdate(
+      session,
+      toolUseId,
+      {
+        status: "in_progress",
+        raw_output: description,
+        content: [{ type: "content", content: { type: "text", text: description } }],
       },
-    });
+      "task_started",
+    );
     return;
   }
 
@@ -150,17 +164,16 @@ export function handleTaskSystemMessage(
     if (!progress) {
       return;
     }
-    emitSessionUpdate(session.sessionId, {
-      type: "tool_call_update",
-      tool_call_update: {
-        tool_call_id: toolUseId,
-        fields: {
-          status: "in_progress",
-          raw_output: progress,
-          content: [{ type: "content", content: { type: "text", text: progress } }],
-        },
+    emitToolCallUpdate(
+      session,
+      toolUseId,
+      {
+        status: "in_progress",
+        raw_output: progress,
+        content: [{ type: "content", content: { type: "text", text: progress } }],
       },
-    });
+      "task_progress",
+    );
     return;
   }
 
@@ -172,11 +185,7 @@ export function handleTaskSystemMessage(
     fields.raw_output = summary;
     fields.content = [{ type: "content", content: { type: "text", text: summary } }];
   }
-  emitSessionUpdate(session.sessionId, {
-    type: "tool_call_update",
-    tool_call_update: { tool_call_id: toolUseId, fields },
-  });
-  toolCall.status = finalStatus;
+  emitToolCallUpdate(session, toolUseId, fields, "task_notification");
   if (taskId) {
     session.taskToolUseIds.delete(taskId);
   }
@@ -366,20 +375,7 @@ export function handleSdkMessage(session: SessionState, message: SDKMessage): vo
       if (!session.connected) {
         emitConnectEvent(session);
       } else if (previousSessionId !== session.sessionId) {
-        const historyUpdates = session.resumeUpdates;
-        writeEvent({
-          event: "session_replaced",
-          session_id: session.sessionId,
-          cwd: session.cwd,
-          model_name: session.model,
-          available_models: session.availableModels,
-          mode: session.mode ? buildModeState(session.mode) : null,
-          ...(historyUpdates && historyUpdates.length > 0
-            ? { history_updates: historyUpdates }
-            : {}),
-        });
-        session.resumeUpdates = undefined;
-        refreshSessionsList();
+        emitSessionReplacedEvent(session);
       } else {
         if (session.model !== previousModelName) {
           emitSessionUpdate(session.sessionId, {

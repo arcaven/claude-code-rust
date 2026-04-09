@@ -76,6 +76,49 @@ pub fn create_app(cli: &Cli) -> App {
     let (file_index_event_tx, file_index_event_rx) = std::sync::mpsc::channel();
     let terminals: crate::agent::events::TerminalMap =
         Rc::new(std::cell::RefCell::new(HashMap::new()));
+    let perf_path = match crate::logging::resolve_perf_path(cli) {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(
+                target: crate::logging::targets::APP_PERF,
+                event_name = "perf_telemetry_unavailable",
+                message = "failed to resolve perf telemetry sidecar path",
+                outcome = "failure",
+                telemetry_channel = "perf_sidecar",
+                perf_schema = "claude-rs-perf/v1",
+                perf_append = cli.perf_append,
+                error = %err,
+            );
+            None
+        }
+    };
+    let perf = perf_path.as_deref().and_then(|path| {
+        let logger = crate::perf::PerfLogger::open(path, cli.perf_append);
+        if logger.is_some() {
+            tracing::info!(
+                target: crate::logging::targets::APP_PERF,
+                event_name = "perf_telemetry_enabled",
+                message = "perf telemetry sidecar enabled",
+                outcome = "success",
+                telemetry_channel = "perf_sidecar",
+                perf_schema = "claude-rs-perf/v1",
+                perf_log = %path.display(),
+                perf_append = cli.perf_append,
+            );
+        } else {
+            tracing::warn!(
+                target: crate::logging::targets::APP_PERF,
+                event_name = "perf_telemetry_unavailable",
+                message = "failed to enable perf telemetry sidecar",
+                outcome = "failure",
+                telemetry_channel = "perf_sidecar",
+                perf_schema = "claude-rs-perf/v1",
+                perf_log = %path.display(),
+                perf_append = cli.perf_append,
+            );
+        }
+        logger
+    });
 
     let cwd_display = shorten_cwd(&cwd);
     let initial_model_name = "Connecting...".to_owned();
@@ -180,10 +223,7 @@ pub fn create_app(cli: &Cli) -> App {
         terminal_tool_call_membership: HashSet::new(),
         needs_redraw: true,
         notifications: super::notify::NotificationManager::new(),
-        perf: cli
-            .perf_log
-            .as_deref()
-            .and_then(|path| crate::perf::PerfLogger::open(path, cli.perf_append)),
+        perf,
         render_cache_budget: RenderCacheBudget::default(),
         render_cache_slots: Vec::new(),
         render_cache_total_bytes: 0,
@@ -195,6 +235,8 @@ pub fn create_app(cli: &Cli) -> App {
         cache_metrics: CacheMetrics::default(),
         fps_ema: None,
         last_frame_at: None,
+        last_chat_render_trace_state: None,
+        last_active_turn_height_state: None,
         startup_connection_requested: false,
         connection_started: false,
         startup_bridge_script: cli.bridge_script.clone(),
@@ -215,7 +257,13 @@ pub fn create_app(cli: &Cli) -> App {
     };
 
     if let Err(err) = super::config::initialize_shared_state(&mut app) {
-        tracing::warn!("failed to initialize shared settings state: {err}");
+        tracing::warn!(
+            target: crate::logging::targets::APP_CONFIG,
+            event_name = "shared_settings_init_failed",
+            message = "failed to initialize shared settings state",
+            outcome = "failure",
+            error_message = %err,
+        );
         app.config.last_error = Some(err);
     }
 
@@ -306,9 +354,12 @@ mod tests {
             no_update_check: true,
             dir: Some(dir.path().to_path_buf()),
             bridge_script: None,
+            enable_logs: false,
+            diagnostics_preset: None,
             log_file: None,
             log_filter: None,
             log_append: false,
+            enable_perf: false,
             perf_log: None,
             perf_append: false,
         };

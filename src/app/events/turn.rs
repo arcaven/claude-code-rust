@@ -34,18 +34,33 @@ pub(super) fn handle_permission_request_event(
     request: model::RequestPermissionRequest,
     response_tx: tokio::sync::oneshot::Sender<model::RequestPermissionResponse>,
 ) {
+    let session_id = request.session_id.to_string();
     let tool_id = request.tool_call.tool_call_id.clone();
     let options = request.options.clone();
 
     let Some((mi, bi)) = app.lookup_tool_call(&tool_id) else {
-        tracing::warn!("Permission request for unknown tool call: {tool_id}; auto-rejecting");
+        tracing::warn!(
+            target: crate::logging::targets::APP_PERMISSION,
+            event_name = "permission_request_rejected",
+            message = "permission request rejected for unknown tool call",
+            outcome = "dropped",
+            session_id = %session_id,
+            tool_call_id = %tool_id,
+            reason = "unknown_tool_call",
+        );
         reject_permission_request(response_tx, &options);
         return;
     };
 
     if app.pending_interaction_ids.iter().any(|id| id == &tool_id) {
         tracing::warn!(
-            "Duplicate permission request for tool call: {tool_id}; auto-rejecting duplicate"
+            target: crate::logging::targets::APP_PERMISSION,
+            event_name = "permission_request_rejected",
+            message = "duplicate permission request rejected",
+            outcome = "dropped",
+            session_id = %session_id,
+            tool_call_id = %tool_id,
+            reason = "duplicate_pending_interaction",
         );
         reject_permission_request(response_tx, &options);
         return;
@@ -65,15 +80,33 @@ pub(super) fn handle_permission_request_event(
         });
         tc.mark_tool_call_layout_dirty();
         layout_dirty = true;
-        app.pending_interaction_ids.push(tool_id);
+        app.pending_interaction_ids.push(tool_id.clone());
         app.claim_focus_target(FocusTarget::Permission);
         app.viewport.engage_auto_scroll();
         app.notifications.notify(
             app.config.preferred_notification_channel_effective(),
             super::super::notify::NotifyEvent::PermissionRequired,
         );
+        tracing::info!(
+            target: crate::logging::targets::APP_PERMISSION,
+            event_name = "permission_request_applied",
+            message = "permission request applied to inline tool call",
+            outcome = "success",
+            session_id = %session_id,
+            tool_call_id = %tool_id,
+            option_count = options.len(),
+            focused = is_first,
+        );
     } else {
-        tracing::warn!("Permission request for non-tool block index: {tool_id}; auto-rejecting");
+        tracing::warn!(
+            target: crate::logging::targets::APP_PERMISSION,
+            event_name = "permission_request_rejected",
+            message = "permission request rejected because target block was not a tool call",
+            outcome = "dropped",
+            session_id = %session_id,
+            tool_call_id = %tool_id,
+            reason = "non_tool_block",
+        );
         reject_permission_request(response_tx, &options);
     }
 
@@ -89,10 +122,22 @@ pub(super) fn handle_question_request_event(
     request: model::RequestQuestionRequest,
     response_tx: tokio::sync::oneshot::Sender<model::RequestQuestionResponse>,
 ) {
+    let session_id = request.session_id.to_string();
     let tool_id = request.tool_call.tool_call_id.clone();
+    let option_count = request.prompt.options.len();
+    let question_index = request.question_index;
+    let total_questions = request.total_questions;
 
     let Some((mi, bi)) = app.lookup_tool_call(&tool_id) else {
-        tracing::warn!("Question request for unknown tool call: {tool_id}; auto-cancelling");
+        tracing::warn!(
+            target: crate::logging::targets::APP_PERMISSION,
+            event_name = "question_request_rejected",
+            message = "question request rejected for unknown tool call",
+            outcome = "dropped",
+            session_id = %session_id,
+            tool_call_id = %tool_id,
+            reason = "unknown_tool_call",
+        );
         let _ = response_tx
             .send(model::RequestQuestionResponse::new(model::RequestQuestionOutcome::Cancelled));
         return;
@@ -100,7 +145,13 @@ pub(super) fn handle_question_request_event(
 
     if app.pending_interaction_ids.iter().any(|id| id == &tool_id) {
         tracing::warn!(
-            "Duplicate inline interaction request for tool call: {tool_id}; auto-cancelling duplicate"
+            target: crate::logging::targets::APP_PERMISSION,
+            event_name = "question_request_rejected",
+            message = "duplicate question request rejected",
+            outcome = "dropped",
+            session_id = %session_id,
+            tool_call_id = %tool_id,
+            reason = "duplicate_pending_interaction",
         );
         let _ = response_tx
             .send(model::RequestQuestionResponse::new(model::RequestQuestionOutcome::Cancelled));
@@ -127,15 +178,35 @@ pub(super) fn handle_question_request_event(
         });
         tc.mark_tool_call_layout_dirty();
         layout_dirty = true;
-        app.pending_interaction_ids.push(tool_id);
+        app.pending_interaction_ids.push(tool_id.clone());
         app.claim_focus_target(FocusTarget::Permission);
         app.viewport.engage_auto_scroll();
         app.notifications.notify(
             app.config.preferred_notification_channel_effective(),
             super::super::notify::NotifyEvent::QuestionRequired,
         );
+        tracing::info!(
+            target: crate::logging::targets::APP_PERMISSION,
+            event_name = "question_request_applied",
+            message = "question request applied to inline tool call",
+            outcome = "success",
+            session_id = %session_id,
+            tool_call_id = %tool_id,
+            question_index,
+            total_questions,
+            option_count,
+            focused = is_first,
+        );
     } else {
-        tracing::warn!("Question request for non-tool block index: {tool_id}; auto-cancelling");
+        tracing::warn!(
+            target: crate::logging::targets::APP_PERMISSION,
+            event_name = "question_request_rejected",
+            message = "question request rejected because target block was not a tool call",
+            outcome = "dropped",
+            session_id = %session_id,
+            tool_call_id = %tool_id,
+            reason = "non_tool_block",
+        );
         let _ = response_tx
             .send(model::RequestQuestionResponse::new(model::RequestQuestionOutcome::Cancelled));
     }
@@ -234,8 +305,11 @@ pub(super) fn handle_turn_error_event(
     if exit.cancelled_requested.is_some() {
         let summary = summarize_internal_error(msg);
         tracing::warn!(
+            target: crate::logging::targets::APP_SESSION,
+            event_name = "turn_error_suppressed",
+            message = "turn error suppressed after cancellation request",
+            outcome = "cancelled",
             error_preview = %summary,
-            "Turn error suppressed after cancellation request"
         );
         app.pending_submit = None;
         finish_ready_turn_exit(app, exit, model::ToolCallStatus::Failed);
@@ -246,27 +320,46 @@ pub(super) fn handle_turn_error_event(
     }
 
     let error_class = classified.unwrap_or_else(|| classify_turn_error(msg));
-    tracing::error!("Turn error: {msg}");
     let summary = summarize_internal_error(msg);
+    tracing::error!(
+        target: crate::logging::targets::APP_SESSION,
+        event_name = "turn_error_received",
+        message = "turn error received",
+        outcome = "failure",
+        error_class = ?error_class,
+        error_preview = %summary,
+    );
     match error_class {
         TurnErrorClass::PlanLimit => {
             tracing::warn!(
+                target: crate::logging::targets::APP_SESSION,
+                event_name = "turn_error_classified",
+                message = "turn error classified as plan limit",
+                outcome = "degraded",
+                error_class = "plan_limit",
                 error_preview = %summary,
-                "Turn error classified as plan/usage limit"
             );
         }
         TurnErrorClass::AuthRequired => {
             tracing::warn!(
+                target: crate::logging::targets::APP_AUTH,
+                event_name = "turn_error_classified",
+                message = "turn error indicates authentication is required",
+                outcome = "degraded",
+                error_class = "auth_required",
                 error_preview = %summary,
-                "Turn error indicates authentication is required"
             );
             app.exit_error = Some(crate::error::AppError::AuthRequired);
             app.should_quit = true;
         }
         TurnErrorClass::Internal => {
             tracing::debug!(
+                target: crate::logging::targets::APP_SESSION,
+                event_name = "turn_error_classified",
+                message = "turn error classified as internal SDK error",
+                outcome = "degraded",
+                error_class = "internal",
                 error_preview = %summary,
-                "Internal Agent SDK turn error payload"
             );
         }
         TurnErrorClass::Other => {}
@@ -293,11 +386,11 @@ pub(super) fn handle_turn_error_event(
 }
 
 fn push_interrupted_hint(app: &mut App) {
-    app.push_message_tracked(ChatMessage {
-        role: MessageRole::System(Some(SystemSeverity::Info)),
-        blocks: vec![MessageBlock::Text(TextBlock::from_complete(CONVERSATION_INTERRUPTED_HINT))],
-        usage: None,
-    });
+    app.push_message_tracked(ChatMessage::new(
+        MessageRole::System(Some(SystemSeverity::Info)),
+        vec![MessageBlock::Text(TextBlock::from_complete(CONVERSATION_INTERRUPTED_HINT))],
+        None,
+    ));
     app.enforce_history_retention_tracked();
     app.viewport.engage_auto_scroll();
 }
@@ -383,15 +476,15 @@ mod tests {
     use crate::app::App;
 
     fn empty_assistant_message() -> ChatMessage {
-        ChatMessage { role: MessageRole::Assistant, blocks: Vec::new(), usage: None }
+        ChatMessage::new(MessageRole::Assistant, Vec::new(), None)
     }
 
     fn user_message(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: MessageRole::User,
-            blocks: vec![MessageBlock::Text(TextBlock::from_complete(text))],
-            usage: None,
-        }
+        ChatMessage::new(
+            MessageRole::User,
+            vec![MessageBlock::Text(TextBlock::from_complete(text))],
+            None,
+        )
     }
 
     #[test]

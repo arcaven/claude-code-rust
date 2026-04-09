@@ -9,7 +9,7 @@ import {
   renameSession,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { BridgeCommand } from "./types.js";
-import { parseCommandEnvelope, toPermissionMode, buildModeState } from "./bridge/commands.js";
+import { parseCommandEnvelope, toPermissionMode } from "./bridge/commands.js";
 import {
   writeEvent,
   failConnection,
@@ -42,9 +42,10 @@ import {
   handleMcpToggleCommand,
   staleMcpAuthCandidates,
 } from "./bridge/mcp.js";
+import { bridgeLogger, LOG_TARGETS, logBridgeCommandReceived } from "./bridge/logger.js";
 
 // Re-exports: all symbols that tests and external consumers import from bridge.js.
-export { AsyncQueue, logPermissionDebug } from "./bridge/shared.js";
+export { AsyncQueue } from "./bridge/shared.js";
 export { asRecordOrNull } from "./bridge/shared.js";
 export { CACHE_SPLIT_POLICY, previewKilobyteLabel } from "./bridge/cache_policy.js";
 export {
@@ -146,8 +147,20 @@ export function agentSdkVersionCompatibilityError(): string | undefined {
 }
 
 async function handleCommand(command: BridgeCommand, requestId?: string): Promise<void> {
+  logBridgeCommandReceived(command, requestId);
   const sdkVersionError = agentSdkVersionCompatibilityError();
   if (sdkVersionError && command.command !== "initialize" && command.command !== "shutdown") {
+    bridgeLogger.error({
+      target: LOG_TARGETS.BRIDGE_LIFECYCLE,
+      eventName: "bridge_command_rejected",
+      message: "bridge command rejected due to unsupported SDK version",
+      outcome: "failure",
+      ...(requestId ? { requestId } : {}),
+      fields: {
+        bridge_command: command.command,
+        error_message: sdkVersionError,
+      },
+    });
     failConnection(sdkVersionError, requestId);
     return;
   }
@@ -155,6 +168,14 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
   switch (command.command) {
     case "initialize":
       if (sdkVersionError) {
+        bridgeLogger.error({
+          target: LOG_TARGETS.BRIDGE_LIFECYCLE,
+          eventName: "bridge_initialize_failed",
+          message: "bridge initialization failed due to unsupported SDK version",
+          outcome: "failure",
+          ...(requestId ? { requestId } : {}),
+          fields: { error_message: sdkVersionError },
+        });
         failConnection(sdkVersionError, requestId);
         return;
       }
@@ -186,6 +207,17 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
       return;
 
     case "create_session":
+      bridgeLogger.info({
+        target: LOG_TARGETS.APP_SESSION,
+        eventName: "session_create_requested",
+        message: "session creation requested",
+        outcome: "start",
+        ...(requestId ? { requestId } : {}),
+        fields: {
+          cwd: command.cwd,
+          resume_requested: command.resume !== undefined,
+        },
+      });
       setSessionListingDir(command.cwd);
       await createSession({
         cwd: command.cwd,
@@ -197,10 +229,27 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
       return;
 
     case "resume_session": {
+      bridgeLogger.info({
+        target: LOG_TARGETS.APP_SESSION,
+        eventName: "session_resume_requested",
+        message: "session resume requested",
+        outcome: "start",
+        ...(requestId ? { requestId } : {}),
+        sessionId: command.session_id,
+      });
       try {
         const sdkSessions = await listSessions(currentSessionListOptions());
         const matched = sdkSessions.find((entry) => entry.sessionId === command.session_id);
         if (!matched) {
+          bridgeLogger.warn({
+            target: LOG_TARGETS.APP_SESSION,
+            eventName: "session_resume_lookup_failed",
+            message: "session resume requested for an unknown session",
+            outcome: "failure",
+            ...(requestId ? { requestId } : {}),
+            sessionId: command.session_id,
+            fields: { reason: "unknown_session" },
+          });
           slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
           return;
         }
@@ -212,6 +261,18 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
         const resumeUpdates = mapSessionMessagesToUpdates(historyMessages);
         const staleSessions = Array.from(sessions.values());
         const hadActiveSession = staleSessions.length > 0;
+        bridgeLogger.info({
+          target: LOG_TARGETS.APP_SESSION,
+          eventName: "session_resume_history_loaded",
+          message: "session resume history loaded",
+          outcome: "success",
+          ...(requestId ? { requestId } : {}),
+          sessionId: command.session_id,
+          fields: {
+            history_update_count: resumeUpdates.length,
+            stale_session_count: staleSessions.length,
+          },
+        });
         await createSession({
           cwd: matched.cwd ?? process.cwd(),
           resume: command.session_id,
@@ -223,13 +284,30 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        bridgeLogger.error({
+          target: LOG_TARGETS.APP_SESSION,
+          eventName: "session_resume_failed",
+          message: "session resume failed",
+          outcome: "failure",
+          ...(requestId ? { requestId } : {}),
+          sessionId: command.session_id,
+          fields: { error_message: message },
+        });
         slashError(command.session_id, `failed to resume session: ${message}`, requestId);
       }
       return;
     }
 
     case "new_session":
-      await closeAllSessions();
+      bridgeLogger.info({
+        target: LOG_TARGETS.APP_SESSION,
+        eventName: "session_new_requested",
+        message: "replacement session requested",
+        outcome: "start",
+        ...(requestId ? { requestId } : {}),
+        fields: { cwd: command.cwd },
+      });
+      await closeAllSessions({ reason: "new_session_requested", requestId });
       setSessionListingDir(command.cwd);
       await createSession({
         cwd: command.cwd,
@@ -351,21 +429,50 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
         slashError(command.session_id, `unknown session: ${command.session_id}`, requestId);
         return;
       }
-      const account = await session.query.accountInfo();
-      writeEvent(
-        {
-          event: "status_snapshot",
-          session_id: session.sessionId,
-          account: {
-            email: account.email,
-            organization: account.organization,
+      try {
+        const account = await session.query.accountInfo();
+        bridgeLogger.info({
+          target: LOG_TARGETS.APP_AUTH,
+          eventName: "status_snapshot_emitted",
+          message: "status snapshot emitted",
+          outcome: "success",
+          ...(requestId ? { requestId } : {}),
+          sessionId: session.sessionId,
+          fields: {
+            has_email: typeof account.email === "string" && account.email.trim().length > 0,
+            has_organization: account.organization !== undefined,
             subscription_type: account.subscriptionType,
             token_source: account.tokenSource,
             api_key_source: account.apiKeySource,
           },
-        },
-        requestId,
-      );
+        });
+        writeEvent(
+          {
+            event: "status_snapshot",
+            session_id: session.sessionId,
+            account: {
+              email: account.email,
+              organization: account.organization,
+              subscription_type: account.subscriptionType,
+              token_source: account.tokenSource,
+              api_key_source: account.apiKeySource,
+            },
+          },
+          requestId,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        bridgeLogger.warn({
+          target: LOG_TARGETS.APP_AUTH,
+          eventName: "status_snapshot_failed",
+          message: "failed to build status snapshot",
+          outcome: "failure",
+          ...(requestId ? { requestId } : {}),
+          sessionId: session.sessionId,
+          fields: { error_message: message },
+        });
+        throw error;
+      }
       return;
     }
 
@@ -452,15 +559,48 @@ async function handleCommand(command: BridgeCommand, requestId?: string): Promis
       return;
 
     case "shutdown":
-      await closeAllSessions();
+      bridgeLogger.info({
+        target: LOG_TARGETS.BRIDGE_LIFECYCLE,
+        eventName: "bridge_shutdown_requested",
+        message: "bridge shutdown requested",
+        outcome: "start",
+        ...(requestId ? { requestId } : {}),
+      });
+      await closeAllSessions({ reason: "bridge_shutdown_requested", requestId });
+      bridgeLogger.info({
+        target: LOG_TARGETS.BRIDGE_LIFECYCLE,
+        eventName: "bridge_shutdown_completed",
+        message: "bridge shutdown completed",
+        outcome: "success",
+        ...(requestId ? { requestId } : {}),
+      });
       process.exit(0);
 
     default:
+      bridgeLogger.error({
+        target: LOG_TARGETS.BRIDGE_PROTOCOL,
+        eventName: "bridge_command_rejected",
+        message: "received unsupported bridge command",
+        outcome: "failure",
+        ...(requestId ? { requestId } : {}),
+        fields: {
+          bridge_command: (command as { command?: string }).command ?? "unknown",
+          reason: "unsupported_command",
+        },
+      });
       failConnection(`unhandled command: ${(command as { command?: string }).command ?? "unknown"}`, requestId);
   }
 }
 
 function main(): void {
+  bridgeLogger.info({
+    target: LOG_TARGETS.BRIDGE_LIFECYCLE,
+    eventName: "bridge_process_started",
+    message: "bridge process started",
+    outcome: "start",
+    fields: { pid: process.pid },
+  });
+
   const rl = readline.createInterface({
     input: process.stdin,
     crlfDelay: Number.POSITIVE_INFINITY,
@@ -476,6 +616,18 @@ function main(): void {
         parsed = parseCommandEnvelope(line);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        bridgeLogger.error({
+          target: LOG_TARGETS.BRIDGE_PROTOCOL,
+          eventName: "bridge_command_decode_failed",
+          message: "failed to decode bridge command envelope",
+          outcome: "failure",
+          sizeBytes: Buffer.byteLength(line),
+          fields: {
+            preview: line.slice(0, 240),
+            preview_chars: Math.min(line.length, 240),
+            error_message: message,
+          },
+        });
         failConnection(`invalid command envelope: ${message}`);
         return;
       }
@@ -484,6 +636,22 @@ function main(): void {
         await handleCommand(parsed.command, parsed.requestId);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        bridgeLogger.error({
+          target: LOG_TARGETS.BRIDGE_PROTOCOL,
+          eventName: "bridge_command_failed",
+          message: "bridge command handler failed",
+          outcome: "failure",
+          ...(parsed.requestId ? { requestId: parsed.requestId } : {}),
+          ...(parsed.command.command === "create_session" || parsed.command.command === "new_session"
+            ? {}
+            : "session_id" in parsed.command
+              ? { sessionId: parsed.command.session_id }
+              : {}),
+          fields: {
+            bridge_command: parsed.command.command,
+            error_message: message,
+          },
+        });
         failConnection(
           `bridge command failed (${parsed.command.command}): ${message}`,
           parsed.requestId,
@@ -493,7 +661,21 @@ function main(): void {
   });
 
   rl.on("close", () => {
-    void closeAllSessions().finally(() => process.exit(0));
+    bridgeLogger.info({
+      target: LOG_TARGETS.BRIDGE_LIFECYCLE,
+      eventName: "bridge_input_closed",
+      message: "bridge stdin closed",
+      outcome: "success",
+    });
+    void closeAllSessions({ reason: "bridge_stdin_closed" }).finally(() => {
+      bridgeLogger.info({
+        target: LOG_TARGETS.BRIDGE_LIFECYCLE,
+        eventName: "bridge_shutdown_completed",
+        message: "bridge shutdown completed after stdin close",
+        outcome: "success",
+      });
+      process.exit(0);
+    });
   });
 }
 

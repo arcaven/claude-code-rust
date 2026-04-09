@@ -13,8 +13,12 @@ import type {
   ToolCallUpdateFields,
 } from "../types.js";
 import { asRecordOrNull } from "./shared.js";
-import { writeEvent, emitSessionUpdate } from "./events.js";
-import { setToolCallStatus } from "./tool_calls.js";
+import {
+  emitPermissionRequestEvent,
+  emitQuestionRequestEvent,
+} from "./events.js";
+import { bridgeLogger, LOG_TARGETS } from "./logger.js";
+import { emitToolCallUpdate, setToolCallStatus } from "./tool_calls.js";
 import type { SessionState } from "./session_lifecycle.js";
 
 export type AskUserQuestionOption = {
@@ -69,7 +73,20 @@ export async function requestExitPlanModeApproval(
       toolName: EXIT_PLAN_MODE_TOOL_NAME,
       inputData,
     });
-    writeEvent({ event: "permission_request", session_id: session.sessionId, request });
+    bridgeLogger.info({
+      target: LOG_TARGETS.BRIDGE_PERMISSION,
+      eventName: "permission_request_created",
+      message: "exit plan mode permission request created",
+      outcome: "start",
+      sessionId: session.sessionId,
+      toolCallId: toolUseId,
+      count: request.options.length,
+      fields: {
+        tool_name: EXIT_PLAN_MODE_TOOL_NAME,
+        option_count: request.options.length,
+      },
+    });
+    emitPermissionRequestEvent(session.sessionId, request);
   });
 
   if (outcome.outcome !== "selected" || outcome.option_id === "reject") {
@@ -236,16 +253,7 @@ export async function requestAskUserQuestionAnswers(
       status: "in_progress",
       raw_input: promptToolCall.raw_input,
     };
-    emitSessionUpdate(session.sessionId, {
-      type: "tool_call_update",
-      tool_call_update: { tool_call_id: toolUseId, fields },
-    });
-    const tracked = session.toolCalls.get(toolUseId);
-    if (tracked) {
-      tracked.title = promptToolCall.title;
-      tracked.status = "in_progress";
-      tracked.raw_input = promptToolCall.raw_input;
-    }
+    emitToolCallUpdate(session, toolUseId, fields, "status");
 
     const request = buildQuestionRequest(promptToolCall, prompt, index, prompts.length);
     const outcome = await new Promise<QuestionOutcome>((resolve) => {
@@ -254,7 +262,21 @@ export async function requestAskUserQuestionAnswers(
         toolName: ASK_USER_QUESTION_TOOL_NAME,
         inputData,
       });
-      writeEvent({ event: "question_request", session_id: session.sessionId, request });
+      bridgeLogger.info({
+        target: LOG_TARGETS.BRIDGE_PERMISSION,
+        eventName: "question_request_created",
+        message: "ask user question request created",
+        outcome: "start",
+        sessionId: session.sessionId,
+        toolCallId: toolUseId,
+        count: request.prompt.options.length,
+        fields: {
+          tool_name: ASK_USER_QUESTION_TOOL_NAME,
+          question_index: index,
+          total_questions: prompts.length,
+        },
+      });
+      emitQuestionRequestEvent(session.sessionId, request);
     });
 
     if (outcome.outcome !== "answered") {
@@ -287,15 +309,7 @@ export async function requestAskUserQuestionAnswers(
       raw_output: summary,
       content: [{ type: "content", content: { type: "text", text: summary } }],
     };
-    emitSessionUpdate(session.sessionId, {
-      type: "tool_call_update",
-      tool_call_update: { tool_call_id: toolUseId, fields: progressFields },
-    });
-    if (tracked) {
-      tracked.status = progressFields.status ?? tracked.status;
-      tracked.raw_output = summary;
-      tracked.content = progressFields.content ?? tracked.content;
-    }
+    emitToolCallUpdate(session, toolUseId, progressFields, "summary");
   }
 
   return {

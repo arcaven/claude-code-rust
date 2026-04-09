@@ -8,6 +8,15 @@ enum TerminalUpdatePayload {
     Replace { bytes: Vec<u8>, current_len: usize },
 }
 
+impl TerminalUpdatePayload {
+    fn summary(&self) -> (&'static str, usize, usize) {
+        match self {
+            Self::Append { bytes, current_len } => ("append", bytes.len(), *current_len),
+            Self::Replace { bytes, current_len } => ("replace", bytes.len(), *current_len),
+        }
+    }
+}
+
 fn apply_terminal_payload(tc: &mut ToolCallInfo, payload: TerminalUpdatePayload) -> bool {
     match payload {
         TerminalUpdatePayload::Append { bytes, current_len } => {
@@ -96,8 +105,24 @@ pub(super) fn update_terminal_outputs(app: &mut App) -> bool {
                 TerminalUpdatePayload::Replace { bytes: buf.clone(), current_len }
             }
         };
+        let (update_mode, delta_bytes, total_bytes) = payload.summary();
         if apply_terminal_payload(tc, payload) {
             tc.mark_tool_call_layout_dirty();
+            tracing::debug!(
+                target: crate::logging::targets::APP_COMMAND,
+                event_name = "terminal_output_summary",
+                message = "terminal output updated",
+                outcome = "success",
+                session_id = %app.session_id.as_ref().map_or_else(String::new, ToString::to_string),
+                tool_call_id = %tc.id,
+                terminal_id = %terminal_ref.terminal_id,
+                terminal_update_mode = update_mode,
+                count = u64::try_from(delta_bytes).unwrap_or_default(),
+                size_bytes = u64::try_from(total_bytes).unwrap_or_default(),
+                tool_name = %tc.sdk_tool_name,
+                tool_status = ?tc.status,
+                has_command = tc.terminal_command.is_some(),
+            );
             dirty_slots.push((terminal_ref.msg_idx, terminal_ref.block_idx));
             if dirty_messages.last().copied() != Some(terminal_ref.msg_idx) {
                 dirty_messages.push(terminal_ref.msg_idx);
@@ -131,9 +156,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn bash_tool_message(id: &str, terminal_id: &str) -> ChatMessage {
-        ChatMessage {
-            role: MessageRole::Assistant,
-            blocks: vec![MessageBlock::ToolCall(Box::new(ToolCallInfo {
+        ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::ToolCall(Box::new(ToolCallInfo {
                 id: id.to_owned(),
                 title: format!("tool {id}"),
                 sdk_tool_name: "Bash".to_owned(),
@@ -159,16 +184,16 @@ mod tests {
                 pending_permission: None,
                 pending_question: None,
             }))],
-            usage: None,
-        }
+            None,
+        )
     }
 
     fn user_message(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: MessageRole::User,
-            blocks: vec![MessageBlock::Text(TextBlock::from_complete(text))],
-            usage: None,
-        }
+        ChatMessage::new(
+            MessageRole::User,
+            vec![MessageBlock::Text(TextBlock::from_complete(text))],
+            None,
+        )
     }
 
     #[test]

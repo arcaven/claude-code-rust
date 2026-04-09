@@ -4,8 +4,8 @@
 use clap::Parser;
 use claude_code_rust::Cli;
 use claude_code_rust::error::AppError;
-use std::fs::OpenOptions;
 use std::time::Instant;
+use tracing::info_span;
 
 #[allow(clippy::exit)]
 fn main() {
@@ -21,21 +21,40 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    init_tracing(&cli)?;
+    let _logging = claude_code_rust::logging::LoggingRuntime::init(&cli)?;
+    let perf_path = claude_code_rust::logging::resolve_perf_path(&cli)?;
 
     #[cfg(not(feature = "perf"))]
-    if cli.perf_log.is_some() {
-        return Err(anyhow::anyhow!("`--perf-log` requires a binary built with `--features perf`"));
+    if perf_path.is_some() {
+        return Err(anyhow::anyhow!(
+            "perf telemetry requires a binary built with `--features perf`"
+        ));
     }
 
-    let resolve_started = Instant::now();
-    let bridge_launcher =
-        claude_code_rust::agent::bridge::resolve_bridge_launcher(cli.bridge_script.as_deref())?;
-    tracing::info!(
-        "Resolved agent bridge launcher in {:?}: {}",
-        resolve_started.elapsed(),
-        bridge_launcher.describe()
-    );
+    {
+        let startup_bootstrap_span = info_span!(
+            target: claude_code_rust::logging::targets::APP_LIFECYCLE,
+            "startup_bootstrap",
+            resume_requested = matches!(
+                cli.command,
+                Some(claude_code_rust::Command::Resume { .. })
+            ),
+            perf_telemetry_requested = perf_path.is_some(),
+            explicit_bridge_script = cli.bridge_script.is_some(),
+        );
+        let _entered = startup_bootstrap_span.enter();
+        let resolve_started = Instant::now();
+        let bridge_launcher =
+            claude_code_rust::agent::bridge::resolve_bridge_launcher(cli.bridge_script.as_deref())?;
+        let duration_ms = u64::try_from(resolve_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            target: claude_code_rust::logging::targets::BRIDGE_LIFECYCLE,
+            event_name = "bridge_launcher_resolved",
+            message = "resolved agent bridge launcher",
+            duration_ms,
+            launcher = %bridge_launcher.describe(),
+        );
+    }
 
     let rt = tokio::runtime::Runtime::new()?;
     let local_set = tokio::task::LocalSet::new();
@@ -64,61 +83,6 @@ fn run() -> anyhow::Result<()> {
 
 fn extract_app_error(err: &anyhow::Error) -> Option<AppError> {
     err.chain().find_map(|cause| cause.downcast_ref::<AppError>().cloned())
-}
-
-fn init_tracing(cli: &Cli) -> anyhow::Result<()> {
-    let Some(path) = cli.log_file.as_ref() else {
-        if std::env::var_os("RUST_LOG").is_some() {
-            eprintln!(
-                "RUST_LOG is set, but tracing is disabled without --log-file <PATH>. \
-Use --log-file to enable diagnostics."
-            );
-        }
-        return Ok(());
-    };
-
-    let mut directives = cli
-        .log_filter
-        .clone()
-        .or_else(|| std::env::var("RUST_LOG").ok())
-        .unwrap_or_else(|| "info".to_owned());
-    if !directives.contains("tui_markdown=") {
-        directives.push_str(",tui_markdown=info");
-    }
-    let filter = tracing_subscriber::EnvFilter::try_new(directives.as_str())
-        .map_err(|e| anyhow::anyhow!("invalid tracing filter `{directives}`: {e}"))?;
-
-    let mut options = OpenOptions::new();
-    options.create(true).write(true);
-    if cli.log_append {
-        options.append(true);
-    } else {
-        options.truncate(true);
-    }
-    let file = options
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("failed to open log file {}: {e}", path.display()))?;
-
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(file)
-        .with_ansi(false)
-        .with_file(true)
-        .with_line_number(true)
-        .with_target(true)
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("failed to initialize tracing subscriber: {e}"))?;
-
-    tracing::info!(
-        target: "diagnostics",
-        version = env!("CARGO_PKG_VERSION"),
-        log_file = %path.display(),
-        log_filter = %directives,
-        log_append = cli.log_append,
-        "tracing enabled"
-    );
-
-    Ok(())
 }
 
 fn maybe_print_resume_hint(app: &claude_code_rust::app::App, success: bool) {

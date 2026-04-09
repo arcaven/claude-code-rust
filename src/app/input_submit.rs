@@ -36,10 +36,22 @@ pub(super) fn submit_input(app: &mut App) {
         match request_cancel(app, CancelOrigin::AutoQueue) {
             Ok(()) => {
                 app.pending_auto_submit_after_cancel = true;
+                tracing::debug!(
+                    target: crate::logging::targets::APP_INPUT,
+                    event_name = "submit_deferred_for_cancel",
+                    message = "input submit deferred until the active turn is cancelled",
+                    outcome = "start",
+                );
             }
             Err(message) => {
                 app.pending_auto_submit_after_cancel = false;
-                tracing::error!("Failed to request cancel for deferred submit: {message}");
+                tracing::error!(
+                    target: crate::logging::targets::APP_INPUT,
+                    event_name = "cancel_request_failed",
+                    message = "failed to request cancel for deferred submit",
+                    outcome = "failure",
+                    error_message = %message,
+                );
             }
         }
         return;
@@ -82,10 +94,19 @@ pub(super) fn request_cancel(app: &mut App, origin: CancelOrigin) -> Result<(), 
         return Err("no active session".to_owned());
     };
 
-    conn.cancel(sid.to_string()).map_err(|e| e.to_string())?;
+    let session_id = sid.to_string();
+    conn.cancel(session_id.clone()).map_err(|e| e.to_string())?;
     app.pending_cancel_origin = Some(origin);
     app.cancelled_turn_pending_hint = matches!(origin, CancelOrigin::Manual);
     let _ = app.event_tx.send(ClientEvent::TurnCancelled);
+    tracing::info!(
+        target: crate::logging::targets::APP_INPUT,
+        event_name = "turn_cancel_requested",
+        message = "turn cancel requested",
+        outcome = "success",
+        session_id = %session_id,
+        origin = ?origin,
+    );
     Ok(())
 }
 
@@ -120,23 +141,17 @@ fn dispatch_prompt_turn(app: &mut App, text: String) {
     let Some(sid) = app.session_id.clone() else {
         return;
     };
+    let input_chars = text.chars().count();
+    let session_id = sid.to_string();
 
     // Take pending images for this turn.
     let images = std::mem::take(&mut app.pending_images);
 
     let user_blocks = vec![MessageBlock::Text(TextBlock::from_complete(&text))];
 
-    app.push_message_tracked(ChatMessage {
-        role: MessageRole::User,
-        blocks: user_blocks,
-        usage: None,
-    });
+    app.push_message_tracked(ChatMessage::new(MessageRole::User, user_blocks, None));
     // Create empty assistant message immediately -- message.rs shows thinking indicator
-    app.push_message_tracked(ChatMessage {
-        role: MessageRole::Assistant,
-        blocks: Vec::new(),
-        usage: None,
-    });
+    app.push_message_tracked(ChatMessage::new(MessageRole::Assistant, Vec::new(), None));
     app.bind_active_turn_assistant_to_tail();
     app.enforce_history_retention_tracked();
     app.status = AppStatus::Thinking;
@@ -147,7 +162,15 @@ fn dispatch_prompt_turn(app: &mut App, text: String) {
     // so the model can correlate user references with image attachments.
     match conn.prompt_with_images(sid.to_string(), text, images) {
         Ok(resp) => {
-            tracing::debug!("Prompt dispatched: stop_reason={:?}", resp.stop_reason);
+            tracing::info!(
+                target: crate::logging::targets::APP_INPUT,
+                event_name = "prompt_dispatched",
+                message = "prompt dispatched to the bridge",
+                outcome = "success",
+                session_id = %session_id,
+                input_chars,
+                stop_reason = ?resp.stop_reason,
+            );
         }
         Err(e) => {
             let _ = tx.send(ClientEvent::TurnError(e.to_string()));

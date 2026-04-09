@@ -153,8 +153,8 @@ fn handle_session_update_event(app: &mut App, update: model::SessionUpdate) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
-    tracing::debug!("SessionUpdate variant: {}", session_update_name(&update));
     match update {
         model::SessionUpdate::AgentMessageChunk(chunk) => {
             clear_compaction_state(app, true);
@@ -166,15 +166,37 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
         }
         model::SessionUpdate::UserMessageChunk(_) => {}
         model::SessionUpdate::AgentThoughtChunk(chunk) => {
-            tracing::debug!("Agent thought: {:?}", chunk);
+            let chunk_chars = match &chunk.content {
+                model::ContentBlock::Text(text) => text.text.chars().count(),
+                model::ContentBlock::Image(_) => 0,
+            };
+            tracing::trace!(
+                target: crate::logging::targets::APP_SESSION,
+                event_name = "agent_thought_chunk_applied",
+                message = "agent thought chunk applied",
+                outcome = "success",
+                chunk_chars,
+            );
             app.status = AppStatus::Thinking;
         }
         model::SessionUpdate::Plan(plan) => {
-            tracing::debug!("Plan update: {:?}", plan);
+            tracing::debug!(
+                target: crate::logging::targets::APP_SESSION,
+                event_name = "plan_update_applied",
+                message = "plan update applied",
+                outcome = "success",
+                todo_count = plan.entries.len(),
+            );
             apply_plan_todos(app, &plan);
         }
         model::SessionUpdate::AvailableCommandsUpdate(cmds) => {
-            tracing::debug!("Available commands: {} commands", cmds.available_commands.len());
+            tracing::debug!(
+                target: crate::logging::targets::APP_SESSION,
+                event_name = "available_commands_applied",
+                message = "available commands update applied",
+                outcome = "success",
+                command_count = cmds.available_commands.len(),
+            );
             app.available_commands = cmds.available_commands;
             crate::app::plugins::clamp_selection(app);
             if app.slash.is_some() {
@@ -182,7 +204,13 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
             }
         }
         model::SessionUpdate::AvailableAgentsUpdate(agents) => {
-            tracing::debug!("Available subagents: {} agents", agents.available_agents.len());
+            tracing::debug!(
+                target: crate::logging::targets::APP_SESSION,
+                event_name = "available_agents_applied",
+                message = "available agents update applied",
+                outcome = "success",
+                agent_count = agents.available_agents.len(),
+            );
             app.available_agents = agents.available_agents;
             if app.subagent.is_some() {
                 super::subagent::update_query(app);
@@ -210,27 +238,7 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
             }
         }
         model::SessionUpdate::ConfigOptionUpdate(config) => {
-            tracing::debug!("Config update: {:?}", config);
-            let option_id = config.option_id;
-            let value = config.value;
-            let model_name =
-                if option_id == "model" { value.as_str().map(ToOwned::to_owned) } else { None };
-            app.config_options.insert(option_id.clone(), value);
-
-            if let Some(model_name) = model_name {
-                app.model_name = model_name;
-                app.update_welcome_model_once();
-            } else if option_id == "model" {
-                tracing::warn!("ConfigOptionUpdate for model carried non-string value");
-            }
-
-            if matches!(
-                app.pending_command_ack.as_ref(),
-                Some(PendingCommandAck::ConfigOptionUpdate { option_id: expected })
-                    if expected == &option_id
-            ) {
-                session::clear_pending_command(app);
-            }
+            handle_config_option_update(app, config);
         }
         model::SessionUpdate::FastModeUpdate(state) => {
             app.fast_mode_state = state;
@@ -246,7 +254,14 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
             } else {
                 clear_compaction_state(app, true);
             }
-            tracing::debug!("SessionStatusUpdate: compacting={}", app.is_compacting);
+            tracing::debug!(
+                target: crate::logging::targets::APP_SESSION,
+                event_name = "session_status_applied",
+                message = "session status update applied",
+                outcome = "success",
+                session_status = ?status,
+                compacting = app.is_compacting,
+            );
         }
         model::SessionUpdate::CompactionBoundary(boundary) => {
             rate_limit::handle_compaction_boundary_update(app, boundary);
@@ -259,11 +274,11 @@ pub(crate) fn push_system_message_with_severity(
     severity: Option<SystemSeverity>,
     message: &str,
 ) {
-    app.push_message_tracked(ChatMessage {
-        role: MessageRole::System(severity),
-        blocks: vec![MessageBlock::Text(TextBlock::from_complete(message))],
-        usage: None,
-    });
+    app.push_message_tracked(ChatMessage::new(
+        MessageRole::System(severity),
+        vec![MessageBlock::Text(TextBlock::from_complete(message))],
+        None,
+    ));
     app.enforce_history_retention_tracked();
     app.viewport.engage_auto_scroll();
 }
@@ -284,24 +299,48 @@ pub(super) fn clear_compaction_state(app: &mut App, emit_manual_success: bool) {
     }
 }
 
-/// Return a human-readable name for a `SessionUpdate` variant (for debug logging).
-fn session_update_name(update: &model::SessionUpdate) -> &'static str {
-    match update {
-        model::SessionUpdate::AgentMessageChunk(_) => "AgentMessageChunk",
-        model::SessionUpdate::ToolCall(_) => "ToolCall",
-        model::SessionUpdate::ToolCallUpdate(_) => "ToolCallUpdate",
-        model::SessionUpdate::UserMessageChunk(_) => "UserMessageChunk",
-        model::SessionUpdate::AgentThoughtChunk(_) => "AgentThoughtChunk",
-        model::SessionUpdate::Plan(_) => "Plan",
-        model::SessionUpdate::AvailableCommandsUpdate(_) => "AvailableCommandsUpdate",
-        model::SessionUpdate::AvailableAgentsUpdate(_) => "AvailableAgentsUpdate",
-        model::SessionUpdate::ModeStateUpdate(_) => "ModeStateUpdate",
-        model::SessionUpdate::CurrentModeUpdate(_) => "CurrentModeUpdate",
-        model::SessionUpdate::ConfigOptionUpdate(_) => "ConfigOptionUpdate",
-        model::SessionUpdate::FastModeUpdate(_) => "FastModeUpdate",
-        model::SessionUpdate::RateLimitUpdate(_) => "RateLimitUpdate",
-        model::SessionUpdate::SessionStatusUpdate(_) => "SessionStatusUpdate",
-        model::SessionUpdate::CompactionBoundary(_) => "CompactionBoundary",
+fn handle_config_option_update(app: &mut App, config: model::ConfigOptionUpdate) {
+    let option_id = config.option_id;
+    let value = config.value;
+    let model_name =
+        if option_id == "model" { value.as_str().map(ToOwned::to_owned) } else { None };
+    let value_kind = match &value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    };
+    app.config_options.insert(option_id.clone(), value);
+    tracing::debug!(
+        target: crate::logging::targets::APP_CONFIG,
+        event_name = "config_option_update_applied",
+        message = "config option update applied",
+        outcome = "success",
+        option_id = %option_id,
+        value_kind,
+    );
+
+    if let Some(model_name) = model_name {
+        app.model_name = model_name;
+        app.update_welcome_model_once();
+    } else if option_id == "model" {
+        tracing::warn!(
+            target: crate::logging::targets::APP_CONFIG,
+            event_name = "config_option_update_rejected",
+            message = "config option update carried an invalid model value",
+            outcome = "failure",
+            option_id = "model",
+            value_kind,
+        );
+    }
+
+    if matches!(
+        app.pending_command_ack.as_ref(),
+        Some(PendingCommandAck::ConfigOptionUpdate { option_id: expected }) if expected == &option_id
+    ) {
+        session::clear_pending_command(app);
     }
 }
 
@@ -377,15 +416,15 @@ mod tests {
     }
 
     fn assistant_msg(blocks: Vec<MessageBlock>) -> ChatMessage {
-        ChatMessage { role: MessageRole::Assistant, blocks, usage: None }
+        ChatMessage::new(MessageRole::Assistant, blocks, None)
     }
 
     fn user_msg(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: MessageRole::User,
-            blocks: vec![MessageBlock::Text(TextBlock::from_complete(text))],
-            usage: None,
-        }
+        ChatMessage::new(
+            MessageRole::User,
+            vec![MessageBlock::Text(TextBlock::from_complete(text))],
+            None,
+        )
     }
 
     fn first_block_text(msg: &ChatMessage) -> &str {
