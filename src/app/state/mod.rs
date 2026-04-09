@@ -217,12 +217,19 @@ pub struct App {
     /// Some terminals split one clipboard paste into multiple chunks; we merge
     /// them and apply placeholder threshold to the merged content once per cycle.
     pub pending_paste_text: String,
+    /// Pending duplicate-suppression marker for terminals that emit both a
+    /// clipboard shortcut key event and `Event::Paste` for the same text paste.
+    pub pending_clipboard_paste_dedupe: Option<String>,
     /// Pending paste session metadata for the currently queued `Event::Paste` payload.
     pub pending_paste_session: Option<PasteSessionState>,
     /// Most recent active placeholder paste session, used for safe chunk continuation.
     pub active_paste_session: Option<PasteSessionState>,
     /// Monotonic counter for paste session identifiers.
     pub next_paste_session_id: u64,
+    /// Pending image attachments accumulated via Ctrl+V clipboard reads and
+    /// consumed on submit. No cap on count — this is a developer tool, so
+    /// users are trusted to attach as many images as they need.
+    pub pending_images: Vec<crate::app::clipboard_image::ImageAttachment>,
     /// Cached todo compact line (invalidated on `set_todos()`).
     pub cached_todo_compact: Option<ratatui::text::Line<'static>>,
     /// Current git branch (refreshed on focus gain + turn complete).
@@ -839,9 +846,11 @@ impl App {
             pending_submit: None,
             paste_burst: super::paste_burst::PasteBurstDetector::new(),
             pending_paste_text: String::new(),
+            pending_clipboard_paste_dedupe: None,
             pending_paste_session: None,
             active_paste_session: None,
             next_paste_session_id: 1,
+            pending_images: Vec::new(),
             cached_todo_compact: None,
             git_branch: None,
             update_check_hint: None,

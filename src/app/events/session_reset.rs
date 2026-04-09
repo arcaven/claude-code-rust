@@ -68,8 +68,10 @@ fn reset_input_state_for_new_session(app: &mut App) {
     app.help_open = false;
     app.pending_submit = None;
     app.pending_paste_text.clear();
+    app.pending_clipboard_paste_dedupe = None;
     app.pending_paste_session = None;
     app.active_paste_session = None;
+    app.pending_images.clear();
 }
 
 fn reset_interaction_state_for_new_session(app: &mut App) {

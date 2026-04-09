@@ -7,6 +7,8 @@ use super::{
     App, AppStatus, CancelOrigin, FocusOwner, FocusTarget, HelpView, InvalidationLevel, ModeInfo,
     ModeState,
 };
+#[cfg(not(test))]
+use crate::app::SystemSeverity;
 use crate::app::inline_interactions::handle_inline_interaction_key;
 use crate::app::selection::{clear_selection, selection_text_from_rendered_lines};
 use crate::app::state::AutocompleteKind;
@@ -24,9 +26,22 @@ fn is_ctrl_shortcut(modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT)
 }
 
+fn ctrl_char(expected: char) -> Option<char> {
+    let upper = expected.to_ascii_uppercase();
+    if !upper.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(char::from((upper as u8) & 0x1f))
+}
+
 fn is_ctrl_char_shortcut(key: KeyEvent, expected: char) -> bool {
-    is_ctrl_shortcut(key.modifiers)
-        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&expected))
+    match key.code {
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&expected) => is_ctrl_shortcut(key.modifiers),
+        KeyCode::Char(c) if Some(c) == ctrl_char(expected) => {
+            !key.modifiers.contains(KeyModifiers::ALT)
+        }
+        _ => false,
+    }
 }
 
 fn is_permission_ctrl_shortcut(key: KeyEvent) -> bool {
@@ -323,6 +338,9 @@ fn handle_normal_key_actions(app: &mut App, key: KeyEvent) -> bool {
     if handle_mode_cycle_key(app, key) {
         return true;
     }
+    if handle_clipboard_paste_key(app, key) {
+        return true;
+    }
     if handle_editing_key(app, key) {
         return true;
     }
@@ -334,6 +352,11 @@ fn handle_turn_control_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
     app.pending_submit = None;
+    // Clear any pending image attachments on Escape.
+    if !app.pending_images.is_empty() {
+        app.pending_images.clear();
+        app.needs_redraw = true;
+    }
     if app.focus_owner() == FocusOwner::TodoList {
         app.release_focus_target(FocusTarget::TodoList);
         return true;
@@ -498,6 +521,81 @@ fn handle_mode_cycle_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
+fn handle_clipboard_paste_key(app: &mut App, key: KeyEvent) -> bool {
+    if !is_clipboard_paste_shortcut(key) || app.focus_owner() == FocusOwner::TodoList {
+        return false;
+    }
+
+    // Skip system clipboard access in tests to avoid flaky failures / segfaults.
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            super::events::push_system_message_with_severity(
+                app,
+                Some(SystemSeverity::Warning),
+                "Failed to access the system clipboard.",
+            );
+            app.viewport.engage_auto_scroll();
+            app.needs_redraw = true;
+            tracing::warn!("clipboard_paste: failed to access system clipboard");
+            return true;
+        };
+
+        // Try reading an image from the clipboard first.
+        if let Ok(img_data) = clipboard.get_image() {
+            match super::clipboard_image::encode_clipboard_image(img_data) {
+                Ok(attachment) => {
+                    app.pending_images.push(attachment);
+                    // Insert badge text at the cursor position so the user (and
+                    // the model) can see where images are relative to text.
+                    let idx = app.pending_images.len();
+                    let badge = format!("[Image #{idx}]");
+                    app.input.insert_str(&badge);
+                    app.needs_redraw = true;
+                    tracing::debug!(
+                        count = app.pending_images.len(),
+                        "clipboard_paste: attached image from clipboard"
+                    );
+                    return true;
+                }
+                Err(error) => {
+                    super::events::push_system_message_with_severity(
+                        app,
+                        Some(SystemSeverity::Warning),
+                        error.user_message(),
+                    );
+                    app.viewport.engage_auto_scroll();
+                    app.needs_redraw = true;
+                    tracing::warn!("clipboard_paste: image attachment failed: {error:?}");
+                    return true;
+                }
+            }
+        }
+
+        // Fallback: paste text (for terminals without Event::Paste).
+        let Ok(text) = clipboard.get_text() else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        if app.pending_paste_text == text {
+            return true;
+        }
+        app.pending_clipboard_paste_dedupe = Some(text.clone());
+        app.queue_paste_text(&text);
+        true
+    }
+}
+
+pub(super) fn is_clipboard_paste_shortcut(key: KeyEvent) -> bool {
+    is_ctrl_char_shortcut(key, 'v')
+}
+
 fn handle_editing_key(app: &mut App, key: KeyEvent) -> bool {
     match (key.code, key.modifiers) {
         (KeyCode::Backspace, m)
@@ -505,6 +603,9 @@ fn handle_editing_key(app: &mut App, key: KeyEvent) -> bool {
                 && m.contains(KeyModifiers::CONTROL)
                 && !m.contains(KeyModifiers::ALT) =>
         {
+            if try_delete_image_badge(app, "before") {
+                return true;
+            }
             app.input.textarea_delete_word_before()
         }
         (KeyCode::Delete, m)
@@ -512,16 +613,41 @@ fn handle_editing_key(app: &mut App, key: KeyEvent) -> bool {
                 && m.contains(KeyModifiers::CONTROL)
                 && !m.contains(KeyModifiers::ALT) =>
         {
+            if try_delete_image_badge(app, "after") {
+                return true;
+            }
             app.input.textarea_delete_word_after()
         }
         (KeyCode::Backspace, _) if app.focus_owner() != FocusOwner::TodoList => {
+            if try_delete_image_badge(app, "before") {
+                return true;
+            }
             app.input.textarea_delete_char_before()
         }
         (KeyCode::Delete, _) if app.focus_owner() != FocusOwner::TodoList => {
+            if try_delete_image_badge(app, "after") {
+                return true;
+            }
             app.input.textarea_delete_char_after()
         }
         _ => false,
     }
+}
+
+/// If the cursor is inside or adjacent to an `[Image #N]` badge, delete the
+/// entire badge, remove the associated image from `pending_images`, and
+/// renumber remaining badges. Returns `true` if a badge was deleted.
+fn try_delete_image_badge(app: &mut App, direction: &str) -> bool {
+    let Some(one_based_idx) = app.input.delete_image_badge(direction) else {
+        return false;
+    };
+    let array_idx = one_based_idx.saturating_sub(1);
+    if array_idx < app.pending_images.len() {
+        app.pending_images.remove(array_idx);
+    }
+    app.input.renumber_image_badges();
+    app.needs_redraw = true;
+    true
 }
 
 fn handle_printable_key(app: &mut App, key: KeyEvent) -> bool {
@@ -872,6 +998,24 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::layout::Rect;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn ctrl_shortcut_accepts_standard_ctrl_v_encoding() {
+        let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert!(is_ctrl_char_shortcut(key, 'v'));
+    }
+
+    #[test]
+    fn ctrl_shortcut_accepts_raw_control_character_encoding() {
+        let key = KeyEvent::new(KeyCode::Char('\u{16}'), KeyModifiers::NONE);
+        assert!(is_ctrl_char_shortcut(key, 'v'));
+    }
+
+    #[test]
+    fn ctrl_shortcut_rejects_raw_control_character_with_alt() {
+        let key = KeyEvent::new(KeyCode::Char('\u{16}'), KeyModifiers::ALT);
+        assert!(!is_ctrl_char_shortcut(key, 'v'));
+    }
 
     #[test]
     fn queued_paste_still_blocks_overlapping_key_text() {
