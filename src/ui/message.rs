@@ -114,20 +114,8 @@ fn assistant_role_label_line() -> Line<'static> {
     Line::from(spans)
 }
 
-/// Render a single chat message into a `Vec<Line>`, using per-block caches.
-/// Takes `&mut` so block caches can be updated.
-/// `spinner` is only used for the "Thinking..." animation on empty assistant messages.
-#[allow(dead_code)]
-pub fn render_message(
-    msg: &mut ChatMessage,
-    spinner: &SpinnerState,
-    width: u16,
-    out: &mut Vec<Line<'static>>,
-) {
-    render_message_with_tools_collapsed(msg, spinner, width, false, out);
-}
-
-pub fn render_message_with_tools_collapsed(
+#[cfg(test)]
+pub(crate) fn render_message_with_tools_collapsed(
     msg: &mut ChatMessage,
     spinner: &SpinnerState,
     width: u16,
@@ -137,8 +125,8 @@ pub fn render_message_with_tools_collapsed(
     render_message_internal(msg, spinner, width, 0, tools_collapsed, true, out);
 }
 
-#[allow(dead_code)]
-pub fn render_message_with_tools_collapsed_and_separator(
+#[cfg(test)]
+pub(crate) fn render_message_with_tools_collapsed_and_separator(
     msg: &mut ChatMessage,
     spinner: &SpinnerState,
     width: u16,
@@ -538,8 +526,8 @@ pub fn measure_message_height_cached_with_tools_collapsed_and_separator(
 /// (label/separators/full blocks) without rendering them. If skipping lands inside
 /// a block, that block is rendered in full and the remaining skip is returned so
 /// the caller can apply `Paragraph::scroll()` for exact intra-block offset.
-#[allow(dead_code)]
-pub fn render_message_from_offset(
+#[cfg(test)]
+pub(crate) fn render_message_from_offset(
     msg: &mut ChatMessage,
     spinner: &SpinnerState,
     width: u16,
@@ -558,7 +546,8 @@ pub fn render_message_from_offset(
     )
 }
 
-pub fn render_message_from_offset_with_tools_collapsed(
+#[cfg(test)]
+pub(crate) fn render_message_from_offset_with_tools_collapsed(
     msg: &mut ChatMessage,
     spinner: &SpinnerState,
     width: u16,
@@ -592,6 +581,7 @@ pub(crate) fn render_message_from_offset_internal(
     let mut can_consume_skip = true;
     render_cached_message_from_offset(
         cache.segments(),
+        width,
         out,
         &mut remaining_skip,
         &mut can_consume_skip,
@@ -601,6 +591,7 @@ pub(crate) fn render_message_from_offset_internal(
 
 fn render_cached_message_from_offset(
     segments: &[CachedMessageSegment],
+    width: u16,
     out: &mut Vec<Line<'static>>,
     remaining_skip: &mut usize,
     can_consume_skip: &mut bool,
@@ -618,8 +609,44 @@ fn render_cached_message_from_offset(
                 if should_skip_whole_block(*height, remaining_skip, can_consume_skip) {
                     continue;
                 }
-                out.extend(lines.iter().cloned());
+                render_cached_lines_from_offset(
+                    lines,
+                    width,
+                    out,
+                    remaining_skip,
+                    can_consume_skip,
+                );
             }
+        }
+    }
+}
+
+fn render_cached_lines_from_offset(
+    lines: &[Line<'static>],
+    width: u16,
+    out: &mut Vec<Line<'static>>,
+    remaining_skip: &mut usize,
+    can_consume_skip: &mut bool,
+) {
+    if !*can_consume_skip || *remaining_skip == 0 {
+        out.extend(lines.iter().cloned());
+        return;
+    }
+
+    for line in lines {
+        let logical_lines = split_line_on_newlines(line);
+        for logical_line in logical_lines {
+            if !*can_consume_skip {
+                out.push(logical_line);
+                continue;
+            }
+            let line_height = rendered_line_height(&logical_line, width);
+            if *remaining_skip >= line_height {
+                *remaining_skip -= line_height;
+                continue;
+            }
+            *can_consume_skip = false;
+            out.push(logical_line);
         }
     }
 }
@@ -753,6 +780,36 @@ fn rendered_lines_height(lines: &[Line<'static>], width: u16) -> usize {
         return 0;
     }
     Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: false }).line_count(width)
+}
+
+fn rendered_line_height(line: &Line<'static>, width: u16) -> usize {
+    Paragraph::new(Text::from(vec![line.clone()]))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
+}
+
+fn split_line_on_newlines(line: &Line<'static>) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut current_spans = Vec::new();
+
+    for span in &line.spans {
+        for chunk in span.content.as_ref().split_inclusive('\n') {
+            let ends_with_newline = chunk.ends_with('\n');
+            let content = chunk.strip_suffix('\n').unwrap_or(chunk);
+            if !content.is_empty() {
+                let mut next_span = span.clone();
+                next_span.content = content.to_owned().into();
+                current_spans.push(next_span);
+            }
+            if ends_with_newline {
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+            }
+        }
+    }
+
+    lines.push(Line::from(current_spans));
+    lines
 }
 
 fn welcome_block_layout(block: &mut WelcomeBlock, width: u16) -> RenderedBlockLayout {
@@ -1443,7 +1500,7 @@ mod tests {
 
     fn ground_truth_height(msg: &mut ChatMessage, spinner: &SpinnerState, width: u16) -> usize {
         let mut lines = Vec::new();
-        render_message(msg, spinner, width, &mut lines);
+        render_message_with_tools_collapsed(msg, spinner, width, false, &mut lines);
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).line_count(width)
     }
 
@@ -1506,7 +1563,7 @@ mod tests {
         let spinner = idle_spinner();
         let mut msg = make_assistant_split_message("First paragraph", "Second paragraph");
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 80, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 80, false, &mut lines);
 
         assert_eq!(
             render_lines_to_strings(&lines),
@@ -1525,7 +1582,7 @@ mod tests {
         let spinner = idle_spinner();
         let mut msg = make_assistant_notice_message();
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 80, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 80, false, &mut lines);
 
         assert_eq!(
             render_lines_to_strings(&lines),
@@ -1544,7 +1601,7 @@ mod tests {
         let spinner = idle_spinner();
         let mut msg = make_assistant_notice_message();
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 80, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 80, false, &mut lines);
 
         let notice_line = lines
             .iter()
@@ -1790,6 +1847,35 @@ mod tests {
     }
 
     #[test]
+    fn render_cached_lines_from_offset_consumes_skip_across_cached_lines() {
+        let skip = usize::from(u16::MAX) + 5;
+        let lines =
+            (0..skip + 3).map(|idx| Line::from(format!("line {idx:05}"))).collect::<Vec<_>>();
+        let mut out = Vec::new();
+        let mut remaining = skip;
+        let mut can_consume_skip = true;
+
+        render_cached_lines_from_offset(
+            &lines,
+            40,
+            &mut out,
+            &mut remaining,
+            &mut can_consume_skip,
+        );
+
+        assert_eq!(remaining, 0);
+        assert!(!can_consume_skip);
+        assert_eq!(
+            render_lines_to_strings(&out),
+            vec![
+                format!("line {skip:05}"),
+                format!("line {:05}", skip + 1),
+                format!("line {:05}", skip + 2),
+            ]
+        );
+    }
+
+    #[test]
     fn welcome_height_matches_ground_truth() {
         let spinner = idle_spinner();
         let mut measured_msg = make_welcome_message("claude-sonnet-4-5", "~/project");
@@ -1808,7 +1894,7 @@ mod tests {
             "Rate limit warning",
         );
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 120, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
         let rendered = render_lines_to_strings(&lines);
 
         assert!(rendered.iter().any(|line| line.contains("Warning")));
@@ -1830,7 +1916,7 @@ mod tests {
         );
 
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 120, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
         let rendered = render_lines_to_strings(&lines);
 
         assert!(rendered.iter().any(|line| line.contains("Thinking...")));
@@ -1842,7 +1928,7 @@ mod tests {
         let mut msg = make_text_message(MessageRole::Assistant, "\n# Heading\nBody");
 
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 80, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 80, false, &mut lines);
         let rendered = render_lines_to_strings(&lines);
 
         assert_eq!(rendered[0], "Claude");
@@ -1900,7 +1986,7 @@ mod tests {
         );
 
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 120, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
         let rendered = render_lines_to_strings(&lines);
 
         assert!(!rendered.iter().any(|line| line.contains("Thinking...")));
@@ -1929,7 +2015,7 @@ mod tests {
         );
 
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 120, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
         let rendered = render_lines_to_strings(&lines);
 
         let bash_idx = rendered.iter().position(|line| line.contains("Bash")).expect("bash line");
@@ -1951,7 +2037,7 @@ mod tests {
         let mut msg = make_text_message(MessageRole::Assistant, "done");
 
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 120, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
         let rendered = render_lines_to_strings(&lines);
 
         assert!(!rendered.iter().any(|line| line.contains("Thinking...")));
@@ -1968,7 +2054,7 @@ mod tests {
         let mut msg = make_text_message(MessageRole::Assistant, "done");
 
         let mut lines = Vec::new();
-        render_message(&mut msg, &spinner, 120, &mut lines);
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
         let rendered = render_lines_to_strings(&lines);
 
         assert!(rendered.iter().any(|line| line.contains("Compacting context...")));
