@@ -42,8 +42,35 @@ export interface AvailableModel {
   supports_auto_mode?: boolean;
 }
 
+export interface CurrentModel {
+  requested_id?: string;
+  resolved_id: string;
+  display_name_short: string;
+  display_name_long: string;
+  catalog_id?: string;
+  supports_effort: boolean;
+  supported_effort_levels: EffortLevel[];
+  supports_fast_mode?: boolean;
+  supports_auto_mode?: boolean;
+  supports_adaptive_thinking?: boolean;
+  is_authoritative: boolean;
+}
+
 export type FastModeState = "off" | "cooldown" | "on";
 export type RateLimitStatus = "allowed" | "allowed_warning" | "rejected";
+export type TerminalReason =
+  | "blocking_limit"
+  | "rapid_refill_breaker"
+  | "prompt_too_long"
+  | "image_error"
+  | "model_error"
+  | "aborted_streaming"
+  | "aborted_tools"
+  | "stop_hook_prevented"
+  | "hook_stopped"
+  | "tool_deferred"
+  | "max_turns"
+  | "completed";
 
 export interface RateLimitUpdate {
   status: RateLimitStatus;
@@ -55,6 +82,23 @@ export interface RateLimitUpdate {
   overage_disabled_reason?: string;
   is_using_overage?: boolean;
   surpassed_threshold?: number;
+}
+
+export type ApiRetryError =
+  | "authentication_failed"
+  | "billing_error"
+  | "rate_limit"
+  | "invalid_request"
+  | "server_error"
+  | "unknown"
+  | "max_output_tokens";
+
+export type RuntimeSessionState = "idle" | "running" | "requires_action";
+
+export interface SettingsParseErrorUpdate {
+  file?: string;
+  path: string;
+  message: string;
 }
 
 export type ContentBlock =
@@ -79,23 +123,24 @@ export type ToolCallContent =
       blob_saved_to?: string;
     };
 
-export interface ExitPlanModeOutputMetadata {
-  is_ultraplan?: boolean;
-}
-
 export interface TodoWriteOutputMetadata {
   verification_nudge_needed?: boolean;
 }
 
 export interface BashOutputMetadata {
   assistant_auto_backgrounded?: boolean;
-  token_saver_active?: boolean;
 }
 
 export interface ToolOutputMetadata {
   bash?: BashOutputMetadata;
-  exit_plan_mode?: ExitPlanModeOutputMetadata;
   todo_write?: TodoWriteOutputMetadata;
+}
+
+export interface TaskMetadata {
+  end_time?: number;
+  total_paused_ms?: number;
+  error?: string;
+  is_backgrounded?: boolean;
 }
 
 export interface ToolLocation {
@@ -112,6 +157,7 @@ export interface ToolCall {
   raw_input?: Json;
   raw_output?: string;
   output_metadata?: ToolOutputMetadata;
+  task_metadata?: TaskMetadata;
   locations: ToolLocation[];
   meta?: Json;
 }
@@ -124,6 +170,7 @@ export interface ToolCallUpdateFields {
   raw_input?: Json;
   raw_output?: string;
   output_metadata?: ToolOutputMetadata;
+  task_metadata?: TaskMetadata;
   locations?: ToolLocation[];
   meta?: Json;
 }
@@ -150,9 +197,21 @@ export type SessionUpdate =
   | { type: "available_agents_update"; agents: AvailableAgent[] }
   | { type: "mode_state_update"; mode: ModeState }
   | { type: "current_mode_update"; current_mode_id: string }
+  | { type: "current_model_update"; current_model: CurrentModel }
   | { type: "config_option_update"; option_id: string; value: Json }
   | { type: "fast_mode_update"; fast_mode_state: FastModeState }
   | ({ type: "rate_limit_update" } & RateLimitUpdate)
+  | {
+      type: "api_retry_update";
+      attempt: number;
+      max_retries: number;
+      retry_delay_ms: number;
+      error_status: number | null;
+      error: ApiRetryError;
+    }
+  | { type: "prompt_suggestion_update"; suggestion: string }
+  | { type: "runtime_session_state_update"; state: RuntimeSessionState }
+  | ({ type: "settings_parse_error" } & SettingsParseErrorUpdate)
   | { type: "session_status_update"; status: "compacting" | "idle" }
   | { type: "compaction_boundary"; trigger: "manual" | "auto"; pre_tokens: number };
 
@@ -166,6 +225,13 @@ export interface PermissionOption {
 export interface PermissionRequest {
   tool_call: ToolCall;
   options: PermissionOption[];
+  display?: PermissionDisplay;
+}
+
+export interface PermissionDisplay {
+  title?: string;
+  display_name?: string;
+  description?: string;
 }
 
 export type ElicitationMode = "form" | "url";
@@ -254,6 +320,7 @@ export interface AccountInfo {
   subscription_type?: string;
   token_source?: string;
   api_key_source?: string;
+  api_provider?: string;
 }
 
 export type McpServerConnectionStatus =
@@ -415,6 +482,14 @@ export type BridgeCommand =
       session_id: string;
     }
   | {
+      command: "get_context_usage";
+      session_id: string;
+    }
+  | {
+      command: "reload_plugins";
+      session_id: string;
+    }
+  | {
       command: "mcp_status";
       session_id: string;
     }
@@ -479,7 +554,7 @@ export type BridgeEvent =
       event: "connected";
       session_id: string;
       cwd: string;
-      model_name: string;
+      current_model: CurrentModel;
       available_models: AvailableModel[];
       mode: ModeState | null;
       history_updates?: SessionUpdate[];
@@ -493,7 +568,7 @@ export type BridgeEvent =
   | { event: "elicitation_complete"; session_id: string; completion: ElicitationComplete }
   | { event: "mcp_auth_redirect"; session_id: string; redirect: McpAuthRedirect }
   | { event: "mcp_operation_error"; session_id: string; error: McpOperationError }
-  | { event: "turn_complete"; session_id: string }
+  | { event: "turn_complete"; session_id: string; terminal_reason?: TerminalReason }
   | {
       event: "turn_error";
       session_id: string;
@@ -501,13 +576,16 @@ export type BridgeEvent =
       error_kind?: TurnErrorKind;
       sdk_result_subtype?: string;
       assistant_error?: string;
+      terminal_reason?: TerminalReason;
     }
   | { event: "slash_error"; session_id: string; message: string }
+  | { event: "runtime_reload_completed"; session_id: string }
+  | { event: "runtime_reload_failed"; session_id: string; message: string }
   | {
       event: "session_replaced";
       session_id: string;
       cwd: string;
-      model_name: string;
+      current_model: CurrentModel;
       available_models: AvailableModel[];
       mode: ModeState | null;
       history_updates?: SessionUpdate[];
@@ -515,6 +593,11 @@ export type BridgeEvent =
   | { event: "initialized"; result: InitializeResult }
   | { event: "sessions_listed"; sessions: SessionListEntry[] }
   | { event: "status_snapshot"; session_id: string; account: AccountInfo }
+  | {
+      event: "context_usage";
+      session_id: string;
+      percentage?: number;
+    }
   | {
       event: "mcp_snapshot";
       session_id: string;

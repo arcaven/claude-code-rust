@@ -140,6 +140,7 @@ pub enum ToolCallStatus {
     InProgress,
     Completed,
     Failed,
+    Killed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +266,7 @@ pub struct ToolCall {
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<serde_json::Value>,
     pub output_metadata: Option<ToolOutputMetadata>,
+    pub task_metadata: Option<TaskMetadata>,
     pub locations: Vec<ToolCallLocation>,
     pub meta: Option<serde_json::Value>,
 }
@@ -281,6 +283,7 @@ impl ToolCall {
             raw_input: None,
             raw_output: None,
             output_metadata: None,
+            task_metadata: None,
             locations: Vec::new(),
             meta: None,
         }
@@ -323,6 +326,12 @@ impl ToolCall {
     }
 
     #[must_use]
+    pub fn task_metadata(mut self, task_metadata: TaskMetadata) -> Self {
+        self.task_metadata = Some(task_metadata);
+        self
+    }
+
+    #[must_use]
     pub fn locations(mut self, locations: Vec<ToolCallLocation>) -> Self {
         self.locations = locations;
         self
@@ -344,6 +353,7 @@ pub struct ToolCallUpdateFields {
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<serde_json::Value>,
     pub output_metadata: Option<ToolOutputMetadata>,
+    pub task_metadata: Option<TaskMetadata>,
     pub locations: Option<Vec<ToolCallLocation>>,
 }
 
@@ -396,6 +406,12 @@ impl ToolCallUpdateFields {
     }
 
     #[must_use]
+    pub fn task_metadata(mut self, task_metadata: TaskMetadata) -> Self {
+        self.task_metadata = Some(task_metadata);
+        self
+    }
+
+    #[must_use]
     pub fn locations(mut self, locations: Vec<ToolCallLocation>) -> Self {
         self.locations = Some(locations);
         self
@@ -424,24 +440,6 @@ impl ToolCallUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ExitPlanModeOutputMetadata {
-    pub is_ultraplan: Option<bool>,
-}
-
-impl ExitPlanModeOutputMetadata {
-    #[must_use]
-    pub fn new() -> Self {
-        Self { is_ultraplan: None }
-    }
-
-    #[must_use]
-    pub fn ultraplan(mut self, is_ultraplan: Option<bool>) -> Self {
-        self.is_ultraplan = is_ultraplan;
-        self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TodoWriteOutputMetadata {
     pub verification_nudge_needed: Option<bool>,
 }
@@ -462,13 +460,12 @@ impl TodoWriteOutputMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BashOutputMetadata {
     pub assistant_auto_backgrounded: Option<bool>,
-    pub token_saver_active: Option<bool>,
 }
 
 impl BashOutputMetadata {
     #[must_use]
     pub fn new() -> Self {
-        Self { assistant_auto_backgrounded: None, token_saver_active: None }
+        Self { assistant_auto_backgrounded: None }
     }
 
     #[must_use]
@@ -479,19 +476,51 @@ impl BashOutputMetadata {
         self.assistant_auto_backgrounded = assistant_auto_backgrounded;
         self
     }
-
-    #[must_use]
-    pub fn token_saver_active(mut self, token_saver_active: Option<bool>) -> Self {
-        self.token_saver_active = token_saver_active;
-        self
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolOutputMetadata {
     pub bash: Option<BashOutputMetadata>,
-    pub exit_plan_mode: Option<ExitPlanModeOutputMetadata>,
     pub todo_write: Option<TodoWriteOutputMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskMetadata {
+    pub end_time: Option<u64>,
+    pub total_paused_ms: Option<u64>,
+    pub error: Option<String>,
+    pub is_backgrounded: Option<bool>,
+}
+
+impl TaskMetadata {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn end_time(mut self, end_time: Option<u64>) -> Self {
+        self.end_time = end_time;
+        self
+    }
+
+    #[must_use]
+    pub fn total_paused_ms(mut self, total_paused_ms: Option<u64>) -> Self {
+        self.total_paused_ms = total_paused_ms;
+        self
+    }
+
+    #[must_use]
+    pub fn error(mut self, error: Option<String>) -> Self {
+        self.error = error;
+        self
+    }
+
+    #[must_use]
+    pub fn backgrounded(mut self, is_backgrounded: Option<bool>) -> Self {
+        self.is_backgrounded = is_backgrounded;
+        self
+    }
 }
 
 impl ToolOutputMetadata {
@@ -503,12 +532,6 @@ impl ToolOutputMetadata {
     #[must_use]
     pub fn bash(mut self, bash: Option<BashOutputMetadata>) -> Self {
         self.bash = bash;
-        self
-    }
-
-    #[must_use]
-    pub fn exit_plan_mode(mut self, exit_plan_mode: Option<ExitPlanModeOutputMetadata>) -> Self {
-        self.exit_plan_mode = exit_plan_mode;
         self
     }
 
@@ -729,6 +752,92 @@ impl AvailableModel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentModel {
+    pub requested_id: Option<String>,
+    pub resolved_id: String,
+    pub display_name_short: String,
+    pub display_name_long: String,
+    pub catalog_id: Option<String>,
+    pub supports_effort: bool,
+    pub supported_effort_levels: Vec<EffortLevel>,
+    pub supports_fast_mode: Option<bool>,
+    pub supports_auto_mode: Option<bool>,
+    pub supports_adaptive_thinking: Option<bool>,
+    pub is_authoritative: bool,
+}
+
+impl CurrentModel {
+    #[must_use]
+    pub fn new(
+        resolved_id: impl Into<String>,
+        display_name_short: impl Into<String>,
+        display_name_long: impl Into<String>,
+    ) -> Self {
+        Self {
+            requested_id: None,
+            resolved_id: resolved_id.into(),
+            display_name_short: display_name_short.into(),
+            display_name_long: display_name_long.into(),
+            catalog_id: None,
+            supports_effort: false,
+            supported_effort_levels: Vec::new(),
+            supports_fast_mode: None,
+            supports_auto_mode: None,
+            supports_adaptive_thinking: None,
+            is_authoritative: false,
+        }
+    }
+
+    #[must_use]
+    pub fn requested_id(mut self, requested_id: impl Into<String>) -> Self {
+        self.requested_id = Some(requested_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn catalog_id(mut self, catalog_id: impl Into<String>) -> Self {
+        self.catalog_id = Some(catalog_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn supports_effort(mut self, supports_effort: bool) -> Self {
+        self.supports_effort = supports_effort;
+        self
+    }
+
+    #[must_use]
+    pub fn supported_effort_levels(mut self, supported_effort_levels: Vec<EffortLevel>) -> Self {
+        self.supported_effort_levels = supported_effort_levels;
+        self
+    }
+
+    #[must_use]
+    pub fn supports_adaptive_thinking(mut self, supports_adaptive_thinking: Option<bool>) -> Self {
+        self.supports_adaptive_thinking = supports_adaptive_thinking;
+        self
+    }
+
+    #[must_use]
+    pub fn supports_fast_mode(mut self, supports_fast_mode: Option<bool>) -> Self {
+        self.supports_fast_mode = supports_fast_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn supports_auto_mode(mut self, supports_auto_mode: Option<bool>) -> Self {
+        self.supports_auto_mode = supports_auto_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn authoritative(mut self, is_authoritative: bool) -> Self {
+        self.is_authoritative = is_authoritative;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AvailableAgentsUpdate {
     pub available_agents: Vec<AvailableAgent>,
 }
@@ -752,6 +861,18 @@ impl CurrentModeUpdate {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentModelUpdate {
+    pub current_model: CurrentModel,
+}
+
+impl CurrentModelUpdate {
+    #[must_use]
+    pub fn new(current_model: CurrentModel) -> Self {
+        Self { current_model }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigOptionUpdate {
     pub option_id: String,
@@ -772,6 +893,24 @@ pub enum RateLimitStatus {
     Allowed,
     AllowedWarning,
     Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApiRetryError {
+    AuthenticationFailed,
+    BillingError,
+    RateLimit,
+    InvalidRequest,
+    ServerError,
+    MaxOutputTokens,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeSessionState {
+    Idle,
+    Running,
+    RequiresAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -819,9 +958,24 @@ pub enum SessionUpdate {
     AvailableAgentsUpdate(AvailableAgentsUpdate),
     ModeStateUpdate(crate::app::ModeState),
     CurrentModeUpdate(CurrentModeUpdate),
+    CurrentModelUpdate(CurrentModelUpdate),
     ConfigOptionUpdate(ConfigOptionUpdate),
     FastModeUpdate(FastModeState),
     RateLimitUpdate(RateLimitUpdate),
+    ApiRetryUpdate {
+        attempt: u64,
+        max_retries: u64,
+        retry_delay_ms: u64,
+        error_status: Option<u16>,
+        error: ApiRetryError,
+    },
+    PromptSuggestionUpdate(String),
+    RuntimeSessionStateUpdate(RuntimeSessionState),
+    SettingsParseError {
+        file: Option<String>,
+        path: String,
+        message: String,
+    },
     SessionStatusUpdate(SessionStatus),
     CompactionBoundary(CompactionBoundary),
 }
@@ -1014,6 +1168,7 @@ pub struct RequestPermissionRequest {
     pub session_id: SessionId,
     pub tool_call: ToolCallUpdate,
     pub options: Vec<PermissionOption>,
+    pub display: Option<PermissionDisplay>,
 }
 
 impl RequestPermissionRequest {
@@ -1022,8 +1177,48 @@ impl RequestPermissionRequest {
         session_id: impl Into<SessionId>,
         tool_call: ToolCallUpdate,
         options: Vec<PermissionOption>,
+        display: Option<PermissionDisplay>,
     ) -> Self {
-        Self { session_id: session_id.into(), tool_call, options }
+        Self { session_id: session_id.into(), tool_call, options, display }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PermissionDisplay {
+    pub title: Option<String>,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+}
+
+impl PermissionDisplay {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn title(mut self, title: Option<String>) -> Self {
+        self.title = title;
+        self
+    }
+
+    #[must_use]
+    pub fn display_name(mut self, display_name: Option<String>) -> Self {
+        self.display_name = display_name;
+        self
+    }
+
+    #[must_use]
+    pub fn description(mut self, description: Option<String>) -> Self {
+        self.description = description;
+        self
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.title.as_ref().is_none_or(|value| value.trim().is_empty())
+            && self.display_name.as_ref().is_none_or(|value| value.trim().is_empty())
+            && self.description.as_ref().is_none_or(|value| value.trim().is_empty())
     }
 }
 

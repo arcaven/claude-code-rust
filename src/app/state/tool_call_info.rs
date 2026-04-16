@@ -13,6 +13,7 @@ pub struct ToolCallInfo {
     pub raw_input: Option<serde_json::Value>,
     pub raw_input_bytes: usize,
     pub output_metadata: Option<model::ToolOutputMetadata>,
+    pub task_metadata: Option<model::TaskMetadata>,
     pub status: model::ToolCallStatus,
     pub content: Vec<model::ToolCallContent>,
     /// Hidden tool calls are subagent children - not rendered directly.
@@ -77,29 +78,11 @@ impl ToolCallInfo {
     }
 
     #[must_use]
-    pub fn is_ultraplan(&self) -> bool {
-        self.output_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.exit_plan_mode.as_ref())
-            .and_then(|metadata| metadata.is_ultraplan)
-            .unwrap_or(false)
-    }
-
-    #[must_use]
     pub fn assistant_auto_backgrounded(&self) -> bool {
         self.output_metadata
             .as_ref()
             .and_then(|metadata| metadata.bash.as_ref())
             .and_then(|metadata| metadata.assistant_auto_backgrounded)
-            .unwrap_or(false)
-    }
-
-    #[must_use]
-    pub fn token_saver_active(&self) -> bool {
-        self.output_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.bash.as_ref())
-            .and_then(|metadata| metadata.token_saver_active)
             .unwrap_or(false)
     }
 
@@ -110,6 +93,30 @@ impl ToolCallInfo {
             .and_then(|metadata| metadata.todo_write.as_ref())
             .and_then(|metadata| metadata.verification_nudge_needed)
             .unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn task_is_backgrounded(&self) -> bool {
+        self.task_metadata.as_ref().and_then(|metadata| metadata.is_backgrounded).unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn hidden_unless_focused_interaction(&self) -> bool {
+        self.hidden
+            && !self.pending_permission.as_ref().is_some_and(|permission| permission.focused)
+            && !self.pending_question.as_ref().is_some_and(|question| question.focused)
+    }
+
+    #[must_use]
+    pub fn is_hidden_focused_interaction(&self) -> bool {
+        self.hidden
+            && (self.pending_permission.as_ref().is_some_and(|permission| permission.focused)
+                || self.pending_question.as_ref().is_some_and(|question| question.focused))
+    }
+
+    #[must_use]
+    pub fn is_subagent_root_tool(&self) -> bool {
+        !self.hidden && matches!(self.sdk_tool_name.as_str(), "Task" | "Agent")
     }
 
     /// Mark render cache for this tool call as stale.
@@ -173,6 +180,7 @@ pub fn is_exit_plan_mode_tool_name(tool_name: &str) -> bool {
 /// controls render inside the tool call block (unified edit/permission UX).
 pub struct InlinePermission {
     pub options: Vec<model::PermissionOption>,
+    pub display: Option<model::PermissionDisplay>,
     pub response_tx: tokio::sync::oneshot::Sender<model::RequestPermissionResponse>,
     pub selected_index: usize,
     /// Whether this permission currently has keyboard focus.

@@ -13,7 +13,7 @@ use crate::app::inline_interactions::handle_inline_interaction_key;
 use crate::app::selection::{clear_selection, selection_text_from_rendered_lines};
 use crate::app::state::AutocompleteKind;
 use crate::app::{mention, slash, subagent};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 #[cfg(test)]
 use std::cell::Cell;
 use std::rc::Rc;
@@ -348,6 +348,9 @@ fn handle_normal_key_actions(app: &mut App, key: KeyEvent) -> bool {
     if handle_focus_toggle_key(app, key) {
         return true;
     }
+    if handle_prompt_suggestion_key(app, key) {
+        return true;
+    }
     if handle_mode_cycle_key(app, key) {
         return true;
     }
@@ -512,6 +515,26 @@ fn handle_focus_toggle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
+fn handle_prompt_suggestion_key(app: &mut App, key: KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Tab)
+        || !key.modifiers.is_empty()
+        || app.focus_owner() != FocusOwner::Input
+        || !app.input.is_empty()
+    {
+        return false;
+    }
+
+    let Some(suggestion) = app.prompt_suggestion.take() else {
+        return false;
+    };
+    if suggestion.trim().is_empty() {
+        return false;
+    }
+    app.input.set_text(&suggestion);
+    app.sync_help_open_with_input();
+    true
+}
+
 fn handle_mode_cycle_key(app: &mut App, key: KeyEvent) -> bool {
     if !matches!(key.code, KeyCode::BackTab) {
         return false;
@@ -565,6 +588,9 @@ fn handle_clipboard_paste_key(app: &mut App, key: KeyEvent) -> bool {
     if !is_clipboard_paste_shortcut(key) || app.focus_owner() == FocusOwner::TodoList {
         return false;
     }
+    if key.kind != KeyEventKind::Release {
+        return false;
+    }
 
     // Skip system clipboard access in tests to avoid flaky failures / segfaults.
     #[cfg(test)]
@@ -616,19 +642,7 @@ fn handle_clipboard_paste_key(app: &mut App, key: KeyEvent) -> bool {
             }
         }
 
-        // Fallback: paste text (for terminals without Event::Paste).
-        let Ok(text) = clipboard.get_text() else {
-            return false;
-        };
-        if text.is_empty() {
-            return false;
-        }
-        if app.pending_paste_text == text {
-            return true;
-        }
-        app.pending_clipboard_paste_dedupe = Some(text.clone());
-        app.queue_paste_text(&text);
-        true
+        false
     }
 }
 

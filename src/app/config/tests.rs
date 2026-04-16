@@ -783,7 +783,7 @@ fn handle_key_cycles_default_permission_mode() {
 
     assert_eq!(
         store::default_permission_mode(&app.config.committed_settings_document),
-        Ok(DefaultPermissionMode::AcceptEdits)
+        Ok(DefaultPermissionMode::Auto)
     );
 }
 
@@ -1311,6 +1311,11 @@ fn mcp_tab_refresh_key_requests_snapshot() {
 
     handle_key(&mut app, KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
 
+    let envelope = rx.try_recv().expect("runtime reload command");
+    assert_eq!(
+        envelope.command,
+        BridgeCommand::ReloadPlugins { session_id: "session-1".to_owned() }
+    );
     let envelope = rx.try_recv().expect("mcp snapshot command");
     assert_eq!(
         envelope.command,

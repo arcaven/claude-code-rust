@@ -357,6 +357,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status: model::ToolCallStatus::InProgress,
             content: Vec::new(),
             hidden: false,
@@ -412,8 +413,13 @@ mod tests {
         if let Some(MessageBlock::ToolCall(tc)) =
             app.messages.get_mut(msg_idx).and_then(|m| m.blocks.get_mut(0))
         {
-            tc.pending_permission =
-                Some(InlinePermission { options, response_tx: tx, selected_index: 0, focused });
+            tc.pending_permission = Some(InlinePermission {
+                options,
+                display: None,
+                response_tx: tx,
+                selected_index: 0,
+                focused,
+            });
         }
         app.pending_interaction_ids.push(tool_id.to_owned());
         rx

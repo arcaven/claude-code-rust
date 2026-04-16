@@ -26,10 +26,9 @@ pub use tool_call_info::{
 pub use types::{
     AppStatus, CancelOrigin, ExtraUsage, HelpView, HistoryRetentionPolicy, HistoryRetentionStats,
     LoginHint, McpState, MessageUsage, ModeInfo, ModeState, PasteSessionState, PendingCommandAck,
-    RecentSessionInfo, RenderCacheBudget, SUBAGENT_THINKING_DEBOUNCE, ScrollbarDragState,
-    SelectionKind, SelectionPoint, SelectionState, SessionPickerState, SessionUsageState, TodoItem,
-    TodoStatus, ToolCallScope, UsageSnapshot, UsageSourceKind, UsageSourceMode, UsageState,
-    UsageWindow,
+    RecentSessionInfo, RenderCacheBudget, ScrollbarDragState, SelectionKind, SelectionPoint,
+    SelectionState, SessionPickerState, SessionUsageState, TodoItem, TodoStatus, ToolCallScope,
+    UsageSnapshot, UsageSourceKind, UsageSourceMode, UsageState, UsageWindow,
 };
 pub use viewport::{
     ChatViewport, LayoutInvalidation, LayoutInvalidation as InvalidationLevel,
@@ -149,9 +148,7 @@ pub struct App {
     pub conn: Option<Rc<crate::agent::client::AgentConnection>>,
     /// Monotonic session authority epoch used to ignore stale async view data.
     pub session_scope_epoch: u64,
-    pub model_name: String,
-    /// True once the welcome banner has captured its one-time session model label.
-    pub welcome_model_resolved: bool,
+    pub current_model: Option<model::CurrentModel>,
     pub cwd: String,
     pub cwd_raw: String,
     pub files_accessed: usize,
@@ -195,15 +192,12 @@ pub struct App {
     /// Session-level preference for collapsing non-Execute tool call bodies.
     /// Toggled by Ctrl+O and applied at render/layout time.
     pub tools_collapsed: bool,
-    /// IDs of Task/Agent tool calls currently `InProgress` -- their children get hidden.
+    /// IDs of root Task/Agent tool calls currently `InProgress`.
     /// Use `insert_active_task()`, `remove_active_task()`.
     pub active_task_ids: HashSet<String>,
-    /// Tool scope keyed by tool call ID; used to distinguish main-agent from subagent tools.
+    /// Tool scope keyed by tool call ID; used to distinguish main-agent, subagent roots,
+    /// and explicitly owned subagent child tools.
     pub tool_call_scopes: HashMap<String, ToolCallScope>,
-    /// IDs of non Task/Agent subagent tool calls currently `InProgress`/`Pending`.
-    pub active_subagent_tool_ids: HashSet<String>,
-    /// Timestamp when subagent entered an idle gap (no active child tool calls).
-    pub subagent_idle_since: Option<Instant>,
     /// Shared terminal process map - used to snapshot output on completion.
     pub terminals: crate::agent::events::TerminalMap,
     /// Force a full terminal clear on next render frame.
@@ -270,9 +264,6 @@ pub struct App {
     /// Some terminals split one clipboard paste into multiple chunks; we merge
     /// them and apply placeholder threshold to the merged content once per cycle.
     pub pending_paste_text: String,
-    /// Pending duplicate-suppression marker for terminals that emit both a
-    /// clipboard shortcut key event and `Event::Paste` for the same text paste.
-    pub pending_clipboard_paste_dedupe: Option<String>,
     /// Pending paste session metadata for the currently queued `Event::Paste` payload.
     pub pending_paste_session: Option<PasteSessionState>,
     /// Most recent active placeholder paste session, used for safe chunk continuation.
@@ -297,6 +288,10 @@ pub struct App {
     pub mcp: McpState,
     /// Fast mode state telemetry from the SDK.
     pub fast_mode_state: model::FastModeState,
+    /// Latest SDK runtime liveness state.
+    pub runtime_session_state: Option<model::RuntimeSessionState>,
+    /// Latest prompt suggestion from the SDK, shown in the input hint band.
+    pub prompt_suggestion: Option<String>,
     /// Latest rate-limit telemetry from the SDK.
     pub last_rate_limit_update: Option<model::RateLimitUpdate>,
     /// Turn-local inline/system notices that may upgrade in place during the active turn.
@@ -444,57 +439,69 @@ impl App {
         if self.messages.first().is_some_and(|m| matches!(m.role, MessageRole::Welcome)) {
             return;
         }
-        self.insert_message_tracked(
-            0,
-            ChatMessage::welcome_with_recent(
-                self.welcome_model_display_name(),
-                &self.cwd,
-                &self.recent_sessions,
-            ),
-        );
-        self.welcome_model_resolved = self.model_name_is_authoritative();
+        self.insert_message_tracked(0, self.build_welcome_message());
     }
 
-    fn model_name_is_authoritative(&self) -> bool {
-        let model_name = self.model_name.trim();
-        if model_name.is_empty() || model_name == "Connecting..." {
-            return false;
-        }
-        if model_name != "default" {
-            return true;
-        }
-        matches!(
-            crate::app::config::store::model(&self.config.committed_settings_document),
-            Ok(Some(configured_model)) if configured_model.trim() == "default"
+    #[must_use]
+    fn welcome_subscription_display(&self) -> &str {
+        self.account_info
+            .as_ref()
+            .and_then(|account| account.subscription_type.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-")
+    }
+
+    #[must_use]
+    fn welcome_cwd_display(&self) -> &str {
+        let cwd = self.cwd.trim();
+        if cwd.is_empty() { "-" } else { cwd }
+    }
+
+    #[must_use]
+    fn welcome_session_id_display(&self) -> String {
+        self.session_id
+            .as_ref()
+            .map(std::string::ToString::to_string)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "-".to_owned())
+    }
+
+    #[must_use]
+    pub(crate) fn build_welcome_message(&self) -> ChatMessage {
+        let subscription = self.welcome_subscription_display();
+        let session_id = self.welcome_session_id_display();
+        ChatMessage::welcome(
+            env!("CARGO_PKG_VERSION"),
+            subscription,
+            self.welcome_cwd_display(),
+            &session_id,
         )
     }
 
     #[must_use]
-    pub fn model_display_name(&self) -> &str {
-        let model_name = self.model_name.trim();
-        if self.session_id.is_none()
-            && (model_name.is_empty() || model_name == "Connecting..." || model_name == "default")
-        {
-            "Connecting..."
-        } else if model_name.is_empty() || model_name == "Connecting..." {
-            "default"
-        } else {
-            &self.model_name
-        }
+    pub(crate) fn current_welcome_tip_seed(&self) -> Option<u64> {
+        let first = self.messages.first()?;
+        let MessageBlock::Welcome(welcome) = first.blocks.first()? else {
+            return None;
+        };
+        Some(welcome.tip_seed)
     }
 
-    #[must_use]
-    fn welcome_model_display_name(&self) -> &str {
-        self.model_display_name()
-    }
-
-    /// Update the welcome message's model name once, when the session model becomes authoritative.
-    pub fn update_welcome_model_once(&mut self) {
-        if self.welcome_model_resolved {
+    pub(crate) fn apply_welcome_tip_seed(message: &mut ChatMessage, tip_seed: u64) {
+        let Some(MessageBlock::Welcome(welcome)) = message.blocks.first_mut() else {
             return;
-        }
-        let welcome_model = self.welcome_model_display_name().to_owned();
-        let model_is_authoritative = self.model_name_is_authoritative();
+        };
+        welcome.tip_seed = tip_seed;
+    }
+
+    /// Update the welcome message with the latest session/account snapshot.
+    pub fn sync_welcome_snapshot(&mut self) {
+        let version = env!("CARGO_PKG_VERSION");
+        let subscription = self.welcome_subscription_display().to_owned();
+        let cwd = self.welcome_cwd_display().to_owned();
+        let session_id = self.welcome_session_id_display();
         let Some(first) = self.messages.first_mut() else {
             return;
         };
@@ -504,34 +511,20 @@ impl App {
         let Some(MessageBlock::Welcome(welcome)) = first.blocks.first_mut() else {
             return;
         };
-        if welcome.model_name != welcome_model {
-            welcome.model_name = welcome_model;
+        if welcome.version != version
+            || welcome.subscription != subscription
+            || welcome.cwd != cwd
+            || welcome.session_id != session_id
+        {
+            version.clone_into(&mut welcome.version);
+            welcome.subscription = subscription;
+            welcome.cwd = cwd;
+            welcome.session_id = session_id;
             welcome.cache.invalidate();
             self.sync_render_cache_slot(0, 0);
             self.recompute_message_retained_bytes(0);
             self.invalidate_layout(InvalidationLevel::MessagesFrom(0));
         }
-        if model_is_authoritative {
-            self.welcome_model_resolved = true;
-        }
-    }
-
-    /// Update the welcome message with latest discovered recent sessions.
-    pub fn sync_welcome_recent_sessions(&mut self) {
-        let Some(first) = self.messages.first_mut() else {
-            return;
-        };
-        if !matches!(first.role, MessageRole::Welcome) {
-            return;
-        }
-        let Some(MessageBlock::Welcome(welcome)) = first.blocks.first_mut() else {
-            return;
-        };
-        welcome.recent_sessions.clone_from(&self.recent_sessions);
-        welcome.cache.invalidate();
-        self.sync_render_cache_slot(0, 0);
-        self.recompute_message_retained_bytes(0);
-        self.invalidate_layout(InvalidationLevel::MessagesFrom(0));
     }
 
     /// Track a Task/Agent tool call as active (in-progress subagent).
@@ -550,7 +543,7 @@ impl App {
 
     #[must_use]
     pub fn tool_call_scope(&self, id: &str) -> Option<ToolCallScope> {
-        self.tool_call_scopes.get(id).copied()
+        self.tool_call_scopes.get(id).cloned()
     }
 
     #[must_use]
@@ -564,40 +557,9 @@ impl App {
         .flatten()
     }
 
-    pub fn mark_subagent_tool_started(&mut self, id: &str) {
-        self.active_subagent_tool_ids.insert(id.to_owned());
-        self.subagent_idle_since = None;
-    }
-
-    pub fn mark_subagent_tool_finished(&mut self, id: &str, now: Instant) {
-        self.active_subagent_tool_ids.remove(id);
-        self.refresh_subagent_idle_since(now);
-    }
-
-    pub fn refresh_subagent_idle_since(&mut self, now: Instant) {
-        if self.active_task_ids.is_empty() || !self.active_subagent_tool_ids.is_empty() {
-            self.subagent_idle_since = None;
-            return;
-        }
-        if self.subagent_idle_since.is_none() {
-            self.subagent_idle_since = Some(now);
-        }
-    }
-
-    #[must_use]
-    pub fn should_show_subagent_thinking(&self, now: Instant) -> bool {
-        if self.active_task_ids.is_empty() || !self.active_subagent_tool_ids.is_empty() {
-            return false;
-        }
-        self.subagent_idle_since
-            .is_some_and(|since| now.saturating_duration_since(since) >= SUBAGENT_THINKING_DEBOUNCE)
-    }
-
     pub fn clear_tool_scope_tracking(&mut self) {
         self.tool_call_scopes.clear();
         self.active_task_ids.clear();
-        self.active_subagent_tool_ids.clear();
-        self.subagent_idle_since = None;
     }
 
     /// Look up the (`message_index`, `block_index`) for a tool call ID.
@@ -866,8 +828,10 @@ impl App {
             session_id: None,
             conn: None,
             session_scope_epoch: 0,
-            model_name: "test-model".into(),
-            welcome_model_resolved: true,
+            current_model: Some(
+                model::CurrentModel::new("test-model", "test-model", "test-model")
+                    .authoritative(true),
+            ),
             cwd: "/test".into(),
             cwd_raw: "/test".into(),
             files_accessed: 0,
@@ -893,8 +857,6 @@ impl App {
             tools_collapsed: false,
             active_task_ids: HashSet::default(),
             tool_call_scopes: HashMap::default(),
-            active_subagent_tool_ids: HashSet::default(),
-            subagent_idle_since: None,
             terminals: std::rc::Rc::default(),
             force_redraw: false,
             tool_call_index: HashMap::default(),
@@ -923,7 +885,6 @@ impl App {
             pending_submit: None,
             paste_burst: super::paste_burst::PasteBurstDetector::new(),
             pending_paste_text: String::new(),
-            pending_clipboard_paste_dedupe: None,
             pending_paste_session: None,
             active_paste_session: None,
             next_paste_session_id: 1,
@@ -935,6 +896,8 @@ impl App {
             usage: UsageState::default(),
             mcp: McpState::default(),
             fast_mode_state: model::FastModeState::Off,
+            runtime_session_state: None,
+            prompt_suggestion: None,
             last_rate_limit_update: None,
             turn_notice_refs: Vec::new(),
             is_compacting: false,
@@ -1073,10 +1036,10 @@ impl App {
 
     pub fn clear_session_runtime_identity(&mut self) {
         self.session_id = None;
-        "Connecting...".clone_into(&mut self.model_name);
+        self.current_model = None;
         self.mode = None;
         self.fast_mode_state = model::FastModeState::Off;
-        self.welcome_model_resolved = false;
+        self.session_usage = SessionUsageState::default();
     }
 
     pub fn reconcile_trust_state_from_preferences_and_cwd(&mut self) {
@@ -1099,9 +1062,7 @@ impl App {
     }
 
     pub fn reconcile_runtime_from_persisted_settings_change(&mut self) {
-        self.welcome_model_resolved = false;
         self.reconcile_trust_state_from_preferences_and_cwd();
-        self.update_welcome_model_once();
     }
 
     pub(crate) fn shift_active_turn_assistant_for_insert(&mut self, idx: usize) {
@@ -1394,6 +1355,32 @@ mod tests {
     }
 
     #[test]
+    fn clear_session_runtime_identity_resets_session_usage() {
+        let mut app = App::test_default();
+        app.session_id = Some(crate::agent::model::SessionId::new("session-1"));
+        app.current_model = Some(
+            crate::agent::model::CurrentModel::new("sonnet", "Claude Sonnet", "Claude Sonnet")
+                .authoritative(true),
+        );
+        app.mode = Some(crate::app::ModeState {
+            current_mode_id: "plan".to_owned(),
+            current_mode_name: "Plan".to_owned(),
+            available_modes: Vec::new(),
+        });
+        app.session_usage.context_usage_percent = Some(62);
+        app.session_usage.context_usage_in_flight = true;
+        app.session_usage.context_usage_refresh_pending = true;
+        app.session_usage.last_compaction_pre_tokens = Some(123_456);
+
+        app.clear_session_runtime_identity();
+
+        assert!(app.session_id.is_none());
+        assert!(app.current_model.is_none());
+        assert!(app.mode.is_none());
+        assert_eq!(app.session_usage, SessionUsageState::default());
+    }
+
+    #[test]
     fn cache_store_without_height_has_no_height() {
         let mut cache = BlockCache::default();
         cache.store(vec![Line::from("hello")]);
@@ -1518,6 +1505,7 @@ mod tests {
                 raw_input: None,
                 raw_input_bytes: 0,
                 output_metadata: None,
+                task_metadata: None,
                 status,
                 content: Vec::new(),
                 hidden: false,
@@ -1555,6 +1543,7 @@ mod tests {
                 raw_input: None,
                 raw_input_bytes: 0,
                 output_metadata: None,
+                task_metadata: None,
                 status,
                 content: Vec::new(),
                 hidden: false,
@@ -1589,6 +1578,7 @@ mod tests {
                 raw_input: None,
                 raw_input_bytes: 0,
                 output_metadata: None,
+                task_metadata: None,
                 status: model::ToolCallStatus::Completed,
                 content: Vec::new(),
                 hidden: false,
@@ -1611,6 +1601,7 @@ mod tests {
                         "Allow once",
                         model::PermissionOptionKind::AllowOnce,
                     )],
+                    display: None,
                     response_tx: tx,
                     selected_index: 0,
                     focused: false,
@@ -1865,7 +1856,6 @@ mod tests {
             is_active_turn_assistant: false,
             show_empty_thinking: false,
             show_thinking: false,
-            show_subagent_thinking: false,
             show_compacting: false,
         };
 
@@ -1892,7 +1882,7 @@ mod tests {
     fn enforce_history_retention_noop_under_budget() {
         let mut app = make_test_app();
         app.messages = vec![
-            ChatMessage::welcome("model", "/cwd"),
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
             user_text_message("small message"),
             user_text_message("another message"),
         ];
@@ -1908,7 +1898,7 @@ mod tests {
     fn enforce_history_retention_drops_oldest_and_adds_marker() {
         let mut app = make_test_app();
         app.messages = vec![
-            ChatMessage::welcome("model", "/cwd"),
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
             user_text_message("first old message"),
             user_text_message("second old message"),
             user_text_message("third old message"),
@@ -1926,7 +1916,7 @@ mod tests {
     fn enforce_history_retention_preserves_in_progress_tool_message() {
         let mut app = make_test_app();
         app.messages = vec![
-            ChatMessage::welcome("model", "/cwd"),
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
             user_text_message("droppable"),
             assistant_tool_message("tool-keep", model::ToolCallStatus::InProgress),
         ];
@@ -1949,7 +1939,7 @@ mod tests {
     fn enforce_history_retention_preserves_pending_tool_message() {
         let mut app = make_test_app();
         app.messages = vec![
-            ChatMessage::welcome("model", "/cwd"),
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
             user_text_message("droppable"),
             assistant_tool_message("tool-pending", model::ToolCallStatus::Pending),
         ];
@@ -1968,7 +1958,7 @@ mod tests {
     fn enforce_history_retention_preserves_permission_tool_message() {
         let mut app = make_test_app();
         app.messages = vec![
-            ChatMessage::welcome("model", "/cwd"),
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
             user_text_message("droppable"),
             assistant_tool_message_with_pending_permission("tool-perm"),
         ];
@@ -1987,7 +1977,7 @@ mod tests {
     fn enforce_history_retention_rebuilds_tool_index_after_prune() {
         let mut app = make_test_app();
         app.messages = vec![
-            ChatMessage::welcome("model", "/cwd"),
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
             user_text_message("drop this"),
             assistant_bash_tool_message("tool-idx", model::ToolCallStatus::InProgress, "term-1"),
         ];
@@ -2009,7 +1999,7 @@ mod tests {
         let mut app = make_test_app();
         app.status = AppStatus::Thinking;
         app.messages = vec![
-            ChatMessage::welcome("model", "/cwd"),
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
             user_text_message("drop this"),
             ChatMessage::new(MessageRole::Assistant, Vec::new(), None),
         ];
@@ -2049,7 +2039,10 @@ mod tests {
     #[test]
     fn enforce_history_retention_keeps_single_marker_on_repeat() {
         let mut app = make_test_app();
-        app.messages = vec![ChatMessage::welcome("model", "/cwd"), user_text_message("drop me")];
+        app.messages = vec![
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
+            user_text_message("drop me"),
+        ];
         app.history_retention.max_bytes = 1;
 
         let first = app.enforce_history_retention();
@@ -2067,7 +2060,7 @@ mod tests {
     fn enforce_history_retention_preserves_manual_scroll_anchor_across_drop_and_marker_insert() {
         let mut app = make_test_app();
         app.messages = vec![
-            ChatMessage::welcome("model", "/cwd"),
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-"),
             user_text_message("drop me first"),
             user_text_message("keep this anchored"),
             user_text_message("tail"),
@@ -2229,8 +2222,6 @@ mod tests {
         assert!(!app.active_task_ids.is_empty());
         app.clear_tool_scope_tracking();
         assert!(app.active_task_ids.is_empty(), "active_task_ids must be cleared at turn end");
-        assert!(app.active_subagent_tool_ids.is_empty());
-        assert!(app.subagent_idle_since.is_none());
     }
 
     #[test]
@@ -2317,7 +2308,10 @@ mod tests {
         let mut app = make_test_app();
         app.messages.push(assistant_tool_message("tool-1", model::ToolCallStatus::Completed));
         app.index_tool_call("tool-1".to_owned(), 0, 0);
-        app.register_tool_call_scope("tool-1".to_owned(), ToolCallScope::Subagent);
+        app.register_tool_call_scope(
+            "tool-1".to_owned(),
+            ToolCallScope::SubagentChild { parent_tool_use_id: "task-1".to_owned() },
+        );
 
         let removed = app.remove_message_tracked(0);
 

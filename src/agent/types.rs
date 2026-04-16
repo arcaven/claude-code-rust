@@ -53,6 +53,22 @@ pub struct AvailableModel {
     pub supports_auto_mode: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentModel {
+    pub requested_id: Option<String>,
+    pub resolved_id: String,
+    pub display_name_short: String,
+    pub display_name_long: String,
+    pub catalog_id: Option<String>,
+    pub supports_effort: bool,
+    #[serde(default)]
+    pub supported_effort_levels: Vec<EffortLevel>,
+    pub supports_fast_mode: Option<bool>,
+    pub supports_auto_mode: Option<bool>,
+    pub supports_adaptive_thinking: Option<bool>,
+    pub is_authoritative: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FastModeState {
@@ -67,6 +83,34 @@ pub enum RateLimitStatus {
     Allowed,
     AllowedWarning,
     Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiRetryError {
+    AuthenticationFailed,
+    BillingError,
+    RateLimit,
+    InvalidRequest,
+    ServerError,
+    MaxOutputTokens,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSessionState {
+    Idle,
+    Running,
+    RequiresAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsParseErrorUpdate {
+    pub file: Option<String>,
+    pub path: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,6 +158,7 @@ pub struct ToolCall {
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<String>,
     pub output_metadata: Option<ToolOutputMetadata>,
+    pub task_metadata: Option<TaskMetadata>,
     pub locations: Vec<ToolLocation>,
     pub meta: Option<serde_json::Value>,
 }
@@ -133,6 +178,7 @@ pub struct ToolCallUpdateFields {
     pub raw_input: Option<serde_json::Value>,
     pub raw_output: Option<String>,
     pub output_metadata: Option<ToolOutputMetadata>,
+    pub task_metadata: Option<TaskMetadata>,
     pub locations: Option<Vec<ToolLocation>>,
     pub meta: Option<serde_json::Value>,
 }
@@ -144,11 +190,6 @@ pub struct ToolLocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ExitPlanModeOutputMetadata {
-    pub is_ultraplan: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TodoWriteOutputMetadata {
     pub verification_nudge_needed: Option<bool>,
 }
@@ -156,14 +197,20 @@ pub struct TodoWriteOutputMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BashOutputMetadata {
     pub assistant_auto_backgrounded: Option<bool>,
-    pub token_saver_active: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ToolOutputMetadata {
     pub bash: Option<BashOutputMetadata>,
-    pub exit_plan_mode: Option<ExitPlanModeOutputMetadata>,
     pub todo_write: Option<TodoWriteOutputMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TaskMetadata {
+    pub end_time: Option<u64>,
+    pub total_paused_ms: Option<u64>,
+    pub error: Option<String>,
+    pub is_backgrounded: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +274,9 @@ pub enum SessionUpdate {
     CurrentModeUpdate {
         current_mode_id: String,
     },
+    CurrentModelUpdate {
+        current_model: CurrentModel,
+    },
     ConfigOptionUpdate {
         option_id: String,
         value: serde_json::Value,
@@ -244,6 +294,24 @@ pub enum SessionUpdate {
         overage_disabled_reason: Option<String>,
         is_using_overage: Option<bool>,
         surpassed_threshold: Option<f64>,
+    },
+    ApiRetryUpdate {
+        attempt: u64,
+        max_retries: u64,
+        retry_delay_ms: u64,
+        error_status: Option<u16>,
+        error: ApiRetryError,
+    },
+    PromptSuggestionUpdate {
+        suggestion: String,
+    },
+    RuntimeSessionStateUpdate {
+        state: RuntimeSessionState,
+    },
+    SettingsParseError {
+        file: Option<String>,
+        path: String,
+        message: String,
     },
     SessionStatusUpdate {
         status: SessionStatus,
@@ -266,6 +334,14 @@ pub struct PermissionOption {
 pub struct PermissionRequest {
     pub tool_call: ToolCall,
     pub options: Vec<PermissionOption>,
+    pub display: Option<PermissionDisplay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PermissionDisplay {
+    pub title: Option<String>,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +434,43 @@ pub struct McpOperationError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReason {
+    BlockingLimit,
+    RapidRefillBreaker,
+    PromptTooLong,
+    ImageError,
+    ModelError,
+    AbortedStreaming,
+    AbortedTools,
+    StopHookPrevented,
+    HookStopped,
+    ToolDeferred,
+    MaxTurns,
+    Completed,
+}
+
+impl TerminalReason {
+    #[must_use]
+    pub const fn as_stored(self) -> &'static str {
+        match self {
+            Self::BlockingLimit => "blocking_limit",
+            Self::RapidRefillBreaker => "rapid_refill_breaker",
+            Self::PromptTooLong => "prompt_too_long",
+            Self::ImageError => "image_error",
+            Self::ModelError => "model_error",
+            Self::AbortedStreaming => "aborted_streaming",
+            Self::AbortedTools => "aborted_tools",
+            Self::StopHookPrevented => "stop_hook_prevented",
+            Self::HookStopped => "hook_stopped",
+            Self::ToolDeferred => "tool_deferred",
+            Self::MaxTurns => "max_turns",
+            Self::Completed => "completed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthMethod {
     pub id: String,
@@ -414,6 +527,7 @@ pub struct AccountInfo {
     pub subscription_type: Option<String>,
     pub token_source: Option<String>,
     pub api_key_source: Option<String>,
+    pub api_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,4 +632,27 @@ pub struct McpSetServersResult {
     pub removed: Vec<String>,
     #[serde(default)]
     pub errors: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiRetryError, SessionUpdate};
+
+    #[test]
+    fn api_retry_update_deserializes_unknown_error_defensively() {
+        let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "type": "api_retry_update",
+            "attempt": 1,
+            "max_retries": 4,
+            "retry_delay_ms": 1000,
+            "error_status": null,
+            "error": "transport_timeout"
+        }))
+        .expect("deserialize api retry update");
+
+        assert!(matches!(
+            update,
+            SessionUpdate::ApiRetryUpdate { error: ApiRetryError::Unknown, .. }
+        ));
+    }
 }

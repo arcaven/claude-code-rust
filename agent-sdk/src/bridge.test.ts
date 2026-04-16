@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   AsyncQueue,
   CACHE_SPLIT_POLICY,
+  buildApiRetryUpdate,
   buildRateLimitUpdate,
   buildQueryOptions,
   canGenerateSessionTitle,
@@ -12,15 +13,19 @@ import {
   buildToolResultFields,
   createToolCall,
   handleTaskSystemMessage,
+  handleSdkMessage,
   mapAvailableAgents,
   mapAvailableModels,
   mapSessionMessagesToUpdates,
   mapSdkSessions,
   agentSdkVersionCompatibilityError,
+  attachRequestUserDialogInterceptor,
   looksLikeAuthRequired,
   normalizeToolResultText,
   parseFastModeState,
+  parseRuntimeSessionState,
   parseRateLimitStatus,
+  normalizeSettingsParseError,
   normalizeToolKind,
   parseCommandEnvelope,
   permissionOptionsFromSuggestions,
@@ -31,8 +36,23 @@ import {
   unwrapToolUseResult,
 } from "./bridge.js";
 import type { SessionState } from "./bridge.js";
+import {
+  availableModesForSession,
+  buildModeState,
+  markModeUnavailableForSession,
+  permissionModeFailureLooksUnsupported,
+  refreshSupportedModesForSession,
+} from "./bridge/commands.js";
+import {
+  emitCurrentModelUpdate,
+  refreshCurrentModel,
+  resolveCurrentModel,
+  shouldInvalidateResolvedRuntimeModel,
+  shouldEmitStartupAuthRequiredForAccount,
+} from "./bridge/session_lifecycle.js";
 import { emitToolProgressUpdate } from "./bridge/tool_calls.js";
 import { requestAskUserQuestionAnswers } from "./bridge/user_interaction.js";
+import { handleResultMessage } from "./bridge/message_handlers.js";
 
 function makeSessionState(): SessionState {
   const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
@@ -42,6 +62,9 @@ function makeSessionState(): SessionState {
     model: "haiku",
     availableModels: [],
     mode: null,
+    supportedModeIds: [],
+    runtimeUnavailableModeIds: [],
+    supportsBypassPermissionsMode: false,
     fastModeState: "off",
     query: {} as import("@anthropic-ai/claude-agent-sdk").Query,
     input,
@@ -56,6 +79,127 @@ function makeSessionState(): SessionState {
     authHintSent: false,
   };
 }
+
+test("availableModesForSession omits conditional modes when unsupported", () => {
+  const session = makeSessionState();
+  refreshSupportedModesForSession(session);
+
+  assert.deepEqual(
+    availableModesForSession(session).map((entry) => entry.id),
+    ["default", "acceptEdits", "plan", "dontAsk"],
+  );
+});
+
+test("buildModeState includes auto and bypassPermissions when supported", () => {
+  const session = makeSessionState();
+  session.mode = "default";
+  session.model = "sonnet";
+  session.supportsBypassPermissionsMode = true;
+  session.availableModels = [
+    {
+      id: "sonnet",
+      display_name: "Sonnet",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+      supports_auto_mode: true,
+    },
+  ];
+  refreshSupportedModesForSession(session);
+
+  const mode = buildModeState(session, "default");
+
+  assert.deepEqual(
+    mode.available_modes.map((entry) => entry.id),
+    ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"],
+  );
+});
+
+test("refreshSupportedModesForSession uses resolved current model for auto-mode eligibility", () => {
+  const session = makeSessionState();
+  session.model = "sonnet";
+  session.availableModels = [
+    {
+      id: "sonnet",
+      display_name: "Claude Sonnet",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+      supports_auto_mode: true,
+    },
+  ];
+  session.currentModel = {
+    resolved_id: "claude-sonnet-4-6[1m]",
+    display_name_short: "Sonnet [1M]",
+    display_name_long: "Sonnet 4.6 [1M]",
+    supports_effort: true,
+    supported_effort_levels: ["low", "medium", "high"],
+    supports_auto_mode: false,
+    is_authoritative: true,
+  };
+
+  refreshSupportedModesForSession(session);
+
+  assert.deepEqual(
+    availableModesForSession(session).map((entry) => entry.id),
+    ["default", "acceptEdits", "plan", "dontAsk"],
+  );
+});
+
+test("refreshSupportedModesForSession retains current mode before capability data arrives", () => {
+  const session = makeSessionState();
+  session.mode = "auto";
+
+  refreshSupportedModesForSession(session);
+
+  assert.deepEqual(
+    session.supportedModeIds,
+    ["default", "auto", "acceptEdits", "plan", "dontAsk"],
+  );
+});
+
+test("markModeUnavailableForSession prunes rejected runtime mode from session list", () => {
+  const session = makeSessionState();
+  session.model = "sonnet";
+  session.availableModels = [
+    {
+      id: "sonnet",
+      display_name: "Sonnet",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+      supports_auto_mode: true,
+    },
+  ];
+  refreshSupportedModesForSession(session);
+
+  assert.equal(markModeUnavailableForSession(session, "auto"), true);
+  assert.deepEqual(
+    availableModesForSession(session).map((entry) => entry.id),
+    ["default", "acceptEdits", "plan", "dontAsk"],
+  );
+});
+
+test("permissionModeFailureLooksUnsupported detects SDK capability rejections", () => {
+  assert.equal(
+    permissionModeFailureLooksUnsupported(
+      "auto",
+      "Cannot set permission mode to auto: not available in my plan",
+    ),
+    true,
+  );
+  assert.equal(
+    permissionModeFailureLooksUnsupported(
+      "bypassPermissions",
+      "Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions",
+    ),
+    true,
+  );
+  assert.equal(
+    permissionModeFailureLooksUnsupported(
+      "auto",
+      "bridge disconnected before request completed",
+    ),
+    false,
+  );
+});
 
 function captureBridgeEvents(run: () => void): Array<Record<string, unknown>> {
   const writes: string[] = [];
@@ -279,6 +423,38 @@ test("parseCommandEnvelope validates mcp_set_servers command", () => {
   });
 });
 
+test("parseCommandEnvelope validates reload_plugins command", () => {
+  const parsed = parseCommandEnvelope(
+    JSON.stringify({
+      request_id: "req-reload",
+      command: "reload_plugins",
+      session_id: "session-123",
+    }),
+  );
+
+  assert.equal(parsed.requestId, "req-reload");
+  assert.deepEqual(parsed.command, {
+    command: "reload_plugins",
+    session_id: "session-123",
+  });
+});
+
+test("parseCommandEnvelope validates get_context_usage command", () => {
+  const parsed = parseCommandEnvelope(
+    JSON.stringify({
+      request_id: "req-usage",
+      command: "get_context_usage",
+      session_id: "session-123",
+    }),
+  );
+
+  assert.equal(parsed.requestId, "req-usage");
+  assert.deepEqual(parsed.command, {
+    command: "get_context_usage",
+    session_id: "session-123",
+  });
+});
+
 test("staleMcpAuthCandidates selects previously connected servers that regressed to needs-auth", () => {
   const candidates = staleMcpAuthCandidates(
     [
@@ -415,6 +591,7 @@ test("buildQueryOptions maps launch settings into sdk query options", () => {
   assert.equal("thinking" in options, false);
   assert.equal("effort" in options, false);
   assert.equal(options.agentProgressSummaries, true);
+  assert.equal(options.promptSuggestions, true);
   assert.equal(options.sessionId, "session-1");
   assert.deepEqual(options.settingSources, ["user", "project", "local"]);
   assert.deepEqual(options.toolConfig, {
@@ -483,6 +660,27 @@ test("buildQueryOptions trims startup model before passing sdk option", () => {
   assert.equal(options.permissionMode, "plan");
 });
 
+test("buildQueryOptions maps auto startup permission mode", () => {
+  const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
+  const options = buildQueryOptions({
+    cwd: "C:/work",
+    launchSettings: {
+      settings: {
+        permissions: { defaultMode: "auto" },
+      },
+    },
+    provisionalSessionId: "session-auto",
+    input,
+    canUseTool: async () => ({ behavior: "deny", message: "not used" }),
+    enableSdkDebug: false,
+    enableSpawnDebug: false,
+    sessionIdForLogs: () => "session-auto",
+  });
+
+  assert.equal(options.permissionMode, "auto");
+  assert.equal("allowDangerouslySkipPermissions" in options, false);
+});
+
 test("buildQueryOptions enables dangerous skip flag for bypass permissions startup mode", () => {
   const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
   const options = buildQueryOptions({
@@ -522,6 +720,61 @@ test("buildQueryOptions omits startup overrides for default logout path", () => 
   assert.equal("allowDangerouslySkipPermissions" in options, false);
   assert.equal("systemPrompt" in options, false);
   assert.equal("agentProgressSummaries" in options, false);
+});
+
+test("buildQueryOptions makes sandbox fallback explicit when enabled", () => {
+  const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
+  const options = buildQueryOptions({
+    cwd: "C:/work",
+    launchSettings: {
+      settings: {
+        sandbox: {
+          enabled: true,
+        },
+      },
+    },
+    provisionalSessionId: "session-sandbox",
+    input,
+    canUseTool: async () => ({ behavior: "deny", message: "not used" }),
+    enableSdkDebug: false,
+    enableSpawnDebug: false,
+    sessionIdForLogs: () => "session-sandbox",
+  });
+
+  assert.deepEqual(options.settings, {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: false,
+    },
+  });
+});
+
+test("buildQueryOptions preserves explicit sandbox failIfUnavailable setting", () => {
+  const input = new AsyncQueue<import("@anthropic-ai/claude-agent-sdk").SDKUserMessage>();
+  const options = buildQueryOptions({
+    cwd: "C:/work",
+    launchSettings: {
+      settings: {
+        sandbox: {
+          enabled: true,
+          failIfUnavailable: true,
+        },
+      },
+    },
+    provisionalSessionId: "session-sandbox-explicit",
+    input,
+    canUseTool: async () => ({ behavior: "deny", message: "not used" }),
+    enableSdkDebug: false,
+    enableSpawnDebug: false,
+    sessionIdForLogs: () => "session-sandbox-explicit",
+  });
+
+  assert.deepEqual(options.settings, {
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+    },
+  });
 });
 
 test("handleTaskSystemMessage prefers task_progress summary over fallback text", () => {
@@ -642,6 +895,143 @@ test("handleTaskSystemMessage final summary replaces prior task content and fina
   assert.equal(session.taskToolUseIds.has("task-1"), false);
 });
 
+test("handleTaskSystemMessage applies task_updated description patches to the linked task", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleTaskSystemMessage(session, "task_started", {
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Initial task description",
+    });
+    handleTaskSystemMessage(session, "task_updated", {
+      task_id: "task-1",
+      patch: {
+        status: "running",
+        description: "Refining the migration plan",
+        is_backgrounded: true,
+      },
+    });
+  });
+
+  const lastEvent = events.at(-1);
+  assert.ok(lastEvent);
+  assert.equal(lastEvent.event, "session_update");
+  assert.deepEqual(lastEvent.update, {
+    type: "tool_call_update",
+    tool_call_update: {
+      tool_call_id: "tool-1",
+      fields: {
+        status: "in_progress",
+        raw_output: "Refining the migration plan",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "Refining the migration plan" },
+          },
+        ],
+        task_metadata: {
+          is_backgrounded: true,
+        },
+      },
+    },
+  });
+});
+
+test("handleTaskSystemMessage uses task_updated terminal error text when description is absent", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleTaskSystemMessage(session, "task_started", {
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Initial task description",
+    });
+    handleTaskSystemMessage(session, "task_updated", {
+      task_id: "task-1",
+      patch: {
+        status: "killed",
+        error: "Task stopped by parent agent",
+        end_time: 1234,
+        total_paused_ms: 250,
+      },
+    });
+  });
+
+  const lastEvent = events.at(-1);
+  assert.ok(lastEvent);
+  assert.equal(lastEvent.event, "session_update");
+  assert.deepEqual(lastEvent.update, {
+    type: "tool_call_update",
+    tool_call_update: {
+      tool_call_id: "tool-1",
+      fields: {
+        status: "killed",
+        raw_output: "Task stopped by parent agent",
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "Task stopped by parent agent" },
+          },
+        ],
+        task_metadata: {
+          error: "Task stopped by parent agent",
+          end_time: 1234,
+          total_paused_ms: 250,
+        },
+      },
+    },
+  });
+});
+
+test("handleTaskSystemMessage merges task metadata patches into the linked task state", () => {
+  const session = makeSessionState();
+
+  captureBridgeEvents(() => {
+    handleTaskSystemMessage(session, "task_started", {
+      task_id: "task-1",
+      tool_use_id: "tool-1",
+      description: "Initial task description",
+    });
+    handleTaskSystemMessage(session, "task_updated", {
+      task_id: "task-1",
+      patch: {
+        status: "running",
+        is_backgrounded: true,
+      },
+    });
+    handleTaskSystemMessage(session, "task_updated", {
+      task_id: "task-1",
+      patch: {
+        error: "Task stopped by parent agent",
+        end_time: 1234,
+      },
+    });
+  });
+
+  assert.deepEqual(session.toolCalls.get("tool-1")?.task_metadata, {
+    is_backgrounded: true,
+    error: "Task stopped by parent agent",
+    end_time: 1234,
+  });
+});
+
+test("handleTaskSystemMessage skips unlinked task_updated messages", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleTaskSystemMessage(session, "task_updated", {
+      task_id: "task-missing",
+      patch: {
+        status: "running",
+        description: "This should not be emitted",
+      },
+    });
+  });
+
+  assert.equal(events.length, 0);
+});
+
 test("emitToolProgressUpdate does not reopen completed tools", () => {
   const session = makeSessionState();
   session.toolCalls.set("tool-1", {
@@ -651,7 +1041,7 @@ test("emitToolProgressUpdate does not reopen completed tools", () => {
     status: "completed",
     content: [],
     locations: [],
-    meta: { claudeCode: { toolName: "Bash" } },
+    meta: { claudeCode: { toolName: "Bash", parentToolUseId: null } },
   });
 
   const events = captureBridgeEvents(() => {
@@ -735,7 +1125,7 @@ test("requestAskUserQuestionAnswers preserves previews and annotations in update
     status: "in_progress",
     content: [] as Array<import("./types.js").ToolCallContent>,
     locations: [] as Array<import("./types.js").ToolLocation>,
-    meta: { claudeCode: { toolName: "AskUserQuestion" } },
+    meta: { claudeCode: { toolName: "AskUserQuestion", parentToolUseId: null } },
   };
 
   const events = await captureBridgeEventsAsync(async () => {
@@ -824,7 +1214,7 @@ test("requestAskUserQuestionAnswers preserves previews and annotations in update
       status: "in_progress",
       content: [],
       locations: [],
-      meta: { claudeCode: { toolName: "AskUserQuestion" } },
+      meta: { claudeCode: { toolName: "AskUserQuestion", parentToolUseId: null } },
       raw_input: {
         prompt: {
           question: "Pick deployment target",
@@ -899,6 +1289,14 @@ test("parseRateLimitStatus accepts known values and rejects unknown values", () 
   assert.equal(parseRateLimitStatus(undefined), null);
 });
 
+test("parseRuntimeSessionState accepts known values and rejects unknown values", () => {
+  assert.equal(parseRuntimeSessionState("idle"), "idle");
+  assert.equal(parseRuntimeSessionState("running"), "running");
+  assert.equal(parseRuntimeSessionState("requires_action"), "requires_action");
+  assert.equal(parseRuntimeSessionState("blocked"), null);
+  assert.equal(parseRuntimeSessionState(undefined), null);
+});
+
 test("buildRateLimitUpdate maps SDK fields to wire shape", () => {
   const update = buildRateLimitUpdate({
     status: "allowed_warning",
@@ -939,6 +1337,165 @@ test("buildRateLimitUpdate rejects invalid payloads", () => {
   );
 });
 
+test("buildApiRetryUpdate maps SDK api_retry messages to wire shape", () => {
+  assert.deepEqual(
+    buildApiRetryUpdate({
+      attempt: 2,
+      max_retries: 4,
+      retry_delay_ms: 1500,
+      error_status: 529,
+      error: "server_error",
+    }),
+    {
+      type: "api_retry_update",
+      attempt: 2,
+      max_retries: 4,
+      retry_delay_ms: 1500,
+      error_status: 529,
+      error: "server_error",
+    },
+  );
+
+  assert.deepEqual(
+    buildApiRetryUpdate({
+      attempt: 1,
+      maxRetries: 4,
+      retryDelayMs: 1000,
+      errorStatus: null,
+      error: "unexpected",
+    }),
+    {
+      type: "api_retry_update",
+      attempt: 1,
+      max_retries: 4,
+      retry_delay_ms: 1000,
+      error_status: null,
+      error: "unknown",
+    },
+  );
+  assert.equal(buildApiRetryUpdate({ attempt: 1 }), null);
+});
+
+test("normalizeSettingsParseError accepts only SDK-shaped errors", () => {
+  assert.deepEqual(
+    normalizeSettingsParseError({
+      file: "C:/work/.claude/settings.json",
+      path: "permissions.allow",
+      message: "Expected array",
+    }),
+    {
+      file: "C:/work/.claude/settings.json",
+      path: "permissions.allow",
+      message: "Expected array",
+    },
+  );
+  assert.deepEqual(normalizeSettingsParseError({ path: "", message: "Invalid JSON" }), {
+    path: "",
+    message: "Invalid JSON",
+  });
+  assert.equal(normalizeSettingsParseError({ path: "", message: "" }), null);
+  assert.equal(normalizeSettingsParseError("Invalid JSON"), null);
+});
+
+test("handleSdkMessage emits lifecycle compatibility session updates", () => {
+  const session = makeSessionState();
+  const events = captureBridgeEvents(() => {
+    handleSdkMessage(session, {
+      type: "prompt_suggestion",
+      suggestion: "Write tests for this change",
+      uuid: "message-1",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+    handleSdkMessage(session, {
+      type: "system",
+      subtype: "api_retry",
+      attempt: 1,
+      max_retries: 4,
+      retry_delay_ms: 1000,
+      error_status: null,
+      error: "server_error",
+      uuid: "message-2",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+    handleSdkMessage(session, {
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+      uuid: "message-3",
+      session_id: "session-1",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+  });
+
+  assert.deepEqual(
+    events.map((event) => event.update),
+    [
+      { type: "prompt_suggestion_update", suggestion: "Write tests for this change" },
+      {
+        type: "api_retry_update",
+        attempt: 1,
+        max_retries: 4,
+        retry_delay_ms: 1000,
+        error_status: null,
+        error: "server_error",
+      },
+      { type: "runtime_session_state_update", state: "idle" },
+    ],
+  );
+});
+
+test("shouldEmitStartupAuthRequiredForAccount keeps legacy first-party behavior", () => {
+  assert.equal(shouldEmitStartupAuthRequiredForAccount({}), true);
+  assert.equal(
+    shouldEmitStartupAuthRequiredForAccount({ apiProvider: "firstParty" }),
+    true,
+  );
+  assert.equal(
+    shouldEmitStartupAuthRequiredForAccount({
+      apiProvider: "firstParty",
+      apiKeySource: "oauth",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldEmitStartupAuthRequiredForAccount({
+      apiProvider: "firstParty",
+      email: "user@example.com",
+    }),
+    false,
+  );
+});
+
+test("shouldEmitStartupAuthRequiredForAccount skips Claude OAuth hint for external providers", () => {
+  for (const apiProvider of [
+    "bedrock",
+    "vertex",
+    "foundry",
+    "anthropicAws",
+    "mantle",
+  ] as const) {
+    assert.equal(shouldEmitStartupAuthRequiredForAccount({ apiProvider }), false);
+  }
+});
+
+test("handleSdkMessage emits settings parse errors from defensive payloads", () => {
+  const session = makeSessionState();
+  const events = captureBridgeEvents(() => {
+    handleSdkMessage(session, {
+      type: "settings_parse_error",
+      file: "C:/work/.claude/settings.json",
+      path: "permissions.allow",
+      message: "Expected array",
+    } as unknown as import("@anthropic-ai/claude-agent-sdk").SDKMessage);
+  });
+
+  assert.deepEqual(events.at(-1)?.update, {
+    type: "settings_parse_error",
+    file: "C:/work/.claude/settings.json",
+    path: "permissions.allow",
+    message: "Expected array",
+  });
+});
+
 test("mapAvailableAgents normalizes and deduplicates agents", () => {
   const agents = mapAvailableAgents([
     { name: "reviewer", description: "", model: "" },
@@ -974,7 +1531,15 @@ test("createToolCall builds edit diff content", () => {
     old: "old",
     new: "new",
   });
-  assert.deepEqual(toolCall.meta, { claudeCode: { toolName: "Edit" } });
+  assert.deepEqual(toolCall.meta, { claudeCode: { toolName: "Edit", parentToolUseId: null } });
+});
+
+test("createToolCall preserves parent tool linkage metadata", () => {
+  const toolCall = createToolCall("tc-child", "Bash", { command: "echo hi" }, "tc-parent");
+
+  assert.deepEqual(toolCall.meta, {
+    claudeCode: { toolName: "Bash", parentToolUseId: "tc-parent" },
+  });
 });
 
 test("createToolCall builds write preview diff content", () => {
@@ -1160,7 +1725,7 @@ test("buildToolResultFields preserves Edit diff content from input and structure
   ]);
 });
 
-test("buildToolResultFields prefers structured Bash stdout over token-saver output", () => {
+test("buildToolResultFields ignores model-facing Bash stale read hints", () => {
   const base = createToolCall("tc-bash", "Bash", { command: "npm test" });
   const fields = buildToolResultFields(
     false,
@@ -1168,7 +1733,7 @@ test("buildToolResultFields prefers structured Bash stdout over token-saver outp
       stdout: "real stdout",
       stderr: "",
       interrupted: false,
-      tokenSaverOutput: "compressed output for model",
+      staleReadFileStateHint: "src/main.rs changed while command ran",
     },
     base,
     {
@@ -1176,17 +1741,13 @@ test("buildToolResultFields prefers structured Bash stdout over token-saver outp
         stdout: "real stdout",
         stderr: "",
         interrupted: false,
-        tokenSaverOutput: "compressed output for model",
+        staleReadFileStateHint: "src/main.rs changed while command ran",
       },
     },
   );
 
   assert.equal(fields.raw_output, "real stdout");
-  assert.deepEqual(fields.output_metadata, {
-    bash: {
-      token_saver_active: true,
-    },
-  });
+  assert.equal(fields.output_metadata, undefined);
 });
 
 test("buildToolResultFields adds Bash auto-backgrounded metadata and message", () => {
@@ -1489,7 +2050,7 @@ test("looksLikeAuthRequired detects login hints", () => {
 });
 
 test("agent sdk version compatibility check matches pinned version", () => {
-  assert.equal(resolveInstalledAgentSdkVersion(), "0.2.74");
+  assert.equal(resolveInstalledAgentSdkVersion(), "0.2.104");
   assert.equal(agentSdkVersionCompatibilityError(), undefined);
 });
 
@@ -1553,6 +2114,105 @@ test("mapSessionMessagesToUpdates maps message content blocks", () => {
   assert.equal(variantCounts.get("agent_message_chunk"), 1);
   assert.equal(variantCounts.get("tool_call"), 1);
   assert.equal(variantCounts.get("tool_call_update"), 1);
+});
+
+test("mapSessionMessagesToUpdates preserves parallel tool results", () => {
+  const updates = mapSessionMessagesToUpdates([
+    {
+      type: "assistant",
+      uuid: "a1",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "tool-a", name: "Bash", input: { command: "echo a" } },
+          { type: "tool_use", id: "tool-b", name: "Bash", input: { command: "echo b" } },
+        ],
+      },
+    },
+    {
+      type: "user",
+      uuid: "u1",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "tool-b",
+            content: "result b",
+            is_error: false,
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "tool-a",
+            content: "result a",
+            is_error: false,
+          },
+        ],
+      },
+    },
+  ]);
+
+  const toolCalls = updates.filter((update) => update.type === "tool_call");
+  const toolUpdates = updates.filter((update) => update.type === "tool_call_update");
+
+  assert.deepEqual(
+    toolCalls.map((update) => update.tool_call.tool_call_id),
+    ["tool-a", "tool-b"],
+  );
+  assert.deepEqual(
+    toolUpdates.map((update) => update.tool_call_update.tool_call_id),
+    ["tool-b", "tool-a"],
+  );
+  assert.deepEqual(
+    toolUpdates.map((update) => update.tool_call_update.fields.raw_output),
+    ["result b", "result a"],
+  );
+});
+
+test("handleResultMessage emits terminal reason on successful turn completion", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleResultMessage(session, {
+      type: "result",
+      subtype: "success",
+      terminal_reason: "completed",
+    });
+  });
+
+  const lastEvent = events.at(-1);
+  assert.deepEqual(lastEvent, {
+    event: "turn_complete",
+    session_id: "session-1",
+    terminal_reason: "completed",
+  });
+});
+
+test("handleResultMessage emits terminal reason on turn errors", () => {
+  const session = makeSessionState();
+
+  const events = captureBridgeEvents(() => {
+    handleResultMessage(session, {
+      type: "result",
+      subtype: "error_max_turns",
+      terminal_reason: "max_turns",
+      errors: ["max turns exceeded"],
+    });
+  });
+
+  const lastEvent = events.at(-1);
+  assert.deepEqual(lastEvent, {
+    event: "turn_error",
+    session_id: "session-1",
+    message: "max turns exceeded",
+    error_kind: "plan_limit",
+    sdk_result_subtype: "error_max_turns",
+    terminal_reason: "max_turns",
+  });
 });
 
 test("mapSessionMessagesToUpdates ignores unsupported records", () => {
@@ -1622,25 +2282,88 @@ test("buildSessionListOptions scopes repo-local listings to worktrees", () => {
   });
 });
 
-test("buildToolResultFields extracts ExitPlanMode ultraplan metadata from structured results", () => {
-  const base = createToolCall("tc-plan", "ExitPlanMode", {});
+test("buildToolResultFields renders file_unchanged Read results compactly", () => {
+  const base = createToolCall("tc-read", "Read", { file_path: "src/main.rs" });
   const fields = buildToolResultFields(
     false,
-    [{ text: "Plan ready for approval" }],
+    {
+      type: "file_unchanged",
+      file: { filePath: "src/main.rs" },
+    },
     base,
     {
       result: {
-        plan: "Plan contents",
-        isUltraplan: true,
+        type: "file_unchanged",
+        file: { filePath: "src/main.rs" },
       },
     },
   );
 
-  assert.deepEqual(fields.output_metadata, {
-    exit_plan_mode: {
-      is_ultraplan: true,
+  assert.equal(fields.raw_output, "File unchanged: src/main.rs");
+  assert.deepEqual(fields.content, [
+    { type: "content", content: { type: "text", text: "File unchanged: src/main.rs" } },
+  ]);
+});
+
+test("buildToolResultFields renders array-wrapped file_unchanged Read results compactly", () => {
+  const base = createToolCall("tc-read", "Read", { file_path: "src/lib.rs" });
+  const fields = buildToolResultFields(
+    false,
+    [],
+    base,
+    {
+      result: [
+        {
+          type: "file_unchanged",
+          file: { filePath: "src/lib.rs" },
+        },
+      ],
     },
-  });
+  );
+
+  assert.equal(fields.raw_output, "File unchanged: src/lib.rs");
+});
+
+test("buildToolResultFields uses Agent output agentType as task title", () => {
+  const base = createToolCall("tc-agent", "Agent", { prompt: "Review tests" });
+  const fields = buildToolResultFields(
+    false,
+    {
+      agentId: "agent-1",
+      agentType: "reviewer",
+      content: [{ type: "text", text: "Done" }],
+      totalToolUseCount: 0,
+      totalDurationMs: 10,
+      totalTokens: 20,
+      usage: {},
+      status: "completed",
+      prompt: "Review tests",
+    },
+    base,
+  );
+
+  assert.equal(fields.title, "reviewer");
+});
+
+test("buildToolResultFields reads array-wrapped Agent output agentType", () => {
+  const base = createToolCall("tc-agent", "Agent", { prompt: "Review tests" });
+  const fields = buildToolResultFields(
+    false,
+    [],
+    base,
+    {
+      result: [
+        {
+          agentId: "agent-1",
+          agentType: "planner",
+          content: [{ type: "text", text: "Done" }],
+          status: "completed",
+        },
+      ],
+    },
+  );
+
+  assert.equal(fields.title, "planner");
 });
 
 test("buildToolResultFields extracts TodoWrite verification metadata from structured results", () => {
@@ -1706,4 +2429,248 @@ test("mapAvailableModels preserves optional fast and auto mode metadata", () => 
       supported_effort_levels: [],
     },
   ]);
+});
+
+test("resolveCurrentModel keeps 1M context suffix in short and long display names", () => {
+  const session = makeSessionState();
+  session.resolvedRuntimeModelId = "claude-opus-4-6[1m]";
+
+  const currentModel = resolveCurrentModel(session);
+
+  assert.equal(currentModel.display_name_short, "Opus [1M]");
+  assert.equal(currentModel.display_name_long, "Opus 4.6 [1M]");
+});
+
+test("resolveCurrentModel does not inherit standard Opus capabilities for 1M when sibling variants exist", () => {
+  const session = makeSessionState();
+  session.requestedModelId = "claude-opus-4-6";
+  session.resolvedRuntimeModelId = "claude-opus-4-6[1m]";
+  session.availableModels = [
+    {
+      id: "claude-opus-4-6",
+      display_name: "Claude Opus",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+    },
+    {
+      id: "claude-opus-4-6[1m]",
+      display_name: "Claude Opus 1M",
+      supports_effort: false,
+      supported_effort_levels: [],
+    },
+  ];
+
+  const currentModel = resolveCurrentModel(session);
+
+  assert.equal(currentModel.catalog_id, "claude-opus-4-6[1m]");
+  assert.equal(currentModel.supports_effort, false);
+});
+
+test("resolveCurrentModel avoids suffix-insensitive fallback when sibling variants make it ambiguous", () => {
+  const session = makeSessionState();
+  session.requestedModelId = "claude-opus-4-6";
+  session.resolvedRuntimeModelId = "claude-opus-4-6[1m]";
+  session.availableModels = [
+    {
+      id: "claude-opus-4-6",
+      display_name: "Claude Opus",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+    },
+    {
+      id: "claude-opus-4-6-alt[1m]",
+      display_name: "Claude Opus Alt 1M",
+      supports_effort: false,
+      supported_effort_levels: [],
+    },
+  ];
+
+  const currentModel = resolveCurrentModel(session);
+
+  assert.equal(currentModel.catalog_id, undefined);
+  assert.equal(currentModel.supports_effort, false);
+});
+
+test("emitCurrentModelUpdate can acknowledge a successful no-op set_model", () => {
+  const session = makeSessionState();
+  session.model = "default";
+  session.requestedModelId = "default";
+  session.resolvedRuntimeModelId = "claude-opus-4-6[1m]";
+  refreshCurrentModel(session);
+
+  const events = captureBridgeEvents(() => {
+    const changed = refreshCurrentModel(session, true);
+    const forced = !changed && emitCurrentModelUpdate(session);
+    assert.equal(changed, false);
+    assert.equal(forced, true);
+  });
+
+  const lastEvent = events.at(-1);
+  assert.ok(lastEvent);
+  assert.equal(lastEvent.event, "session_update");
+  assert.deepEqual(lastEvent.update, {
+    type: "current_model_update",
+    current_model: {
+      requested_id: "default",
+      resolved_id: "claude-opus-4-6[1m]",
+      display_name_short: "Opus [1M]",
+      display_name_long: "Opus 4.6 [1M]",
+      supports_effort: false,
+      supported_effort_levels: [],
+      is_authoritative: true,
+    },
+  });
+});
+
+test("emitCurrentModelUpdate can publish catalog-enriched current model metadata after connect", () => {
+  const session = makeSessionState();
+  session.model = "sonnet";
+  refreshCurrentModel(session);
+  session.availableModels = [
+    {
+      id: "sonnet",
+      display_name: "Claude Sonnet",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+      supports_auto_mode: true,
+    },
+  ];
+
+  const events = captureBridgeEvents(() => {
+    const changed = refreshCurrentModel(session, false);
+    assert.equal(changed, true);
+    assert.equal(emitCurrentModelUpdate(session), true);
+  });
+
+  const lastEvent = events.at(-1);
+  assert.ok(lastEvent);
+  assert.equal(lastEvent.event, "session_update");
+  assert.deepEqual(lastEvent.update, {
+    type: "current_model_update",
+    current_model: {
+      resolved_id: "sonnet",
+      display_name_short: "Sonnet",
+      display_name_long: "Sonnet",
+      catalog_id: "sonnet",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+      supports_auto_mode: true,
+      is_authoritative: true,
+    },
+  });
+});
+
+test("shouldInvalidateResolvedRuntimeModel invalidates stale runtime identity only when the request changes", () => {
+  assert.equal(
+    shouldInvalidateResolvedRuntimeModel("default", "default", "sonnet"),
+    true,
+  );
+  assert.equal(
+    shouldInvalidateResolvedRuntimeModel("sonnet", "sonnet", "haiku"),
+    true,
+  );
+  assert.equal(
+    shouldInvalidateResolvedRuntimeModel("default", "default", "default"),
+    false,
+  );
+});
+
+test("resolveCurrentModel falls back to the requested model immediately after stale runtime identity is cleared", () => {
+  const session = makeSessionState();
+  session.requestedModelId = "sonnet";
+  session.model = "sonnet";
+  session.availableModels = [
+    {
+      id: "sonnet",
+      display_name: "Claude Sonnet",
+      supports_effort: true,
+      supported_effort_levels: ["low", "medium", "high"],
+    },
+  ];
+
+  const currentModel = resolveCurrentModel(session);
+
+  assert.equal(currentModel.resolved_id, "sonnet");
+  assert.equal(currentModel.display_name_short, "Sonnet");
+  assert.equal(currentModel.display_name_long, "Sonnet");
+  assert.equal(currentModel.catalog_id, "sonnet");
+  assert.equal(currentModel.supports_effort, true);
+});
+
+test("attachRequestUserDialogInterceptor rejects request_user_dialog with a stable error", async () => {
+  const calls: Array<{ request_id: string; request: Record<string, unknown> }> = [];
+  const fakeQuery = {
+    async processControlRequest(
+      request: { request_id: string; request: Record<string, unknown> },
+      _signal: AbortSignal,
+    ): Promise<Record<string, unknown>> {
+      calls.push(request);
+      return { ok: true };
+    },
+  } as unknown as import("@anthropic-ai/claude-agent-sdk").Query;
+
+  assert.equal(
+    attachRequestUserDialogInterceptor(fakeQuery, () => "session-test"),
+    true,
+  );
+
+  await assert.rejects(
+    (fakeQuery as import("@anthropic-ai/claude-agent-sdk").Query & {
+      processControlRequest: (
+        request: { request_id: string; request: Record<string, unknown> },
+        signal: AbortSignal,
+      ) => Promise<Record<string, unknown> | undefined>;
+    }).processControlRequest(
+      {
+        request_id: "dialog-1",
+        request: {
+          subtype: "request_user_dialog",
+          dialog_kind: "computer_use_approval",
+          payload: { title: "Need approval", kind: "computer_use_approval" },
+          tool_use_id: "tool-1",
+        },
+      },
+      new AbortController().signal,
+    ),
+    /request_user_dialog is not supported by claude-rs yet \(dialog_kind: computer_use_approval\)/,
+  );
+  assert.equal(calls.length, 0);
+});
+
+test("attachRequestUserDialogInterceptor preserves non-dialog control requests", async () => {
+  const calls: Array<{ request_id: string; request: Record<string, unknown> }> = [];
+  const fakeQuery = {
+    async processControlRequest(
+      request: { request_id: string; request: Record<string, unknown> },
+      _signal: AbortSignal,
+    ): Promise<Record<string, unknown>> {
+      calls.push(request);
+      return { ok: true };
+    },
+  } as unknown as import("@anthropic-ai/claude-agent-sdk").Query;
+
+  attachRequestUserDialogInterceptor(fakeQuery, () => "session-test");
+  const result = await (
+    fakeQuery as import("@anthropic-ai/claude-agent-sdk").Query & {
+      processControlRequest: (
+        request: { request_id: string; request: Record<string, unknown> },
+        signal: AbortSignal,
+      ) => Promise<Record<string, unknown> | undefined>;
+    }
+  ).processControlRequest(
+    {
+      request_id: "permission-1",
+      request: {
+        subtype: "can_use_tool",
+        tool_name: "Bash",
+        input: { command: "dir" },
+        tool_use_id: "tool-1",
+      },
+    },
+    new AbortController().signal,
+  );
+
+  assert.deepEqual(result, { ok: true });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]?.request.subtype, "can_use_tool");
 });

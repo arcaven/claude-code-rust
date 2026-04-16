@@ -21,6 +21,7 @@ pub(super) fn submit_input(app: &mut App) {
     if text.trim().is_empty() {
         return;
     }
+    app.prompt_suggestion = None;
 
     // `/cancel` is an explicit control action: execute immediately.
     if slash::is_cancel_command(&text) {
@@ -164,6 +165,7 @@ fn dispatch_prompt_turn(app: &mut App, text: String) {
     // so the model can correlate user references with image attachments.
     match conn.prompt_with_images(sid.to_string(), text, images) {
         Ok(resp) => {
+            crate::app::session_runtime::request_context_usage_refresh(app);
             tracing::info!(
                 target: crate::logging::targets::APP_INPUT,
                 event_name = "prompt_dispatched",
@@ -175,7 +177,8 @@ fn dispatch_prompt_turn(app: &mut App, text: String) {
             );
         }
         Err(e) => {
-            let _ = tx.send(ClientEvent::TurnError(e.to_string()));
+            let _ =
+                tx.send(ClientEvent::TurnError { message: e.to_string(), terminal_reason: None });
         }
     }
 }

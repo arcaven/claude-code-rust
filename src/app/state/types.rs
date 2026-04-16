@@ -3,8 +3,6 @@
 
 use crate::agent::model;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModeInfo {
     pub id: String,
@@ -35,8 +33,9 @@ pub struct LoginHint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingCommandAck {
-    CurrentModeUpdate,
-    ConfigOptionUpdate { option_id: String },
+    CurrentMode,
+    CurrentModel,
+    ConfigOption { option_id: String },
 }
 
 /// A single todo item from Claude's `TodoWrite` tool call.
@@ -146,6 +145,9 @@ pub struct UsageState {
 pub struct SessionUsageState {
     pub last_compaction_trigger: Option<model::CompactionTrigger>,
     pub last_compaction_pre_tokens: Option<u64>,
+    pub context_usage_percent: Option<u8>,
+    pub context_usage_in_flight: bool,
+    pub context_usage_refresh_pending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -158,8 +160,6 @@ pub struct McpState {
 
 pub const DEFAULT_RENDER_CACHE_BUDGET_BYTES: usize = 24 * 1024 * 1024;
 pub const DEFAULT_HISTORY_RETENTION_MAX_BYTES: usize = 64 * 1024 * 1024;
-pub const SUBAGENT_THINKING_DEBOUNCE: Duration = Duration::from_millis(1_500);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderCacheBudget {
     pub max_bytes: usize,
@@ -222,11 +222,11 @@ pub enum AppStatus {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCallScope {
     MainAgent,
-    Subagent,
-    Task,
+    SubagentRoot,
+    SubagentChild { parent_tool_use_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

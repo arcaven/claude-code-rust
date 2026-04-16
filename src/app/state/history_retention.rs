@@ -13,7 +13,7 @@ use super::messages::{
     WelcomeBlock,
 };
 use super::tool_call_info::{InlinePermission, InlineQuestion, ToolCallInfo};
-use super::types::{HistoryRetentionStats, MessageUsage, RecentSessionInfo};
+use super::types::{HistoryRetentionStats, MessageUsage};
 
 const HISTORY_HIDDEN_MARKER_PREFIX: &str = "Older messages hidden to keep memory bounded";
 
@@ -216,6 +216,7 @@ impl super::App {
                             NoticeDedupKey::RateLimit(incident) => {
                                 incident.rate_limit_type.as_ref().map_or(0, String::capacity)
                             }
+                            NoticeDedupKey::ApiRetry => 0,
                         });
                     }
                 }
@@ -225,27 +226,10 @@ impl super::App {
                 MessageBlock::Welcome(welcome) => {
                     total = total
                         .saturating_add(size_of::<WelcomeBlock>())
-                        .saturating_add(welcome.model_name.capacity())
+                        .saturating_add(welcome.version.capacity())
+                        .saturating_add(welcome.subscription.capacity())
                         .saturating_add(welcome.cwd.capacity())
-                        .saturating_add(
-                            welcome
-                                .recent_sessions
-                                .capacity()
-                                .saturating_mul(size_of::<RecentSessionInfo>()),
-                        );
-                    for session in &welcome.recent_sessions {
-                        total = total
-                            .saturating_add(session.session_id.capacity())
-                            .saturating_add(session.summary.capacity())
-                            .saturating_add(session.cwd.as_ref().map_or(0, String::capacity))
-                            .saturating_add(session.git_branch.as_ref().map_or(0, String::capacity))
-                            .saturating_add(
-                                session.custom_title.as_ref().map_or(0, String::capacity),
-                            )
-                            .saturating_add(
-                                session.first_prompt.as_ref().map_or(0, String::capacity),
-                            );
-                    }
+                        .saturating_add(welcome.session_id.capacity());
                 }
                 MessageBlock::ImageAttachment(_) => {
                     total =
@@ -372,12 +356,10 @@ impl super::App {
         self.tool_call_index.clear();
         self.clear_terminal_tool_call_tracking();
         self.active_task_ids.clear();
-        self.active_subagent_tool_ids.clear();
 
         let mut pending_interaction_ids = Vec::new();
         let mut terminal_tool_call_membership = HashSet::new();
         let mut terminal_tool_calls = Vec::new();
-        let previous_idle_since = self.subagent_idle_since;
         for (msg_idx, msg) in self.messages.iter_mut().enumerate() {
             for (block_idx, block) in msg.blocks.iter_mut().enumerate() {
                 if let MessageBlock::ToolCall(tc) = block {
@@ -415,23 +397,18 @@ impl super::App {
                 ) {
                     continue;
                 }
-                match self.tool_call_scopes.get(&tc.id).copied() {
-                    Some(super::ToolCallScope::Task) => {
+                match self.tool_call_scopes.get(&tc.id) {
+                    Some(super::ToolCallScope::SubagentRoot) => {
                         self.active_task_ids.insert(tc.id.clone());
                     }
-                    Some(super::ToolCallScope::Subagent) => {
-                        self.active_subagent_tool_ids.insert(tc.id.clone());
-                    }
-                    Some(super::ToolCallScope::MainAgent) | None => {}
+                    Some(
+                        super::ToolCallScope::SubagentChild { .. }
+                        | super::ToolCallScope::MainAgent,
+                    )
+                    | None => {}
                 }
             }
         }
-        self.subagent_idle_since =
-            if self.active_task_ids.is_empty() || !self.active_subagent_tool_ids.is_empty() {
-                None
-            } else {
-                previous_idle_since
-            };
 
         let interaction_set: HashSet<&str> =
             pending_interaction_ids.iter().map(String::as_str).collect();

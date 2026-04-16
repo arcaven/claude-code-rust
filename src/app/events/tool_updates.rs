@@ -4,11 +4,11 @@
 use super::super::{App, AppStatus, InvalidationLevel, MessageBlock, ToolCallInfo, ToolCallScope};
 use super::tool_calls::{
     current_session_id, has_in_progress_tool_calls, json_value_size, log_terminal_spawned,
-    sdk_tool_name_from_meta, should_jump_on_large_write, tool_scope_name,
+    parent_tool_use_id_from_meta, sdk_tool_name_from_meta, should_jump_on_large_write,
+    tool_scope_name,
 };
 use crate::agent::model;
 use crate::app::todos::{parse_todos_if_present, set_todos};
-use std::time::Instant;
 
 pub(super) fn handle_tool_call_update_session(app: &mut App, tcu: &model::ToolCallUpdate) {
     let id_str = tcu.tool_call_id.clone();
@@ -24,6 +24,12 @@ pub(super) fn handle_tool_call_update_session(app: &mut App, tcu: &model::ToolCa
         );
         return;
     };
+    if let Some(parent_tool_use_id) = parent_tool_use_id_from_meta(tcu.meta.as_ref()) {
+        app.register_tool_call_scope(
+            id_str.clone(),
+            ToolCallScope::SubagentChild { parent_tool_use_id: parent_tool_use_id.to_owned() },
+        );
+    }
     let tool_scope = app.tool_call_scope(&id_str);
     let previous_status = app.messages.get(mi).and_then(|message| message.blocks.get(bi)).and_then(
         |block| match block {
@@ -38,14 +44,21 @@ pub(super) fn handle_tool_call_update_session(app: &mut App, tcu: &model::ToolCa
                 _ => None,
             },
         );
-    apply_tool_scope_status_update(app, &id_str, tool_scope, tcu.fields.status);
+    apply_tool_scope_status_update(app, &id_str, tool_scope.as_ref(), tcu.fields.status);
 
     let update_outcome = apply_tool_call_update_to_indexed_block(app, mi, bi, &id_str, tcu);
     if let Some(mi) = update_outcome.layout_dirty_idx {
         app.recompute_message_retained_bytes(mi);
         app.invalidate_layout(InvalidationLevel::MessageChanged(mi));
     }
-    log_tool_call_update_applied(app, &id_str, tcu, tool_scope, previous_status, &update_outcome);
+    log_tool_call_update_applied(
+        app,
+        &id_str,
+        tcu,
+        tool_scope.as_ref(),
+        previous_status,
+        &update_outcome,
+    );
     log_command_update_applied(app, &id_str, previous_status, previous_terminal_id.as_deref());
     if let Some(todos) = update_outcome.pending_todos {
         set_todos(app, todos);
@@ -58,31 +71,24 @@ pub(super) fn handle_tool_call_update_session(app: &mut App, tcu: &model::ToolCa
 fn apply_tool_scope_status_update(
     app: &mut App,
     id_str: &str,
-    tool_scope: Option<ToolCallScope>,
+    tool_scope: Option<&ToolCallScope>,
     status: Option<model::ToolCallStatus>,
 ) {
     let Some(status) = status else {
         return;
     };
     match tool_scope {
-        Some(ToolCallScope::Subagent) => match status {
+        Some(ToolCallScope::SubagentRoot) => match status {
             model::ToolCallStatus::Pending | model::ToolCallStatus::InProgress => {
-                app.mark_subagent_tool_started(id_str);
+                app.insert_active_task(id_str.to_owned());
             }
-            model::ToolCallStatus::Completed | model::ToolCallStatus::Failed => {
-                app.mark_subagent_tool_finished(id_str, Instant::now());
-            }
-        },
-        Some(ToolCallScope::Task) => match status {
-            model::ToolCallStatus::Pending | model::ToolCallStatus::InProgress => {
-                app.refresh_subagent_idle_since(Instant::now());
-            }
-            model::ToolCallStatus::Completed | model::ToolCallStatus::Failed => {
+            model::ToolCallStatus::Completed
+            | model::ToolCallStatus::Failed
+            | model::ToolCallStatus::Killed => {
                 app.remove_active_task(id_str);
-                app.refresh_subagent_idle_since(Instant::now());
             }
         },
-        Some(ToolCallScope::MainAgent) | None => {}
+        Some(ToolCallScope::SubagentChild { .. } | ToolCallScope::MainAgent) | None => {}
     }
 }
 
@@ -121,8 +127,10 @@ fn apply_tool_call_update_to_indexed_block(
         );
         changed |= apply_tool_call_raw_input_update(tc, tcu.fields.raw_input.as_ref());
         changed |= apply_tool_call_output_metadata_update(tc, tcu.fields.output_metadata.as_ref());
+        changed |= apply_tool_call_task_metadata_update(tc, tcu.fields.task_metadata.as_ref());
         changed |= apply_tool_call_raw_output_update(tc, tcu.fields.raw_output.as_ref());
         changed |= apply_tool_call_name_update(tc, tcu.meta.as_ref());
+        changed |= apply_tool_call_hidden_update(tc, tcu.meta.as_ref());
         out.pending_todos = extract_todo_updates_from_tool_call_update(
             id_str,
             &session_id,
@@ -235,6 +243,33 @@ fn apply_tool_call_output_metadata_update(
     true
 }
 
+fn apply_tool_call_task_metadata_update(
+    tc: &mut ToolCallInfo,
+    task_metadata: Option<&model::TaskMetadata>,
+) -> bool {
+    let Some(task_metadata) = task_metadata else {
+        return false;
+    };
+    let mut merged = tc.task_metadata.clone().unwrap_or_default();
+    if task_metadata.end_time.is_some() {
+        merged.end_time = task_metadata.end_time;
+    }
+    if task_metadata.total_paused_ms.is_some() {
+        merged.total_paused_ms = task_metadata.total_paused_ms;
+    }
+    if task_metadata.error.is_some() {
+        merged.error.clone_from(&task_metadata.error);
+    }
+    if task_metadata.is_backgrounded.is_some() {
+        merged.is_backgrounded = task_metadata.is_backgrounded;
+    }
+    if tc.task_metadata.as_ref() == Some(&merged) {
+        return false;
+    }
+    tc.task_metadata = Some(merged);
+    true
+}
+
 fn apply_tool_call_raw_output_update(
     tc: &mut ToolCallInfo,
     raw_output: Option<&serde_json::Value>,
@@ -266,6 +301,14 @@ fn apply_tool_call_name_update(tc: &mut ToolCallInfo, meta: Option<&serde_json::
         return false;
     }
     name.clone_into(&mut tc.sdk_tool_name);
+    true
+}
+
+fn apply_tool_call_hidden_update(tc: &mut ToolCallInfo, meta: Option<&serde_json::Value>) -> bool {
+    if parent_tool_use_id_from_meta(meta).is_none() || tc.hidden {
+        return false;
+    }
+    tc.hidden = true;
     true
 }
 
@@ -345,7 +388,7 @@ fn log_tool_call_update_applied(
     app: &App,
     id_str: &str,
     tcu: &model::ToolCallUpdate,
-    tool_scope: Option<ToolCallScope>,
+    tool_scope: Option<&ToolCallScope>,
     previous_status: Option<model::ToolCallStatus>,
     update_outcome: &ToolCallUpdateApplyOutcome,
 ) {
@@ -391,6 +434,7 @@ fn log_tool_call_update_applied(
             content_block_count,
             raw_output_chars = raw_output_chars.unwrap_or_default(),
             has_output_metadata = tc.output_metadata.is_some(),
+            has_task_metadata = tc.task_metadata.is_some(),
         ),
         ToolUpdateLogLevel::Warn => tracing::warn!(
             target: crate::logging::targets::APP_TOOL,
@@ -407,6 +451,7 @@ fn log_tool_call_update_applied(
             content_block_count,
             raw_output_chars = raw_output_chars.unwrap_or_default(),
             has_output_metadata = tc.output_metadata.is_some(),
+            has_task_metadata = tc.task_metadata.is_some(),
         ),
         ToolUpdateLogLevel::Debug => tracing::debug!(
             target: crate::logging::targets::APP_TOOL,
@@ -423,6 +468,7 @@ fn log_tool_call_update_applied(
             content_block_count,
             raw_output_chars = raw_output_chars.unwrap_or_default(),
             has_output_metadata = tc.output_metadata.is_some(),
+            has_task_metadata = tc.task_metadata.is_some(),
             title_changed = tcu.fields.title.is_some(),
             status_changed = tcu.fields.status != previous_status,
             raw_input_bytes,
@@ -470,7 +516,7 @@ fn tool_update_log_spec(
             },
             outcome: "success",
         },
-        model::ToolCallStatus::Failed => {
+        model::ToolCallStatus::Failed | model::ToolCallStatus::Killed => {
             if !entered_final_status(previous_status, tc.status) {
                 return ToolUpdateLogSpec {
                     level: ToolUpdateLogLevel::Debug,
@@ -507,8 +553,16 @@ fn tool_update_log_spec(
             }
             ToolUpdateLogSpec {
                 level: ToolUpdateLogLevel::Warn,
-                event_name: "tool_call_failed",
-                message: "tool call failed",
+                event_name: if matches!(tc.status, model::ToolCallStatus::Killed) {
+                    "tool_call_killed"
+                } else {
+                    "tool_call_failed"
+                },
+                message: if matches!(tc.status, model::ToolCallStatus::Killed) {
+                    "tool call killed"
+                } else {
+                    "tool call failed"
+                },
                 outcome: "failure",
             }
         }
@@ -525,8 +579,12 @@ fn entered_final_status(
     previous_status: Option<model::ToolCallStatus>,
     current_status: model::ToolCallStatus,
 ) -> bool {
-    matches!(current_status, model::ToolCallStatus::Completed | model::ToolCallStatus::Failed)
-        && !matches!(previous_status, Some(status) if status == current_status)
+    matches!(
+        current_status,
+        model::ToolCallStatus::Completed
+            | model::ToolCallStatus::Failed
+            | model::ToolCallStatus::Killed
+    ) && !matches!(previous_status, Some(status) if status == current_status)
 }
 
 fn log_command_update_applied(
@@ -554,11 +612,15 @@ fn log_command_update_applied(
         log_terminal_spawned(app, tc, "update");
     }
 
-    let transitioned_to_final =
-        matches!(
-            previous_status,
-            Some(model::ToolCallStatus::Pending | model::ToolCallStatus::InProgress)
-        ) && matches!(tc.status, model::ToolCallStatus::Completed | model::ToolCallStatus::Failed);
+    let transitioned_to_final = matches!(
+        previous_status,
+        Some(model::ToolCallStatus::Pending | model::ToolCallStatus::InProgress)
+    ) && matches!(
+        tc.status,
+        model::ToolCallStatus::Completed
+            | model::ToolCallStatus::Failed
+            | model::ToolCallStatus::Killed
+    );
     if !transitioned_to_final {
         return;
     }
@@ -577,12 +639,19 @@ fn log_command_update_applied(
             terminal_output_bytes = u64::try_from(tc.terminal_output_len).unwrap_or_default(),
             has_terminal = tc.terminal_id.is_some(),
             assistant_auto_backgrounded = tc.assistant_auto_backgrounded(),
-            token_saver_active = tc.token_saver_active(),
         ),
-        model::ToolCallStatus::Failed => tracing::warn!(
+        model::ToolCallStatus::Failed | model::ToolCallStatus::Killed => tracing::warn!(
             target: crate::logging::targets::APP_COMMAND,
-            event_name = "command_failed",
-            message = "command execution failed",
+            event_name = if matches!(tc.status, model::ToolCallStatus::Killed) {
+                "command_killed"
+            } else {
+                "command_failed"
+            },
+            message = if matches!(tc.status, model::ToolCallStatus::Killed) {
+                "command execution killed"
+            } else {
+                "command execution failed"
+            },
             outcome = "failure",
             session_id = %current_session_id(app),
             tool_call_id = %tc.id,
@@ -592,7 +661,6 @@ fn log_command_update_applied(
             terminal_output_bytes = u64::try_from(tc.terminal_output_len).unwrap_or_default(),
             has_terminal = tc.terminal_id.is_some(),
             assistant_auto_backgrounded = tc.assistant_auto_backgrounded(),
-            token_saver_active = tc.token_saver_active(),
         ),
         model::ToolCallStatus::Pending | model::ToolCallStatus::InProgress => {}
     }
@@ -632,6 +700,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status,
             content: Vec::new(),
             hidden: false,
@@ -655,6 +724,36 @@ mod tests {
 
     fn terminal_content(terminal_id: &str) -> Vec<model::ToolCallContent> {
         vec![model::ToolCallContent::Terminal(model::TerminalToolCallContent::new(terminal_id))]
+    }
+
+    fn make_task_tool_call(id: &str, status: model::ToolCallStatus) -> ToolCallInfo {
+        ToolCallInfo {
+            id: id.to_owned(),
+            title: format!("task {id}"),
+            sdk_tool_name: "Agent".to_owned(),
+            raw_input: None,
+            raw_input_bytes: 0,
+            output_metadata: None,
+            task_metadata: None,
+            status,
+            content: Vec::new(),
+            hidden: false,
+            terminal_id: None,
+            terminal_command: None,
+            terminal_output: None,
+            terminal_output_len: 0,
+            terminal_bytes_seen: 0,
+            terminal_snapshot_mode: TerminalSnapshotMode::AppendOnly,
+            render_epoch: 0,
+            layout_epoch: 0,
+            last_measured_width: 0,
+            last_measured_height: 0,
+            last_measured_layout_epoch: 0,
+            last_measured_layout_generation: 0,
+            cache: BlockCache::default(),
+            pending_permission: None,
+            pending_question: None,
+        }
     }
 
     #[test]
@@ -777,5 +876,120 @@ mod tests {
         assert!(matches!(spec.level, ToolUpdateLogLevel::Info));
         assert_eq!(spec.event_name, "tool_call_completed");
         assert_eq!(spec.outcome, "success");
+    }
+
+    #[test]
+    fn task_metadata_update_is_applied_to_tool_call() {
+        let mut app = App::test_default();
+        let tool_id = "task-1";
+        app.messages.push(ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::ToolCall(Box::new(make_task_tool_call(
+                tool_id,
+                model::ToolCallStatus::InProgress,
+            )))],
+            None,
+        ));
+        app.index_tool_call(tool_id.to_owned(), 0, 0);
+
+        let update = model::ToolCallUpdate::new(
+            tool_id,
+            model::ToolCallUpdateFields::new().task_metadata(
+                model::TaskMetadata::new()
+                    .error(Some("Task paused".to_owned()))
+                    .backgrounded(Some(true)),
+            ),
+        );
+
+        handle_tool_call_update_session(&mut app, &update);
+
+        let MessageBlock::ToolCall(tc) = &app.messages[0].blocks[0] else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(
+            tc.task_metadata,
+            Some(
+                model::TaskMetadata::new()
+                    .error(Some("Task paused".to_owned()))
+                    .backgrounded(Some(true)),
+            )
+        );
+    }
+
+    #[test]
+    fn task_metadata_update_merges_partial_patches() {
+        let mut app = App::test_default();
+        let tool_id = "task-1";
+        app.messages.push(ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::ToolCall(Box::new(make_task_tool_call(
+                tool_id,
+                model::ToolCallStatus::InProgress,
+            )))],
+            None,
+        ));
+        app.index_tool_call(tool_id.to_owned(), 0, 0);
+
+        let backgrounded_update = model::ToolCallUpdate::new(
+            tool_id,
+            model::ToolCallUpdateFields::new()
+                .task_metadata(model::TaskMetadata::new().backgrounded(Some(true))),
+        );
+        handle_tool_call_update_session(&mut app, &backgrounded_update);
+
+        let timing_update = model::ToolCallUpdate::new(
+            tool_id,
+            model::ToolCallUpdateFields::new().task_metadata(
+                model::TaskMetadata::new()
+                    .error(Some("Task stopped by parent agent".to_owned()))
+                    .end_time(Some(1234))
+                    .total_paused_ms(Some(250)),
+            ),
+        );
+        handle_tool_call_update_session(&mut app, &timing_update);
+
+        let MessageBlock::ToolCall(tc) = &app.messages[0].blocks[0] else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(
+            tc.task_metadata,
+            Some(
+                model::TaskMetadata::new()
+                    .error(Some("Task stopped by parent agent".to_owned()))
+                    .end_time(Some(1234))
+                    .total_paused_ms(Some(250))
+                    .backgrounded(Some(true)),
+            )
+        );
+    }
+
+    #[test]
+    fn killed_task_update_clears_active_task_scope() {
+        let mut app = App::test_default();
+        let tool_id = "task-1";
+        app.messages.push(ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::ToolCall(Box::new(make_task_tool_call(
+                tool_id,
+                model::ToolCallStatus::InProgress,
+            )))],
+            None,
+        ));
+        app.index_tool_call(tool_id.to_owned(), 0, 0);
+        app.register_tool_call_scope(tool_id.to_owned(), ToolCallScope::SubagentRoot);
+        app.insert_active_task(tool_id.to_owned());
+
+        let update = model::ToolCallUpdate::new(
+            tool_id,
+            model::ToolCallUpdateFields::new().status(model::ToolCallStatus::Killed),
+        );
+
+        handle_tool_call_update_session(&mut app, &update);
+
+        let MessageBlock::ToolCall(tc) = &app.messages[0].blocks[0] else {
+            panic!("expected tool call block");
+        };
+        assert_eq!(tc.status, model::ToolCallStatus::Killed);
+        assert!(!app.active_task_ids.contains(tool_id));
     }
 }

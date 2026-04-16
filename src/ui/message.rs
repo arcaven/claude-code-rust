@@ -30,6 +30,33 @@ const FERRIS_SAYS: &[&str] = &[
     r"          / '-----' \ ",
 ];
 
+// Prepared for future randomized welcome-tip selection. Intentionally unused
+// until the welcome UI is switched from a single hard-coded tip.
+const WELCOME_TIPS: &[&str] = &[
+    "Use /mode plan before larger changes, then switch back to code once the plan is clear",
+    "Use /mcp to connect live tools and docs instead of pasting stale context into chat",
+    "Keep repo instructions short in CLAUDE.md and update them when mistakes repeat",
+    "Start prompts with the goal, relevant context, and constraints so Claude needs fewer corrections",
+    "Ask Claude for a plan first on multi-step work instead of jumping straight to edits",
+    "Give success criteria Claude can verify: tests, lint, screenshots, or exact outputs",
+    "For visual work, paste screenshots or mockups so Claude can verify UI changes instead of guessing",
+    "Start a fresh thread with /new-session when the task changes and old context is noise",
+    "Use /compact when a session gets long and you want to keep the thread but trim context",
+    "Use /resume <session_id> to jump back into earlier work without rebuilding context",
+    "Use /docs shortcuts to see the live keyboard shortcuts for the current app state",
+    "Use /docs commands to inspect the slash commands this app and the SDK expose",
+    "If Claude drifts, refine or restate the plan early instead of piling on corrective prompts",
+    "For tricky bugs, provide clear repro steps and runtime evidence instead of guessing fixes",
+    "Point Claude at the relevant files, errors, and constraints instead of pasting everything",
+    "If you do not know the exact file, let Claude search first and only pin the files that matter",
+    "Ask codebase questions first in unfamiliar areas instead of coding blind",
+    "Review diffs carefully even when the output looks plausible on first read",
+    "Use hooks for checks that must run every time instead of relying on reminder text alone",
+    "Turn repeated workflows into CLAUDE.md guidance only after they work reliably by hand",
+    "For larger features, let Claude clarify requirements and edge cases through structured questions",
+    "Use separate sessions for unrelated work so planning, debugging, and review stay clean",
+];
+
 /// Snapshot of the app state needed by the spinner -- extracted before
 /// the message loop so we don't need `&App` (which conflicts with `&mut msg`).
 #[derive(Clone, Copy)]
@@ -42,8 +69,6 @@ pub struct SpinnerState {
     pub show_empty_thinking: bool,
     /// True when this message should show the thinking indicator.
     pub show_thinking: bool,
-    /// True when this message should show the subagent-thinking indicator.
-    pub show_subagent_thinking: bool,
     /// True when this message should show the compaction indicator.
     pub show_compacting: bool,
 }
@@ -277,26 +302,35 @@ fn append_assistant_blocks(
     }
 
     let show_compacting = spinner.show_compacting;
-    let show_subagent_thinking = spinner.show_subagent_thinking && !show_compacting;
+    let deferred_interaction = deferred_hidden_interaction_render_after(&msg.blocks);
     let mut state = AssistantLayoutState::default();
-    for block in &mut msg.blocks {
-        match block {
-            MessageBlock::Text(block) => {
-                append_assistant_text_block(block, width, layout, &mut state);
-            }
-            MessageBlock::Notice(notice) => {
-                append_assistant_notice_block(notice, width, layout, &mut state);
-            }
-            MessageBlock::ToolCall(tc) => append_assistant_tool_block(
-                tc.as_mut(),
+    for idx in 0..msg.blocks.len() {
+        if deferred_interaction.is_some_and(|(deferred_idx, _)| deferred_idx == idx) {
+            continue;
+        }
+
+        append_assistant_block(
+            &mut msg.blocks[idx],
+            spinner,
+            width,
+            tools_collapsed,
+            layout_generation,
+            layout,
+            &mut state,
+        );
+
+        if let Some((deferred_idx, render_after_idx)) = deferred_interaction
+            && render_after_idx == idx
+        {
+            append_assistant_block(
+                &mut msg.blocks[deferred_idx],
                 spinner,
                 width,
                 tools_collapsed,
                 layout_generation,
                 layout,
                 &mut state,
-            ),
-            MessageBlock::Welcome(_) | MessageBlock::ImageAttachment(_) => {}
+            );
         }
     }
 
@@ -305,17 +339,57 @@ fn append_assistant_blocks(
             layout.push_blank();
         }
         layout.push_wrapped_line(compacting_line(spinner.frame), width);
-    } else if show_subagent_thinking {
-        if state.has_body_content {
-            layout.push_blank();
-        }
-        layout.push_wrapped_line(subagent_thinking_line(spinner.frame), width);
     }
-    if spinner.show_thinking && !show_subagent_thinking && !show_compacting {
+    if spinner.show_thinking && !show_compacting {
         if state.has_body_content {
             layout.push_blank();
         }
         layout.push_wrapped_line(thinking_line(spinner.frame), width);
+    }
+}
+
+fn deferred_hidden_interaction_render_after(blocks: &[MessageBlock]) -> Option<(usize, usize)> {
+    let deferred_idx = blocks.iter().position(
+        |block| matches!(block, MessageBlock::ToolCall(tc) if tc.is_hidden_focused_interaction()),
+    )?;
+    let render_after_idx = blocks
+        .iter()
+        .enumerate()
+        .skip(deferred_idx.saturating_add(1))
+        .filter_map(|(idx, block)| match block {
+            MessageBlock::ToolCall(tc) if tc.is_subagent_root_tool() => Some(idx),
+            _ => None,
+        })
+        .last()?;
+    Some((deferred_idx, render_after_idx))
+}
+
+fn append_assistant_block(
+    block: &mut MessageBlock,
+    spinner: &SpinnerState,
+    width: u16,
+    tools_collapsed: bool,
+    layout_generation: Option<u64>,
+    layout: &mut MessageLayout,
+    state: &mut AssistantLayoutState,
+) {
+    match block {
+        MessageBlock::Text(block) => {
+            append_assistant_text_block(block, width, layout, state);
+        }
+        MessageBlock::Notice(notice) => {
+            append_assistant_notice_block(notice, width, layout, state);
+        }
+        MessageBlock::ToolCall(tc) => append_assistant_tool_block(
+            tc.as_mut(),
+            spinner,
+            width,
+            tools_collapsed,
+            layout_generation,
+            layout,
+            state,
+        ),
+        MessageBlock::Welcome(_) | MessageBlock::ImageAttachment(_) => {}
     }
 }
 
@@ -380,7 +454,7 @@ fn append_assistant_tool_block(
     layout: &mut MessageLayout,
     state: &mut AssistantLayoutState,
 ) {
-    if tc.hidden {
+    if tc.hidden_unless_focused_interaction() {
         return;
     }
     if !state.prev_was_tool && state.has_body_content {
@@ -718,7 +792,6 @@ fn build_message_render_signature(
         role: msg.role.clone(),
         show_empty_thinking: spinner.show_empty_thinking,
         show_thinking: spinner.show_thinking,
-        show_subagent_thinking: spinner.show_subagent_thinking,
         show_compacting: spinner.show_compacting,
         assistant_frame,
         blocks,
@@ -760,10 +833,7 @@ fn build_message_block_render_signature(
 
 fn message_has_frame_dependent_assistant_lines(msg: &ChatMessage, spinner: &SpinnerState) -> bool {
     matches!(msg.role, MessageRole::Assistant)
-        && (spinner.show_empty_thinking
-            || spinner.show_thinking
-            || spinner.show_subagent_thinking
-            || spinner.show_compacting)
+        && (spinner.show_empty_thinking || spinner.show_thinking || spinner.show_compacting)
 }
 
 fn tool_call_needs_spinner_frame(tc: &crate::app::ToolCallInfo) -> bool {
@@ -936,14 +1006,6 @@ fn compacting_line(frame: usize) -> Line<'static> {
     ))
 }
 
-fn subagent_thinking_line(frame: usize) -> Line<'static> {
-    let ch = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
-    Line::from(vec![
-        Span::styled("  \u{2514}\u{2500} ", Style::default().fg(theme::DIM)),
-        Span::styled(format!("{ch} Thinking..."), Style::default().fg(theme::DIM)),
-    ])
-}
-
 fn welcome_lines(block: &WelcomeBlock, _width: u16) -> Vec<Line<'static>> {
     let pad = "  ";
     let mut lines = Vec::new();
@@ -958,27 +1020,45 @@ fn welcome_lines(block: &WelcomeBlock, _width: u16) -> Vec<Line<'static>> {
     lines.push(Line::default());
 
     lines.push(Line::from(vec![
-        Span::styled(format!("{pad}Model: "), Style::default().fg(theme::DIM)),
+        Span::styled(format!("{pad}Version:      "), Style::default().fg(theme::DIM)),
+        Span::styled(block.version.clone(), Style::default().fg(theme::DIM)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{pad}Subscription: "), Style::default().fg(theme::DIM)),
         Span::styled(
-            block.model_name.clone(),
+            block.subscription.clone(),
             Style::default().fg(theme::RUST_ORANGE).add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::from(Span::styled(
-        format!("{pad}cwd:   {}", block.cwd),
+        format!("{pad}cwd:          {}", block.cwd),
+        Style::default().fg(theme::DIM),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("{pad}Session ID:   {}", block.session_id),
         Style::default().fg(theme::DIM),
     )));
 
     lines.push(Line::default());
+    // TODO: Replace the hard-coded tip text with a small array of welcome tips
+    // and randomized selection once this becomes a first-class surface.
     lines.push(Line::from(Span::styled(
-        format!(
-            "{pad}Tips: Enter to send, Shift+Enter for newline, Ctrl+C copies selection or quits"
-        ),
+        format!("{pad}Tips: {}", selected_welcome_tip(block)),
         Style::default().fg(theme::DIM),
     )));
     lines.push(Line::default());
 
     lines
+}
+
+fn selected_welcome_tip(block: &WelcomeBlock) -> &'static str {
+    let Some(first_tip) = WELCOME_TIPS.first().copied() else {
+        return "Enter sends, Shift+Enter inserts a newline, and Ctrl+C copies a selection or quits";
+    };
+    let len_u64 = u64::try_from(WELCOME_TIPS.len()).unwrap_or(1);
+    let idx_u64 = block.tip_seed % len_u64;
+    let idx = usize::try_from(idx_u64).unwrap_or(0);
+    WELCOME_TIPS.get(idx).copied().unwrap_or(first_tip)
 }
 
 fn render_welcome_cached(block: &mut WelcomeBlock, width: u16, out: &mut Vec<Line<'static>>) {
@@ -1140,7 +1220,9 @@ fn force_markdown_line_breaks(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{ChatMessage, MessageBlock, NoticeBlock, TextBlock, TextBlockSpacing};
+    use crate::app::{
+        ChatMessage, InlinePermission, MessageBlock, NoticeBlock, TextBlock, TextBlockSpacing,
+    };
     use pretty_assertions::assert_eq;
     use ratatui::widgets::{Paragraph, Wrap};
 
@@ -1306,21 +1388,8 @@ mod tests {
     }
 
     #[test]
-    fn welcome_lines_do_not_render_recent_sessions_section() {
-        let message = ChatMessage::welcome_with_recent(
-            "claude-sonnet-4-5",
-            "/cwd",
-            &[crate::app::RecentSessionInfo {
-                session_id: "11111111-1111-1111-1111-111111111111".to_owned(),
-                summary: "Title".to_owned(),
-                last_modified_ms: 0,
-                file_size_bytes: 0,
-                cwd: Some("/a".to_owned()),
-                git_branch: None,
-                custom_title: Some("Title".to_owned()),
-                first_prompt: None,
-            }],
-        );
+    fn welcome_lines_render_expected_fields() {
+        let message = ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/cwd", "-");
         let MessageBlock::Welcome(block) = &message.blocks[0] else {
             panic!("expected welcome block");
         };
@@ -1329,7 +1398,15 @@ mod tests {
             .into_iter()
             .map(|line| line.spans.into_iter().map(|s| s.content).collect())
             .collect();
-        assert!(!lines.iter().any(|line| line.contains("Recent sessions")));
+        assert!(lines.iter().any(|line| line.contains("Version:")));
+        assert!(lines.iter().any(|line| line.contains("Subscription: -")));
+        assert!(lines.iter().any(|line| line.contains("cwd:          /cwd")));
+        assert!(lines.iter().any(|line| line.contains("Session ID:   -")));
+        assert!(lines.iter().any(|line| line.contains("Tips: ")));
+        assert!(
+            WELCOME_TIPS.iter().any(|tip| lines.iter().any(|line| line.contains(tip))),
+            "expected one welcome tip to be rendered"
+        );
     }
 
     // force_markdown_line_breaks
@@ -1450,6 +1527,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status,
             content: if text.is_empty() {
                 Vec::new()
@@ -1475,6 +1553,28 @@ mod tests {
         }
     }
 
+    fn pending_permission(focused: bool) -> InlinePermission {
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        InlinePermission {
+            options: vec![
+                crate::agent::model::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    crate::agent::model::PermissionOptionKind::AllowOnce,
+                ),
+                crate::agent::model::PermissionOption::new(
+                    "deny",
+                    "Deny",
+                    crate::agent::model::PermissionOptionKind::RejectOnce,
+                ),
+            ],
+            display: None,
+            response_tx,
+            selected_index: 0,
+            focused,
+        }
+    }
+
     fn render_lines_to_strings(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
@@ -1482,8 +1582,21 @@ mod tests {
             .collect()
     }
 
-    fn make_welcome_message(model_name: &str, cwd: &str) -> ChatMessage {
-        ChatMessage::welcome(model_name, cwd)
+    fn line_index_containing(lines: &[String], needle: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("expected line containing {needle:?}"))
+    }
+
+    fn make_welcome_message(subscription: &str, cwd: &str, session_id: &str) -> ChatMessage {
+        let mut message =
+            ChatMessage::welcome(env!("CARGO_PKG_VERSION"), subscription, cwd, session_id);
+        let Some(MessageBlock::Welcome(block)) = message.blocks.first_mut() else {
+            panic!("expected welcome block");
+        };
+        block.tip_seed = 0;
+        message
     }
 
     fn idle_spinner() -> SpinnerState {
@@ -1492,7 +1605,6 @@ mod tests {
             is_active_turn_assistant: false,
             show_empty_thinking: false,
             show_thinking: false,
-            show_subagent_thinking: false,
             show_compacting: false,
         }
     }
@@ -1552,8 +1664,8 @@ mod tests {
     #[test]
     fn welcome_role_label_wrap_height_matches_ground_truth() {
         let spinner = idle_spinner();
-        let mut measured_msg = make_welcome_message("claude-sonnet-4-5", "~/project");
-        let mut truth_msg = make_welcome_message("claude-sonnet-4-5", "~/project");
+        let mut measured_msg = make_welcome_message("Max", "~/project", "session-1");
+        let mut truth_msg = make_welcome_message("Max", "~/project", "session-1");
 
         let (h, _) = measure_message_height_cached(&mut measured_msg, &spinner, 4, 1);
         let truth = ground_truth_height(&mut truth_msg, &spinner, 4);
@@ -1938,8 +2050,8 @@ mod tests {
     #[test]
     fn welcome_height_matches_ground_truth() {
         let spinner = idle_spinner();
-        let mut measured_msg = make_welcome_message("claude-sonnet-4-5", "~/project");
-        let mut truth_msg = make_welcome_message("claude-sonnet-4-5", "~/project");
+        let mut measured_msg = make_welcome_message("Max", "~/project", "session-1");
+        let mut truth_msg = make_welcome_message("Max", "~/project", "session-1");
 
         let (h, _) = measure_message_height_cached(&mut measured_msg, &spinner, 52, 1);
         let truth = ground_truth_height(&mut truth_msg, &spinner, 52);
@@ -1962,16 +2074,52 @@ mod tests {
     }
 
     #[test]
-    fn assistant_message_shows_subagent_indicator_when_enabled() {
-        let spinner = SpinnerState { show_subagent_thinking: true, ..idle_spinner() };
+    fn assistant_message_suppresses_hidden_subagent_child_tools() {
+        let spinner = idle_spinner();
+
+        for tools_collapsed in [false, true] {
+            let mut hidden_tool = make_tool_call_info(
+                "hidden-child",
+                "Bash",
+                crate::agent::model::ToolCallStatus::Completed,
+                "child output",
+            );
+            hidden_tool.hidden = true;
+            let mut msg = ChatMessage::new(
+                MessageRole::Assistant,
+                vec![MessageBlock::ToolCall(Box::new(hidden_tool))],
+                None,
+            );
+
+            let mut lines = Vec::new();
+            render_message_with_tools_collapsed(
+                &mut msg,
+                &spinner,
+                120,
+                tools_collapsed,
+                &mut lines,
+            );
+            let rendered = render_lines_to_strings(&lines);
+
+            assert!(!rendered.iter().any(|line| line.contains("hidden-child")));
+            assert!(!rendered.iter().any(|line| line.contains("child output")));
+        }
+    }
+
+    #[test]
+    fn assistant_message_renders_hidden_subagent_child_permission_prompt() {
+        let spinner = idle_spinner();
+        let mut hidden_tool = make_tool_call_info(
+            "hidden-permission",
+            "Bash",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "",
+        );
+        hidden_tool.hidden = true;
+        hidden_tool.pending_permission = Some(pending_permission(true));
         let mut msg = ChatMessage::new(
             MessageRole::Assistant,
-            vec![MessageBlock::ToolCall(Box::new(make_tool_call_info(
-                "task-only",
-                "Task",
-                crate::agent::model::ToolCallStatus::InProgress,
-                "Research project",
-            )))],
+            vec![MessageBlock::ToolCall(Box::new(hidden_tool))],
             None,
         );
 
@@ -1979,7 +2127,160 @@ mod tests {
         render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
         let rendered = render_lines_to_strings(&lines);
 
-        assert!(rendered.iter().any(|line| line.contains("Thinking...")));
+        assert!(rendered.iter().any(|line| line.contains("hidden-permission")));
+        assert!(rendered.iter().any(|line| line.contains("Allow")));
+        assert!(rendered.iter().any(|line| line.contains("Deny")));
+    }
+
+    #[test]
+    fn assistant_message_renders_only_focused_hidden_subagent_child_permission_prompt() {
+        let spinner = idle_spinner();
+        let mut focused_tool = make_tool_call_info(
+            "focused-permission",
+            "Bash",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "",
+        );
+        focused_tool.hidden = true;
+        focused_tool.pending_permission = Some(pending_permission(true));
+        let mut waiting_tool = make_tool_call_info(
+            "waiting-permission",
+            "Bash",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "",
+        );
+        waiting_tool.hidden = true;
+        waiting_tool.pending_permission = Some(pending_permission(false));
+        let mut msg = ChatMessage::new(
+            MessageRole::Assistant,
+            vec![
+                MessageBlock::ToolCall(Box::new(focused_tool)),
+                MessageBlock::ToolCall(Box::new(waiting_tool)),
+            ],
+            None,
+        );
+
+        let mut lines = Vec::new();
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
+        let rendered = render_lines_to_strings(&lines);
+
+        assert!(rendered.iter().any(|line| line.contains("focused-permission")));
+        assert!(!rendered.iter().any(|line| line.contains("waiting-permission")));
+        assert!(!rendered.iter().any(|line| line.contains("Waiting for input")));
+    }
+
+    #[test]
+    fn assistant_message_keeps_unfocused_main_agent_permission_prompt_visible() {
+        let spinner = idle_spinner();
+        let mut main_tool = make_tool_call_info(
+            "main-permission",
+            "Bash",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "",
+        );
+        main_tool.pending_permission = Some(pending_permission(false));
+        let mut msg = ChatMessage::new(
+            MessageRole::Assistant,
+            vec![MessageBlock::ToolCall(Box::new(main_tool))],
+            None,
+        );
+
+        let mut lines = Vec::new();
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
+        let rendered = render_lines_to_strings(&lines);
+
+        assert!(rendered.iter().any(|line| line.contains("main-permission")));
+        assert!(rendered.iter().any(|line| line.contains("Waiting for input")));
+    }
+
+    #[test]
+    fn assistant_message_defers_focused_hidden_child_permission_after_later_subagent_roots() {
+        let spinner = idle_spinner();
+        let root_a = make_tool_call_info(
+            "root-a",
+            "Task",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "first subagent",
+        );
+        let mut focused_tool = make_tool_call_info(
+            "focused-permission",
+            "Bash",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "",
+        );
+        focused_tool.hidden = true;
+        focused_tool.pending_permission = Some(pending_permission(true));
+        let root_b = make_tool_call_info(
+            "root-b",
+            "Agent",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "second subagent",
+        );
+        let mut msg = ChatMessage::new(
+            MessageRole::Assistant,
+            vec![
+                MessageBlock::ToolCall(Box::new(root_a)),
+                MessageBlock::ToolCall(Box::new(focused_tool)),
+                MessageBlock::ToolCall(Box::new(root_b)),
+            ],
+            None,
+        );
+
+        let mut lines = Vec::new();
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
+        let rendered = render_lines_to_strings(&lines);
+
+        let first_root_line = line_index_containing(&rendered, "root-a");
+        let second_root_line = line_index_containing(&rendered, "root-b");
+        let focused_idx = line_index_containing(&rendered, "focused-permission");
+
+        assert!(first_root_line < second_root_line);
+        assert!(second_root_line < focused_idx);
+    }
+
+    #[test]
+    fn assistant_message_keeps_focused_hidden_child_permission_before_later_main_tool() {
+        let spinner = idle_spinner();
+        let root = make_tool_call_info(
+            "root",
+            "Task",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "subagent",
+        );
+        let mut focused_tool = make_tool_call_info(
+            "focused-permission",
+            "Bash",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "",
+        );
+        focused_tool.hidden = true;
+        focused_tool.pending_permission = Some(pending_permission(true));
+        let main_tool = make_tool_call_info(
+            "main-tool",
+            "Read",
+            crate::agent::model::ToolCallStatus::InProgress,
+            "main agent tool",
+        );
+        let mut msg = ChatMessage::new(
+            MessageRole::Assistant,
+            vec![
+                MessageBlock::ToolCall(Box::new(root)),
+                MessageBlock::ToolCall(Box::new(focused_tool)),
+                MessageBlock::ToolCall(Box::new(main_tool)),
+            ],
+            None,
+        );
+
+        let mut lines = Vec::new();
+        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
+        let rendered = render_lines_to_strings(&lines);
+
+        let root_idx = line_index_containing(&rendered, "root");
+        let focused_idx = line_index_containing(&rendered, "focused-permission");
+        let main_idx = line_index_containing(&rendered, "main-tool");
+
+        assert!(root_idx < focused_idx);
+        assert!(focused_idx < main_idx);
     }
 
     #[test]
@@ -2025,70 +2326,6 @@ mod tests {
             rendered.iter().position(|line| line.contains("Heading")).expect("heading");
         assert_eq!(heading_idx, 1);
         assert!(!rendered[heading_idx].is_empty());
-    }
-
-    #[test]
-    fn assistant_message_hides_subagent_indicator_when_disabled() {
-        let spinner = idle_spinner();
-        let mut msg = ChatMessage::new(
-            MessageRole::Assistant,
-            vec![
-                MessageBlock::ToolCall(Box::new(make_tool_call_info(
-                    "task-main",
-                    "Task",
-                    crate::agent::model::ToolCallStatus::InProgress,
-                    "Research project",
-                ))),
-                MessageBlock::ToolCall(Box::new(make_tool_call_info(
-                    "bash-child",
-                    "Bash",
-                    crate::agent::model::ToolCallStatus::InProgress,
-                    "",
-                ))),
-            ],
-            None,
-        );
-
-        let mut lines = Vec::new();
-        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
-        let rendered = render_lines_to_strings(&lines);
-
-        assert!(!rendered.iter().any(|line| line.contains("Thinking...")));
-    }
-
-    #[test]
-    fn assistant_message_places_subagent_indicator_after_visible_tool_blocks() {
-        let spinner = SpinnerState { show_subagent_thinking: true, ..idle_spinner() };
-        let mut msg = ChatMessage::new(
-            MessageRole::Assistant,
-            vec![
-                MessageBlock::ToolCall(Box::new(make_tool_call_info(
-                    "task-main",
-                    "Task",
-                    crate::agent::model::ToolCallStatus::InProgress,
-                    "Research project",
-                ))),
-                MessageBlock::ToolCall(Box::new(make_tool_call_info(
-                    "bash-done",
-                    "Bash",
-                    crate::agent::model::ToolCallStatus::Completed,
-                    "",
-                ))),
-            ],
-            None,
-        );
-
-        let mut lines = Vec::new();
-        render_message_with_tools_collapsed(&mut msg, &spinner, 120, false, &mut lines);
-        let rendered = render_lines_to_strings(&lines);
-
-        let bash_idx = rendered.iter().position(|line| line.contains("Bash")).expect("bash line");
-        let thinking_idx = rendered
-            .iter()
-            .position(|line| line.contains("Thinking..."))
-            .expect("subagent thinking line");
-
-        assert!(thinking_idx > bash_idx);
     }
 
     #[test]

@@ -121,17 +121,16 @@ pub fn create_app(cli: &Cli) -> App {
     });
 
     let cwd_display = shorten_cwd(&cwd);
-    let initial_model_name = "Connecting...".to_owned();
-
     let mut app = App {
         active_view: ActiveView::Chat,
         config: ConfigState::default(),
         trust: trust::TrustState::default(),
         settings_home_override: None,
-        messages: vec![super::ChatMessage::welcome_with_recent(
-            &initial_model_name,
+        messages: vec![super::ChatMessage::welcome(
+            env!("CARGO_PKG_VERSION"),
+            "-",
             &cwd_display,
-            &[],
+            "-",
         )],
         message_retained_bytes: Vec::new(),
         retained_history_bytes: 0,
@@ -146,8 +145,7 @@ pub fn create_app(cli: &Cli) -> App {
         session_id: None,
         conn: None,
         session_scope_epoch: 0,
-        model_name: initial_model_name,
-        welcome_model_resolved: false,
+        current_model: None,
         cwd_raw: cwd.to_string_lossy().to_string(),
         cwd: cwd_display,
         files_accessed: 0,
@@ -173,8 +171,6 @@ pub fn create_app(cli: &Cli) -> App {
         tools_collapsed: true,
         active_task_ids: HashSet::new(),
         tool_call_scopes: HashMap::new(),
-        active_subagent_tool_ids: HashSet::new(),
-        subagent_idle_since: None,
         terminals,
         force_redraw: false,
         tool_call_index: HashMap::new(),
@@ -203,7 +199,6 @@ pub fn create_app(cli: &Cli) -> App {
         pending_submit: None,
         paste_burst: super::paste_burst::PasteBurstDetector::new(),
         pending_paste_text: String::new(),
-        pending_clipboard_paste_dedupe: None,
         pending_paste_session: None,
         active_paste_session: None,
         next_paste_session_id: 1,
@@ -215,6 +210,8 @@ pub fn create_app(cli: &Cli) -> App {
         usage: super::UsageState::default(),
         mcp: super::McpState::default(),
         fast_mode_state: model::FastModeState::Off,
+        runtime_session_state: None,
+        prompt_suggestion: None,
         last_rate_limit_update: None,
         turn_notice_refs: Vec::new(),
         is_compacting: false,

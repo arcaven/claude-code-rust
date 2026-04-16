@@ -74,6 +74,7 @@ pub(super) fn handle_permission_request_event(
         let is_first = app.pending_interaction_ids.is_empty();
         tc.pending_permission = Some(InlinePermission {
             options: request.options,
+            display: request.display,
             response_tx,
             selected_index: 0,
             focused: is_first,
@@ -275,15 +276,28 @@ fn finish_ready_turn_exit(app: &mut App, exit: TurnExitState, tool_status: model
     super::notices::clear_turn_notice_tracking(app);
 }
 
-pub(super) fn handle_turn_complete_event(app: &mut App) {
+pub(super) fn handle_turn_complete_event(
+    app: &mut App,
+    terminal_reason: Option<crate::agent::types::TerminalReason>,
+) {
     let exit = begin_turn_exit(app, true);
     let turn_was_active = exit.turn_was_active;
+    if let Some(reason) = terminal_reason {
+        tracing::debug!(
+            target: crate::logging::targets::APP_SESSION,
+            event_name = "turn_complete_terminal_reason",
+            message = "turn completed with SDK terminal reason",
+            outcome = "success",
+            terminal_reason = reason.as_stored(),
+        );
+    }
     let tool_status = if exit.cancelled_requested.is_some() {
         model::ToolCallStatus::Failed
     } else {
         model::ToolCallStatus::Completed
     };
     finish_ready_turn_exit(app, exit, tool_status);
+    crate::app::session_runtime::request_context_usage_refresh(app);
     if turn_was_active {
         app.notifications.notify(
             app.config.preferred_notification_channel_effective(),
@@ -299,6 +313,7 @@ pub(super) fn handle_turn_error_event(
     app: &mut App,
     msg: &str,
     classified: Option<TurnErrorClass>,
+    terminal_reason: Option<crate::agent::types::TerminalReason>,
 ) {
     let exit = begin_turn_exit(app, true);
 
@@ -310,9 +325,11 @@ pub(super) fn handle_turn_error_event(
             message = "turn error suppressed after cancellation request",
             outcome = "cancelled",
             error_preview = %summary,
+            terminal_reason = terminal_reason.map_or("", crate::agent::types::TerminalReason::as_stored),
         );
         app.pending_submit = None;
         finish_ready_turn_exit(app, exit, model::ToolCallStatus::Failed);
+        crate::app::session_runtime::request_context_usage_refresh(app);
         if app.active_view == super::super::ActiveView::Chat {
             super::super::input_submit::maybe_auto_submit_after_cancel(app);
         }
@@ -328,6 +345,7 @@ pub(super) fn handle_turn_error_event(
         outcome = "failure",
         error_class = ?error_class,
         error_preview = %summary,
+        terminal_reason = terminal_reason.map_or("", crate::agent::types::TerminalReason::as_stored),
     );
     match error_class {
         TurnErrorClass::PlanLimit => {
@@ -383,6 +401,7 @@ pub(super) fn handle_turn_error_event(
     }
     app.clear_active_turn_assistant();
     super::notices::clear_turn_notice_tracking(app);
+    crate::app::session_runtime::request_context_usage_refresh(app);
 }
 
 fn push_interrupted_hint(app: &mut App) {
@@ -494,7 +513,7 @@ mod tests {
         app.messages.push(user_message("hello"));
         app.messages.push(empty_assistant_message());
 
-        handle_turn_complete_event(&mut app);
+        handle_turn_complete_event(&mut app, None);
 
         assert_eq!(app.messages.len(), 1);
         assert!(matches!(app.messages[0].role, MessageRole::User));
@@ -508,7 +527,7 @@ mod tests {
         app.messages.push(user_message("hello"));
         app.messages.push(empty_assistant_message());
 
-        handle_turn_error_event(&mut app, "cancelled", None);
+        handle_turn_error_event(&mut app, "cancelled", None, None);
 
         assert_eq!(app.messages.len(), 2);
         assert!(matches!(app.messages[0].role, MessageRole::User));
@@ -522,7 +541,7 @@ mod tests {
         app.messages.push(user_message("hello"));
         app.messages.push(empty_assistant_message());
 
-        handle_turn_error_event(&mut app, "boom", None);
+        handle_turn_error_event(&mut app, "boom", None, None);
 
         assert_eq!(app.messages.len(), 2);
         assert!(matches!(app.messages[0].role, MessageRole::User));

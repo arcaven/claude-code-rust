@@ -103,6 +103,12 @@ pub enum BridgeCommand {
     GetStatusSnapshot {
         session_id: String,
     },
+    GetContextUsage {
+        session_id: String,
+    },
+    ReloadPlugins {
+        session_id: String,
+    },
     GetMcpSnapshot {
         session_id: String,
     },
@@ -154,6 +160,8 @@ impl BridgeCommand {
             Self::QuestionResponse { .. } => "question_response",
             Self::ElicitationResponse { .. } => "elicitation_response",
             Self::GetStatusSnapshot { .. } => "get_status_snapshot",
+            Self::GetContextUsage { .. } => "get_context_usage",
+            Self::ReloadPlugins { .. } => "reload_plugins",
             Self::GetMcpSnapshot { .. } => "get_mcp_snapshot",
             Self::McpReconnect { .. } => "mcp_reconnect",
             Self::McpToggle { .. } => "mcp_toggle",
@@ -179,6 +187,8 @@ impl BridgeCommand {
             | Self::QuestionResponse { session_id, .. }
             | Self::ElicitationResponse { session_id, .. }
             | Self::GetStatusSnapshot { session_id }
+            | Self::GetContextUsage { session_id }
+            | Self::ReloadPlugins { session_id }
             | Self::GetMcpSnapshot { session_id }
             | Self::McpReconnect { session_id, .. }
             | Self::McpToggle { session_id, .. }
@@ -208,6 +218,8 @@ impl BridgeCommand {
             | Self::NewSession { .. }
             | Self::ElicitationResponse { .. }
             | Self::GetStatusSnapshot { .. }
+            | Self::GetContextUsage { .. }
+            | Self::ReloadPlugins { .. }
             | Self::GetMcpSnapshot { .. }
             | Self::McpReconnect { .. }
             | Self::McpToggle { .. }
@@ -234,7 +246,7 @@ pub enum BridgeEvent {
     Connected {
         session_id: String,
         cwd: String,
-        model_name: String,
+        current_model: types::CurrentModel,
         #[serde(default)]
         available_models: Vec<types::AvailableModel>,
         mode: Option<types::ModeState>,
@@ -278,6 +290,8 @@ pub enum BridgeEvent {
     },
     TurnComplete {
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_reason: Option<types::TerminalReason>,
     },
     TurnError {
         session_id: String,
@@ -285,15 +299,24 @@ pub enum BridgeEvent {
         error_kind: Option<String>,
         sdk_result_subtype: Option<String>,
         assistant_error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_reason: Option<types::TerminalReason>,
     },
     SlashError {
+        session_id: String,
+        message: String,
+    },
+    RuntimeReloadCompleted {
+        session_id: String,
+    },
+    RuntimeReloadFailed {
         session_id: String,
         message: String,
     },
     SessionReplaced {
         session_id: String,
         cwd: String,
-        model_name: String,
+        current_model: types::CurrentModel,
         #[serde(default)]
         available_models: Vec<types::AvailableModel>,
         mode: Option<types::ModeState>,
@@ -308,6 +331,10 @@ pub enum BridgeEvent {
     StatusSnapshot {
         session_id: String,
         account: types::AccountInfo,
+    },
+    ContextUsage {
+        session_id: String,
+        percentage: Option<u8>,
     },
     McpSnapshot {
         session_id: String,
@@ -334,10 +361,13 @@ impl BridgeEvent {
             Self::TurnComplete { .. } => "turn_complete",
             Self::TurnError { .. } => "turn_error",
             Self::SlashError { .. } => "slash_error",
+            Self::RuntimeReloadCompleted { .. } => "runtime_reload_completed",
+            Self::RuntimeReloadFailed { .. } => "runtime_reload_failed",
             Self::SessionReplaced { .. } => "session_replaced",
             Self::Initialized { .. } => "initialized",
             Self::SessionsListed { .. } => "sessions_listed",
             Self::StatusSnapshot { .. } => "status_snapshot",
+            Self::ContextUsage { .. } => "context_usage",
             Self::McpSnapshot { .. } => "mcp_snapshot",
         }
     }
@@ -353,11 +383,14 @@ impl BridgeEvent {
             | Self::ElicitationComplete { session_id, .. }
             | Self::McpAuthRedirect { session_id, .. }
             | Self::McpOperationError { session_id, .. }
-            | Self::TurnComplete { session_id }
+            | Self::TurnComplete { session_id, .. }
             | Self::TurnError { session_id, .. }
             | Self::SlashError { session_id, .. }
+            | Self::RuntimeReloadCompleted { session_id, .. }
+            | Self::RuntimeReloadFailed { session_id, .. }
             | Self::SessionReplaced { session_id, .. }
             | Self::StatusSnapshot { session_id, .. }
+            | Self::ContextUsage { session_id, .. }
             | Self::McpSnapshot { session_id, .. } => Some(session_id.as_str()),
             Self::AuthRequired { .. }
             | Self::ConnectionFailed { .. }
@@ -384,10 +417,13 @@ impl BridgeEvent {
             | Self::TurnComplete { .. }
             | Self::TurnError { .. }
             | Self::SlashError { .. }
+            | Self::RuntimeReloadCompleted { .. }
+            | Self::RuntimeReloadFailed { .. }
             | Self::SessionReplaced { .. }
             | Self::Initialized { .. }
             | Self::SessionsListed { .. }
             | Self::StatusSnapshot { .. }
+            | Self::ContextUsage { .. }
             | Self::McpSnapshot { .. } => None,
         }
     }
@@ -418,11 +454,9 @@ mod tests {
     fn event_envelope_roundtrip_json() {
         let env = EventEnvelope {
             request_id: None,
-            event: BridgeEvent::SessionUpdate {
+            event: BridgeEvent::TurnComplete {
                 session_id: "session-1".to_owned(),
-                update: types::SessionUpdate::CurrentModeUpdate {
-                    current_mode_id: "default".to_owned(),
-                },
+                terminal_reason: Some(types::TerminalReason::Completed),
             },
         };
         let json = serde_json::to_string(&env).expect("serialize");

@@ -35,18 +35,22 @@ pub enum ClientEvent {
     /// MCP operation failed and should be surfaced in the MCP config UI.
     McpOperationError { error: crate::agent::types::McpOperationError },
     /// A prompt turn completed successfully.
-    TurnComplete,
+    TurnComplete { terminal_reason: Option<crate::agent::types::TerminalReason> },
     /// `cancel` notification was accepted by the bridge.
     TurnCancelled,
     /// A prompt turn failed with an error.
-    TurnError(String),
+    TurnError { message: String, terminal_reason: Option<crate::agent::types::TerminalReason> },
     /// A prompt turn failed with bridge-provided classification metadata.
-    TurnErrorClassified { message: String, class: TurnErrorClass },
+    TurnErrorClassified {
+        message: String,
+        class: TurnErrorClass,
+        terminal_reason: Option<crate::agent::types::TerminalReason>,
+    },
     /// Background connection completed successfully.
     Connected {
         session_id: model::SessionId,
         cwd: String,
-        model_name: String,
+        current_model: model::CurrentModel,
         available_models: Vec<model::AvailableModel>,
         mode: Option<crate::app::ModeState>,
         history_updates: Vec<model::SessionUpdate>,
@@ -57,11 +61,15 @@ pub enum ClientEvent {
     AuthRequired { method_name: String, method_description: String },
     /// Slash-command execution failed with a user-facing error.
     SlashCommandError(String),
+    /// Session runtime plugin reload completed successfully.
+    RuntimeReloadCompleted { session_id: String },
+    /// Session runtime plugin reload failed after dispatch.
+    RuntimeReloadFailed { session_id: String, message: String },
     /// Custom slash command replaced the active session.
     SessionReplaced {
         session_id: model::SessionId,
         cwd: String,
-        model_name: String,
+        current_model: model::CurrentModel,
         available_models: Vec<model::AvailableModel>,
         mode: Option<crate::app::ModeState>,
         history_updates: Vec<model::SessionUpdate>,
@@ -78,6 +86,8 @@ pub enum ClientEvent {
     LogoutCompleted,
     /// Status snapshot received from bridge (account info).
     StatusSnapshotReceived { session_id: String, account: crate::agent::types::AccountInfo },
+    /// Session context window usage received from bridge.
+    ContextUsageReceived { session_id: String, percentage: Option<u8> },
     /// MCP server snapshot received from bridge.
     McpSnapshotReceived {
         session_id: String,

@@ -26,7 +26,8 @@ fn setup_permission(
     let (response_tx, response_rx) = oneshot::channel();
     let tool_call_update =
         model::ToolCallUpdate::new(tool_id.to_owned(), model::ToolCallUpdateFields::new());
-    let request = model::RequestPermissionRequest::new("test-session", tool_call_update, options);
+    let request =
+        model::RequestPermissionRequest::new("test-session", tool_call_update, options, None);
     send_client_event(app, ClientEvent::PermissionRequest { request, response_tx });
     response_rx
 }
@@ -79,7 +80,8 @@ async fn permission_for_unknown_tool_call_auto_rejects() {
     let tool_call_update =
         model::ToolCallUpdate::new("nonexistent", model::ToolCallUpdateFields::new());
     let options = allow_deny_options();
-    let request = model::RequestPermissionRequest::new("test-session", tool_call_update, options);
+    let request =
+        model::RequestPermissionRequest::new("test-session", tool_call_update, options, None);
     send_client_event(&mut app, ClientEvent::PermissionRequest { request, response_tx });
 
     // Should NOT be in pending queue
@@ -130,6 +132,7 @@ async fn duplicate_permission_request_is_rejected_without_duplicate_queue_entry(
         "test-session",
         tool_call_update,
         allow_deny_options(),
+        None,
     );
     send_client_event(&mut app, ClientEvent::PermissionRequest { request, response_tx });
 
@@ -186,7 +189,7 @@ async fn turn_complete_resets_transient_state() {
     app.files_accessed = 5;
     app.spinner_frame = 42;
 
-    send_client_event(&mut app, ClientEvent::TurnComplete);
+    send_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
     assert!(matches!(app.status, AppStatus::Ready));
     assert_eq!(app.files_accessed, 0, "files_accessed should reset");
@@ -207,7 +210,7 @@ async fn turn_complete_does_not_clear_messages() {
     );
     assert_eq!(app.messages.len(), 1);
 
-    send_client_event(&mut app, ClientEvent::TurnComplete);
+    send_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
     assert_eq!(app.messages.len(), 1, "messages should persist across turns");
 }
@@ -221,7 +224,7 @@ async fn turn_complete_does_not_clear_tool_call_index() {
     send_client_event(&mut app, ClientEvent::SessionUpdate(model::SessionUpdate::ToolCall(tc)));
     assert!(app.tool_call_index.contains_key("tc-persist"));
 
-    send_client_event(&mut app, ClientEvent::TurnComplete);
+    send_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
     assert!(
         app.tool_call_index.contains_key("tc-persist"),
@@ -241,7 +244,7 @@ async fn turn_complete_does_not_clear_todos() {
     }];
     app.show_todo_panel = true;
 
-    send_client_event(&mut app, ClientEvent::TurnComplete);
+    send_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
     assert_eq!(app.todos.len(), 1, "todos should persist across turns");
     assert!(app.show_todo_panel, "todo panel state should persist");
@@ -260,7 +263,7 @@ async fn turn_complete_does_not_affect_mode() {
         }],
     });
 
-    send_client_event(&mut app, ClientEvent::TurnComplete);
+    send_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
     assert!(app.mode.is_some(), "mode should persist across turns");
 }

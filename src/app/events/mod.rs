@@ -1,6 +1,7 @@
 // Copyright 2025 Simon Peter Rothgang
 // SPDX-License-Identifier: Apache-2.0
 
+mod api_retry;
 mod client;
 mod mouse;
 mod notices;
@@ -114,16 +115,6 @@ fn dispatch_mouse_by_view(app: &mut App, mouse: crossterm::event::MouseEvent) {
 fn dispatch_paste_by_view(app: &mut App, text: &str) -> bool {
     match app.active_view {
         ActiveView::Chat => {
-            if app
-                .pending_clipboard_paste_dedupe
-                .as_deref()
-                .is_some_and(|expected| expected == text)
-            {
-                app.pending_clipboard_paste_dedupe = None;
-                tracing::debug!("paste_event: suppressed duplicate clipboard text paste");
-                return true;
-            }
-            app.pending_clipboard_paste_dedupe = None;
             if !matches!(
                 app.status,
                 AppStatus::Connecting | AppStatus::CommandPending | AppStatus::Error
@@ -218,7 +209,7 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
         }
         model::SessionUpdate::ModeStateUpdate(mode) => {
             app.mode = Some(mode);
-            if matches!(app.pending_command_ack, Some(PendingCommandAck::CurrentModeUpdate)) {
+            if matches!(app.pending_command_ack, Some(PendingCommandAck::CurrentMode)) {
                 session::clear_pending_command(app);
             }
         }
@@ -233,9 +224,32 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
                     mode.current_mode_id = mode_id;
                 }
             }
-            if matches!(app.pending_command_ack, Some(PendingCommandAck::CurrentModeUpdate)) {
+            if matches!(app.pending_command_ack, Some(PendingCommandAck::CurrentMode)) {
                 session::clear_pending_command(app);
             }
+        }
+        model::SessionUpdate::CurrentModelUpdate(update) => {
+            let next_resolved_id = update.current_model.resolved_id.clone();
+            let next_display_short = update.current_model.display_name_short.clone();
+            let next_display_long = update.current_model.display_name_long.clone();
+            let pending_ack_before = format!("{:?}", app.pending_command_ack);
+            app.current_model = Some(update.current_model);
+            let clearing_pending =
+                matches!(app.pending_command_ack, Some(PendingCommandAck::CurrentModel));
+            if matches!(app.pending_command_ack, Some(PendingCommandAck::CurrentModel)) {
+                session::clear_pending_command(app);
+            }
+            tracing::debug!(
+                target: crate::logging::targets::APP_SESSION,
+                event_name = "current_model_update_applied",
+                message = "current model update applied",
+                outcome = "success",
+                resolved_id = %next_resolved_id,
+                display_name_short = %next_display_short,
+                display_name_long = %next_display_long,
+                clearing_pending = clearing_pending,
+                pending_ack_before = %pending_ack_before,
+            );
         }
         model::SessionUpdate::ConfigOptionUpdate(config) => {
             handle_config_option_update(app, config);
@@ -246,13 +260,42 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
         model::SessionUpdate::RateLimitUpdate(update) => {
             rate_limit::handle_rate_limit_update(app, &update);
         }
+        model::SessionUpdate::ApiRetryUpdate {
+            attempt,
+            max_retries,
+            retry_delay_ms,
+            error_status,
+            error,
+        } => {
+            api_retry::handle_api_retry_update(
+                app,
+                attempt,
+                max_retries,
+                retry_delay_ms,
+                error_status,
+                error,
+            );
+        }
+        model::SessionUpdate::PromptSuggestionUpdate(suggestion) => {
+            app.prompt_suggestion = (!suggestion.trim().is_empty()).then_some(suggestion);
+        }
+        model::SessionUpdate::RuntimeSessionStateUpdate(state) => {
+            handle_runtime_session_state_update(app, state);
+        }
+        model::SessionUpdate::SettingsParseError { file, path, message } => {
+            handle_settings_parse_error(app, file.as_deref(), &path, &message);
+        }
         model::SessionUpdate::SessionStatusUpdate(status) => {
             // TODO(runtime-verification): confirm in real SDK sessions that compaction
             // status updates are emitted consistently; if not, add a fallback indicator.
+            let was_compacting = app.is_compacting;
             if matches!(status, model::SessionStatus::Compacting) {
                 app.is_compacting = true;
             } else {
                 clear_compaction_state(app, true);
+            }
+            if was_compacting && matches!(status, model::SessionStatus::Idle) {
+                crate::app::session_runtime::request_context_usage_refresh(app);
             }
             tracing::debug!(
                 target: crate::logging::targets::APP_SESSION,
@@ -267,6 +310,42 @@ fn handle_session_update(app: &mut App, update: model::SessionUpdate) {
             rate_limit::handle_compaction_boundary_update(app, boundary);
         }
     }
+}
+
+fn handle_runtime_session_state_update(app: &mut App, state: model::RuntimeSessionState) {
+    app.runtime_session_state = Some(state);
+    match state {
+        model::RuntimeSessionState::Running => {
+            if matches!(app.status, AppStatus::Ready | AppStatus::Thinking | AppStatus::Running)
+                && !app.is_compacting
+            {
+                app.status = AppStatus::Running;
+            }
+        }
+        model::RuntimeSessionState::RequiresAction => {}
+        model::RuntimeSessionState::Idle => {
+            if matches!(app.status, AppStatus::Thinking | AppStatus::Running)
+                && !app.is_compacting
+                && app.pending_cancel_origin.is_none()
+            {
+                app.status = AppStatus::Ready;
+            }
+        }
+    }
+}
+
+fn handle_settings_parse_error(app: &mut App, file: Option<&str>, path: &str, message: &str) {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let rendered = match (file.filter(|value| !value.trim().is_empty()), path.trim()) {
+        (Some(file), "") => format!("Settings parse error in {file}: {trimmed}"),
+        (Some(file), path) => format!("Settings parse error in {file} at {path}: {trimmed}"),
+        (None, "") => format!("Settings parse error: {trimmed}"),
+        (None, path) => format!("Settings parse error at {path}: {trimmed}"),
+    };
+    push_system_message_with_severity(app, Some(SystemSeverity::Error), &rendered);
 }
 
 pub(crate) fn push_system_message_with_severity(
@@ -302,8 +381,6 @@ pub(super) fn clear_compaction_state(app: &mut App, emit_manual_success: bool) {
 fn handle_config_option_update(app: &mut App, config: model::ConfigOptionUpdate) {
     let option_id = config.option_id;
     let value = config.value;
-    let model_name =
-        if option_id == "model" { value.as_str().map(ToOwned::to_owned) } else { None };
     let value_kind = match &value {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "bool",
@@ -322,23 +399,9 @@ fn handle_config_option_update(app: &mut App, config: model::ConfigOptionUpdate)
         value_kind,
     );
 
-    if let Some(model_name) = model_name {
-        app.model_name = model_name;
-        app.update_welcome_model_once();
-    } else if option_id == "model" {
-        tracing::warn!(
-            target: crate::logging::targets::APP_CONFIG,
-            event_name = "config_option_update_rejected",
-            message = "config option update carried an invalid model value",
-            outcome = "failure",
-            option_id = "model",
-            value_kind,
-        );
-    }
-
     if matches!(
         app.pending_command_ack.as_ref(),
-        Some(PendingCommandAck::ConfigOptionUpdate { option_id: expected }) if expected == &option_id
+        Some(PendingCommandAck::ConfigOption { option_id: expected }) if expected == &option_id
     ) {
         session::clear_pending_command(app);
     }
@@ -394,6 +457,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status,
             content: vec![],
             hidden: false,
@@ -452,26 +516,39 @@ mod tests {
     }
 
     #[test]
-    fn register_tool_call_scope_treats_agent_as_task_scope() {
+    fn register_tool_call_scope_treats_agent_as_subagent_root() {
         let mut app = make_test_app();
-        let scope = tool_calls::register_tool_call_scope(&mut app, "tool-agent", "Agent");
-        assert_eq!(scope, ToolCallScope::Task);
-        assert!(app.active_task_ids.contains("tool-agent"));
+        let scope = tool_calls::register_tool_call_scope(&mut app, "tool-agent", "Agent", None);
+        assert_eq!(scope, ToolCallScope::SubagentRoot);
     }
 
     #[test]
-    fn register_tool_call_scope_treats_task_as_task_scope() {
+    fn register_tool_call_scope_treats_task_as_subagent_root() {
         let mut app = make_test_app();
-        let scope = tool_calls::register_tool_call_scope(&mut app, "tool-task", "Task");
-        assert_eq!(scope, ToolCallScope::Task);
-        assert!(app.active_task_ids.contains("tool-task"));
+        let scope = tool_calls::register_tool_call_scope(&mut app, "tool-task", "Task", None);
+        assert_eq!(scope, ToolCallScope::SubagentRoot);
+    }
+
+    #[test]
+    fn register_tool_call_scope_uses_explicit_parent_for_subagent_child() {
+        let mut app = make_test_app();
+        let scope = tool_calls::register_tool_call_scope(
+            &mut app,
+            "tool-child",
+            "Bash",
+            Some("tool-parent"),
+        );
+        assert_eq!(
+            scope,
+            ToolCallScope::SubagentChild { parent_tool_use_id: "tool-parent".to_owned() }
+        );
     }
 
     /// Regression: when a Task was cancelled mid-turn, `active_task_ids` was never cleared
     /// because `finalize_in_progress_tool_calls` doesn't call `remove_active_task` and
     /// `clear_tool_scope_tracking` (called on `TurnComplete`) did not clear `active_task_ids`.
     /// The leaked ID caused main-agent tools on the next turn to be classified as Subagent,
-    /// which eventually triggered the subagent thinking indicator spuriously.
+    /// which eventually caused main-agent tools to inherit the wrong scope.
     #[test]
     fn turn_complete_after_cancelled_task_leaves_no_stale_active_task_ids() {
         let mut app = make_test_app();
@@ -489,12 +566,10 @@ mod tests {
 
         // User cancels then TurnComplete finalizes the turn
         handle_client_event(&mut app, ClientEvent::TurnCancelled);
-        handle_client_event(&mut app, ClientEvent::TurnComplete);
+        handle_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
         // Stale task ID must be gone after turn boundary
         assert!(app.active_task_ids.is_empty(), "stale task id must not survive TurnComplete");
-        assert!(app.active_subagent_tool_ids.is_empty());
-        assert!(app.subagent_idle_since.is_none());
 
         // Next turn: a normal main-agent Glob must get MainAgent scope, not Subagent
         let glob_tc = model::ToolCall::new("glob-1", "Glob **/*.rs")
@@ -509,10 +584,6 @@ mod tests {
             app.tool_call_scope("glob-1"),
             Some(ToolCallScope::MainAgent),
             "main-agent tool must not be misclassified as Subagent after stale task is cleared"
-        );
-        assert!(
-            app.active_subagent_tool_ids.is_empty(),
-            "main-agent tool must not enter subagent tracking"
         );
     }
 
@@ -750,11 +821,17 @@ mod tests {
         App::test_default()
     }
 
+    fn test_current_model(model_name: &str) -> model::CurrentModel {
+        let (short, long) =
+            if model_name == "default" { ("Default", "Default") } else { (model_name, model_name) };
+        model::CurrentModel::new(model_name, short, long).authoritative(model_name != "default")
+    }
+
     fn connected_event(model_name: &str) -> ClientEvent {
         ClientEvent::Connected {
             session_id: model::SessionId::new("test-session"),
             cwd: "/test".into(),
-            model_name: model_name.to_owned(),
+            current_model: test_current_model(model_name),
             available_models: Vec::new(),
             mode: None,
             history_updates: Vec::new(),
@@ -882,14 +959,17 @@ mod tests {
     }
 
     #[test]
-    fn late_tool_update_for_removed_tool_does_not_corrupt_active_subagent_set() {
+    fn late_tool_update_for_removed_tool_does_not_corrupt_active_task_set() {
         let mut app = make_test_app();
         app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tool_call(
             "tool-stale",
             model::ToolCallStatus::Completed,
         )))]));
         app.index_tool_call("tool-stale".into(), 0, 0);
-        app.register_tool_call_scope("tool-stale".into(), ToolCallScope::Subagent);
+        app.register_tool_call_scope(
+            "tool-stale".into(),
+            ToolCallScope::SubagentChild { parent_tool_use_id: "task-1".to_owned() },
+        );
 
         let removed = app.remove_message_tracked(0);
         assert!(removed.is_some());
@@ -904,7 +984,6 @@ mod tests {
             ClientEvent::SessionUpdate(model::SessionUpdate::ToolCallUpdate(update)),
         );
 
-        assert!(app.active_subagent_tool_ids.is_empty());
         assert!(app.active_task_ids.is_empty());
     }
 
@@ -1254,7 +1333,7 @@ mod tests {
         handle_client_event(&mut app, ClientEvent::TurnCancelled);
         assert!(app.cancelled_turn_pending_hint);
 
-        handle_client_event(&mut app, ClientEvent::TurnComplete);
+        handle_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
         assert!(!app.cancelled_turn_pending_hint);
         let last = app.messages.last().expect("expected interruption hint message");
@@ -1275,7 +1354,7 @@ mod tests {
         ))]));
         app.pending_cancel_origin = Some(CancelOrigin::Manual);
 
-        handle_client_event(&mut app, ClientEvent::TurnComplete);
+        handle_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
         assert!(matches!(app.status, AppStatus::Ready));
         assert!(!app.viewport.message_height_is_current(1));
@@ -1295,7 +1374,7 @@ mod tests {
         ))]));
         app.pending_cancel_origin = Some(CancelOrigin::AutoQueue);
 
-        handle_client_event(&mut app, ClientEvent::TurnComplete);
+        handle_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
         assert!(matches!(app.status, AppStatus::Ready));
         assert!(!app.viewport.message_height_is_current(1));
@@ -1306,10 +1385,13 @@ mod tests {
     }
 
     #[test]
-    fn connected_updates_welcome_model_while_pristine() {
+    fn connected_updates_welcome_session_id_while_pristine() {
         let mut app = make_test_app();
-        app.welcome_model_resolved = false;
-        app.messages.push(ChatMessage::welcome("Connecting...", "/test"));
+        app.messages.push(ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/test", "-"));
+        let Some(MessageBlock::Welcome(welcome)) = app.messages[0].blocks.first_mut() else {
+            panic!("expected welcome block");
+        };
+        welcome.tip_seed = 7;
 
         handle_client_event(&mut app, connected_event("claude-updated"));
 
@@ -1319,14 +1401,14 @@ mod tests {
         let Some(MessageBlock::Welcome(welcome)) = first.blocks.first() else {
             panic!("expected welcome block");
         };
-        assert_eq!(welcome.model_name, "claude-updated");
+        assert_eq!(welcome.session_id, "test-session");
+        assert_eq!(welcome.tip_seed, 7);
     }
 
     #[test]
-    fn connected_updates_welcome_to_default_for_provisional_default_model() {
+    fn connected_keeps_subscription_placeholder_until_status_snapshot_arrives() {
         let mut app = make_test_app();
-        app.welcome_model_resolved = false;
-        app.messages.push(ChatMessage::welcome("Connecting...", "/test"));
+        app.messages.push(ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "old", "/test", "old"));
 
         handle_client_event(&mut app, connected_event("default"));
 
@@ -1336,8 +1418,7 @@ mod tests {
         let Some(MessageBlock::Welcome(welcome)) = first.blocks.first() else {
             panic!("expected welcome block");
         };
-        assert_eq!(welcome.model_name, "default");
-        assert!(!app.welcome_model_resolved);
+        assert_eq!(welcome.subscription, "-");
     }
 
     #[test]
@@ -1370,8 +1451,7 @@ mod tests {
     #[test]
     fn connected_updates_cwd_and_clears_resuming_marker() {
         let mut app = make_test_app();
-        app.welcome_model_resolved = false;
-        app.messages.push(ChatMessage::welcome("Connecting...", "/test"));
+        app.messages.push(ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/test", "-"));
         app.resuming_session_id = Some("resume-123".into());
 
         handle_client_event(
@@ -1379,7 +1459,7 @@ mod tests {
             ClientEvent::Connected {
                 session_id: model::SessionId::new("session-cwd"),
                 cwd: "/changed".into(),
-                model_name: "claude-updated".into(),
+                current_model: test_current_model("claude-updated"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
@@ -1411,7 +1491,7 @@ mod tests {
             ClientEvent::Connected {
                 session_id: model::SessionId::new("session-trust"),
                 cwd: "/untrusted".into(),
-                model_name: "claude-updated".into(),
+                current_model: test_current_model("claude-updated"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
@@ -1428,8 +1508,11 @@ mod tests {
     #[test]
     fn connected_updates_welcome_once_even_after_chat_started() {
         let mut app = make_test_app();
-        app.welcome_model_resolved = false;
-        app.messages.push(ChatMessage::welcome("Connecting...", "/test"));
+        app.messages.push(ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/test", "-"));
+        let Some(MessageBlock::Welcome(welcome)) = app.messages[0].blocks.first_mut() else {
+            panic!("expected welcome block");
+        };
+        welcome.tip_seed = 11;
         app.messages.push(user_msg("hello"));
 
         handle_client_event(&mut app, connected_event("claude-updated"));
@@ -1440,46 +1523,40 @@ mod tests {
         let Some(MessageBlock::Welcome(welcome)) = first.blocks.first() else {
             panic!("expected welcome block");
         };
-        assert_eq!(welcome.model_name, "claude-updated");
-        assert!(app.welcome_model_resolved);
+        assert_eq!(welcome.session_id, "test-session");
+        assert_eq!(welcome.tip_seed, 11);
     }
 
     #[test]
-    fn persisted_model_change_reopens_welcome_model_reconciliation() {
+    fn current_model_update_does_not_mutate_welcome_snapshot_after_settings_reconcile() {
         let mut app = make_test_app();
         app.session_id = Some(model::SessionId::new("session-1"));
-        app.model_name = "default".into();
-        app.messages = vec![ChatMessage::welcome("default", "/test")];
+        app.current_model = Some(test_current_model("default"));
+        app.messages =
+            vec![ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/test", "session-1")];
         crate::app::config::store::set_model(
             &mut app.config.committed_settings_document,
             Some("default"),
         );
-
-        app.update_welcome_model_once();
-        assert!(app.welcome_model_resolved);
 
         crate::app::config::store::set_model(
             &mut app.config.committed_settings_document,
             Some("haiku"),
         );
         app.reconcile_runtime_from_persisted_settings_change();
-        assert!(!app.welcome_model_resolved);
 
         handle_client_event(
             &mut app,
-            ClientEvent::SessionUpdate(model::SessionUpdate::ConfigOptionUpdate(
-                model::ConfigOptionUpdate {
-                    option_id: "model".into(),
-                    value: serde_json::Value::String("claude-opus-4-6".into()),
-                },
+            ClientEvent::SessionUpdate(model::SessionUpdate::CurrentModelUpdate(
+                model::CurrentModelUpdate::new(test_current_model("claude-opus-4-6")),
             )),
         );
 
         let Some(MessageBlock::Welcome(welcome)) = app.messages[0].blocks.first() else {
             panic!("expected welcome block");
         };
-        assert_eq!(welcome.model_name, "claude-opus-4-6");
-        assert!(app.welcome_model_resolved);
+        assert_eq!(welcome.session_id, "session-1");
+        assert_eq!(welcome.subscription, "-");
     }
 
     #[test]
@@ -1503,6 +1580,7 @@ mod tests {
             subscription_type: None,
             token_source: None,
             api_key_source: None,
+            api_provider: None,
         });
         app.plugins.installed.push(crate::app::plugins::InstalledPluginEntry {
             id: "old-plugin".into(),
@@ -1535,20 +1613,16 @@ mod tests {
     }
 
     #[test]
-    fn model_config_update_resolves_welcome_once_after_provisional_default() {
+    fn current_model_update_leaves_existing_welcome_snapshot_unchanged() {
         let mut app = make_test_app();
-        app.model_name = "default".into();
-        app.welcome_model_resolved = false;
-        app.messages.push(ChatMessage::welcome("Connecting...", "/test"));
+        app.current_model = Some(test_current_model("default"));
+        app.messages.push(ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/test", "-"));
         app.messages.push(user_msg("hello"));
 
         handle_client_event(
             &mut app,
-            ClientEvent::SessionUpdate(model::SessionUpdate::ConfigOptionUpdate(
-                model::ConfigOptionUpdate {
-                    option_id: "model".into(),
-                    value: serde_json::Value::String("claude-opus-4-6".into()),
-                },
+            ClientEvent::SessionUpdate(model::SessionUpdate::CurrentModelUpdate(
+                model::CurrentModelUpdate::new(test_current_model("claude-opus-4-6")),
             )),
         );
 
@@ -1558,16 +1632,12 @@ mod tests {
         let Some(MessageBlock::Welcome(welcome)) = first.blocks.first() else {
             panic!("expected welcome block");
         };
-        assert_eq!(welcome.model_name, "claude-opus-4-6");
-        assert!(app.welcome_model_resolved);
+        assert_eq!(welcome.session_id, "-");
 
         handle_client_event(
             &mut app,
-            ClientEvent::SessionUpdate(model::SessionUpdate::ConfigOptionUpdate(
-                model::ConfigOptionUpdate {
-                    option_id: "model".into(),
-                    value: serde_json::Value::String("claude-sonnet-4-5".into()),
-                },
+            ClientEvent::SessionUpdate(model::SessionUpdate::CurrentModelUpdate(
+                model::CurrentModelUpdate::new(test_current_model("claude-sonnet-4-5")),
             )),
         );
 
@@ -1577,7 +1647,7 @@ mod tests {
         let Some(MessageBlock::Welcome(welcome)) = first.blocks.first() else {
             panic!("expected welcome block");
         };
-        assert_eq!(welcome.model_name, "claude-opus-4-6");
+        assert_eq!(welcome.session_id, "-");
     }
 
     #[test]
@@ -1664,6 +1734,11 @@ mod tests {
     #[test]
     fn session_replaced_resets_chat_and_transient_state() {
         let mut app = make_test_app();
+        app.messages.push(ChatMessage::welcome(env!("CARGO_PKG_VERSION"), "-", "/test", "-"));
+        let Some(MessageBlock::Welcome(welcome)) = app.messages[0].blocks.first_mut() else {
+            panic!("expected welcome block");
+        };
+        welcome.tip_seed = 5;
         app.messages.push(user_msg("hello"));
         app.messages
             .push(assistant_msg(vec![MessageBlock::Text(TextBlock::from_complete("world"))]));
@@ -1693,7 +1768,7 @@ mod tests {
             ClientEvent::SessionReplaced {
                 session_id: model::SessionId::new("replacement"),
                 cwd: "/replacement".into(),
-                model_name: "new-model".into(),
+                current_model: test_current_model("new-model"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
@@ -1705,7 +1780,10 @@ mod tests {
             app.session_id.as_ref().map(ToString::to_string).as_deref(),
             Some("replacement")
         );
-        assert_eq!(app.model_name, "new-model");
+        assert_eq!(
+            app.current_model.as_ref().map(|model| model.resolved_id.as_str()),
+            Some("new-model")
+        );
         assert_eq!(app.messages.len(), 1);
         assert!(matches!(app.messages[0].role, MessageRole::Welcome));
         assert_eq!(app.files_accessed, 0);
@@ -1720,6 +1798,7 @@ mod tests {
             panic!("expected welcome block");
         };
         assert_eq!(welcome.cwd, "/replacement");
+        assert_ne!(welcome.tip_seed, 5);
     }
 
     #[test]
@@ -1741,7 +1820,7 @@ mod tests {
             ClientEvent::SessionReplaced {
                 session_id: model::SessionId::new("replacement"),
                 cwd: "/replacement".into(),
-                model_name: "new-model".into(),
+                current_model: test_current_model("new-model"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
@@ -1760,24 +1839,22 @@ mod tests {
     }
 
     #[test]
-    fn connected_requests_status_snapshot_when_status_tab_is_open() {
+    fn connected_requests_status_snapshot_on_connect() {
         let (mut app, mut rx) = app_with_bridge_connection();
-        app.active_view = ActiveView::Config;
-        app.config.active_tab = crate::app::config::ConfigTab::Status;
 
         handle_client_event(&mut app, connected_event("claude-updated"));
 
-        let status = rx.try_recv().expect("status snapshot command");
-        assert_eq!(
-            status.command,
-            crate::agent::wire::BridgeCommand::GetStatusSnapshot {
-                session_id: "test-session".to_owned(),
-            }
-        );
         let mcp = rx.try_recv().expect("mcp snapshot command");
         assert_eq!(
             mcp.command,
             crate::agent::wire::BridgeCommand::GetMcpSnapshot {
+                session_id: "test-session".to_owned(),
+            }
+        );
+        let status = rx.try_recv().expect("status snapshot command");
+        assert_eq!(
+            status.command,
+            crate::agent::wire::BridgeCommand::GetStatusSnapshot {
                 session_id: "test-session".to_owned(),
             }
         );
@@ -1813,11 +1890,44 @@ mod tests {
                     subscription_type: None,
                     token_source: None,
                     api_key_source: None,
+                    api_provider: None,
                 },
             },
         );
 
         assert!(app.account_info.is_none());
+    }
+
+    #[test]
+    fn status_snapshot_updates_welcome_subscription() {
+        let mut app = make_test_app();
+        app.messages.push(ChatMessage::welcome(
+            env!("CARGO_PKG_VERSION"),
+            "-",
+            "/test",
+            "session-1",
+        ));
+        app.session_id = Some(model::SessionId::new("session-1"));
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::StatusSnapshotReceived {
+                session_id: "session-1".into(),
+                account: crate::agent::types::AccountInfo {
+                    email: None,
+                    organization: None,
+                    subscription_type: Some("Claude Max".into()),
+                    token_source: None,
+                    api_key_source: None,
+                    api_provider: None,
+                },
+            },
+        );
+
+        let Some(MessageBlock::Welcome(welcome)) = app.messages[0].blocks.first() else {
+            panic!("expected welcome block");
+        };
+        assert_eq!(welcome.subscription, "Claude Max");
     }
 
     #[test]
@@ -2137,7 +2247,7 @@ mod tests {
         let mut app = make_test_app();
         app.status = AppStatus::CommandPending;
         app.pending_command_label = Some("Switching mode...".into());
-        app.pending_command_ack = Some(PendingCommandAck::CurrentModeUpdate);
+        app.pending_command_ack = Some(PendingCommandAck::CurrentMode);
         app.mode = Some(crate::app::ModeState {
             current_mode_id: "code".to_owned(),
             current_mode_name: "Code".to_owned(),
@@ -2163,29 +2273,24 @@ mod tests {
     }
 
     #[test]
-    fn model_config_option_update_updates_state_and_clears_pending_when_expected() {
+    fn current_model_update_updates_state_and_clears_pending_when_expected() {
         let mut app = make_test_app();
         app.status = AppStatus::CommandPending;
         app.pending_command_label = Some("Switching model...".into());
-        app.pending_command_ack =
-            Some(PendingCommandAck::ConfigOptionUpdate { option_id: "model".to_owned() });
-        app.model_name = "old-model".to_owned();
+        app.pending_command_ack = Some(PendingCommandAck::CurrentModel);
+        app.current_model = Some(test_current_model("old-model"));
 
         handle_client_event(
             &mut app,
-            ClientEvent::SessionUpdate(model::SessionUpdate::ConfigOptionUpdate(
-                model::ConfigOptionUpdate {
-                    option_id: "model".to_owned(),
-                    value: serde_json::Value::String("sonnet".to_owned()),
-                },
+            ClientEvent::SessionUpdate(model::SessionUpdate::CurrentModelUpdate(
+                model::CurrentModelUpdate::new(test_current_model("sonnet")),
             )),
         );
 
         assert!(matches!(app.status, AppStatus::Ready));
-        assert_eq!(app.model_name, "sonnet");
         assert_eq!(
-            app.config_options.get("model"),
-            Some(&serde_json::Value::String("sonnet".to_owned()))
+            app.current_model.as_ref().map(|model| model.resolved_id.as_str()),
+            Some("sonnet")
         );
         assert!(app.pending_command_label.is_none());
         assert!(app.pending_command_ack.is_none());
@@ -2197,7 +2302,7 @@ mod tests {
         app.status = AppStatus::CommandPending;
         app.pending_command_label = Some("Switching model...".into());
         app.pending_command_ack =
-            Some(PendingCommandAck::ConfigOptionUpdate { option_id: "model".to_owned() });
+            Some(PendingCommandAck::ConfigOption { option_id: "model".to_owned() });
 
         handle_client_event(
             &mut app,
@@ -2214,7 +2319,7 @@ mod tests {
         assert_eq!(app.pending_command_label.as_deref(), Some("Switching model..."));
         assert!(matches!(
             app.pending_command_ack.as_ref(),
-            Some(PendingCommandAck::ConfigOptionUpdate { option_id }) if option_id == "model"
+            Some(PendingCommandAck::ConfigOption { option_id }) if option_id == "model"
         ));
     }
 
@@ -2228,7 +2333,7 @@ mod tests {
             ClientEvent::SessionReplaced {
                 session_id: model::SessionId::new("active-456"),
                 cwd: "/replacement".into(),
-                model_name: "new-model".into(),
+                current_model: test_current_model("new-model"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
@@ -2258,7 +2363,7 @@ mod tests {
             ClientEvent::SessionReplaced {
                 session_id: model::SessionId::new("active-456"),
                 cwd: "/replacement".into(),
-                model_name: "new-model".into(),
+                current_model: test_current_model("new-model"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates,
@@ -2277,6 +2382,59 @@ mod tests {
     }
 
     #[test]
+    fn resume_history_preserves_turn_order_between_user_and_assistant_messages() {
+        let mut app = make_test_app();
+        let history_updates = vec![
+            model::SessionUpdate::UserMessageChunk(model::ContentChunk::new(
+                model::ContentBlock::Text(model::TextContent::new("first user")),
+            )),
+            model::SessionUpdate::AgentMessageChunk(model::ContentChunk::new(
+                model::ContentBlock::Text(model::TextContent::new("first assistant")),
+            )),
+            model::SessionUpdate::UserMessageChunk(model::ContentChunk::new(
+                model::ContentBlock::Text(model::TextContent::new("second user")),
+            )),
+            model::SessionUpdate::AgentMessageChunk(model::ContentChunk::new(
+                model::ContentBlock::Text(model::TextContent::new("second assistant")),
+            )),
+        ];
+
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionReplaced {
+                session_id: model::SessionId::new("active-457"),
+                cwd: "/replacement".into(),
+                current_model: test_current_model("new-model"),
+                available_models: Vec::new(),
+                mode: None,
+                history_updates,
+            },
+        );
+
+        let rendered: Vec<(MessageRole, String)> = app
+            .messages
+            .iter()
+            .filter_map(|message| {
+                let text = message.blocks.iter().find_map(|block| match block {
+                    MessageBlock::Text(block) => Some(block.text.clone()),
+                    _ => None,
+                })?;
+                Some((message.role.clone(), text))
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                (MessageRole::User, "first user".to_owned()),
+                (MessageRole::Assistant, "first assistant".to_owned()),
+                (MessageRole::User, "second user".to_owned()),
+                (MessageRole::Assistant, "second assistant".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn resume_history_forces_open_tool_calls_to_failed() {
         let mut app = make_test_app();
         let open_tool = model::ToolCall::new("resume-open", "Execute command")
@@ -2288,7 +2446,7 @@ mod tests {
             ClientEvent::SessionReplaced {
                 session_id: model::SessionId::new("active-789"),
                 cwd: "/replacement".into(),
-                model_name: "new-model".into(),
+                current_model: test_current_model("new-model"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: vec![model::SessionUpdate::ToolCall(open_tool)],
@@ -2314,7 +2472,7 @@ mod tests {
             ClientEvent::SessionReplaced {
                 session_id: model::SessionId::new("active-790"),
                 cwd: "/replacement".into(),
-                model_name: "new-model".into(),
+                current_model: test_current_model("new-model"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: vec![model::SessionUpdate::AgentMessageChunk(
@@ -2341,7 +2499,7 @@ mod tests {
             ClientEvent::SessionReplaced {
                 session_id: model::SessionId::new("active-791"),
                 cwd: "/replacement".into(),
-                model_name: "new-model".into(),
+                current_model: test_current_model("new-model"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: vec![model::SessionUpdate::ToolCall(task_tool)],
@@ -2349,14 +2507,13 @@ mod tests {
         );
 
         assert!(app.active_task_ids.is_empty());
-        assert!(app.active_subagent_tool_ids.is_empty());
         assert_eq!(app.tool_call_scope("resume-task"), None);
     }
 
     #[test]
     fn turn_complete_without_cancel_does_not_render_interrupted_hint() {
         let mut app = make_test_app();
-        handle_client_event(&mut app, ClientEvent::TurnComplete);
+        handle_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
         assert!(app.messages.is_empty());
     }
 
@@ -2378,7 +2535,7 @@ mod tests {
         );
         assert!(app.pending_compact_clear);
 
-        handle_client_event(&mut app, ClientEvent::TurnComplete);
+        handle_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
         assert!(!app.pending_compact_clear);
         assert_eq!(app.messages.len(), 3);
@@ -2442,7 +2599,10 @@ mod tests {
         app.pending_compact_clear = true;
         app.messages.push(user_msg("/compact"));
 
-        handle_client_event(&mut app, ClientEvent::TurnError("adapter failed".into()));
+        handle_client_event(
+            &mut app,
+            ClientEvent::TurnError { message: "adapter failed".into(), terminal_reason: None },
+        );
 
         assert!(!app.pending_compact_clear);
         assert!(matches!(app.status, AppStatus::Error));
@@ -2489,7 +2649,10 @@ mod tests {
         app.is_compacting = true;
 
         handle_client_event(&mut app, ClientEvent::TurnCancelled);
-        handle_client_event(&mut app, ClientEvent::TurnError("cancelled".into()));
+        handle_client_event(
+            &mut app,
+            ClientEvent::TurnError { message: "cancelled".into(), terminal_reason: None },
+        );
 
         assert_eq!(app.messages.len(), 3);
         assert!(matches!(app.messages[1].role, MessageRole::System(Some(SystemSeverity::Info))));
@@ -2509,7 +2672,10 @@ mod tests {
 
         handle_client_event(
             &mut app,
-            ClientEvent::TurnError("HTTP 429 Too Many Requests: max turns exceeded".into()),
+            ClientEvent::TurnError {
+                message: "HTTP 429 Too Many Requests: max turns exceeded".into(),
+                terminal_reason: None,
+            },
         );
 
         assert!(matches!(app.status, AppStatus::Error));
@@ -2533,6 +2699,7 @@ mod tests {
             ClientEvent::TurnErrorClassified {
                 message: "turn failed".into(),
                 class: TurnErrorClass::PlanLimit,
+                terminal_reason: None,
             },
         );
 
@@ -2556,6 +2723,7 @@ mod tests {
             ClientEvent::TurnErrorClassified {
                 message: "auth required".into(),
                 class: TurnErrorClass::AuthRequired,
+                terminal_reason: None,
             },
         );
 
@@ -2571,13 +2739,15 @@ mod tests {
             "task-1",
             model::ToolCallStatus::InProgress,
         )))]));
-        app.register_tool_call_scope("task-1".into(), ToolCallScope::Task);
+        app.register_tool_call_scope("task-1".into(), ToolCallScope::SubagentRoot);
         app.insert_active_task("task-1".into());
 
-        handle_client_event(&mut app, ClientEvent::TurnError("boom".into()));
+        handle_client_event(
+            &mut app,
+            ClientEvent::TurnError { message: "boom".into(), terminal_reason: None },
+        );
 
         assert!(app.active_task_ids.is_empty());
-        assert!(app.active_subagent_tool_ids.is_empty());
         assert_eq!(app.tool_call_scope("task-1"), None);
     }
 
@@ -2586,7 +2756,7 @@ mod tests {
         let mut app = make_test_app();
         app.status = AppStatus::Running;
         app.session_id = Some(model::SessionId::new("session-auth"));
-        app.model_name = "claude-old".into();
+        app.current_model = Some(test_current_model("claude-old"));
         app.mode = Some(crate::app::ModeState {
             current_mode_id: "plan".into(),
             current_mode_name: "Plan".into(),
@@ -2598,7 +2768,7 @@ mod tests {
             model::ToolCallStatus::InProgress,
         )))]));
         app.bind_active_turn_assistant(0);
-        app.register_tool_call_scope("task-1".into(), ToolCallScope::Task);
+        app.register_tool_call_scope("task-1".into(), ToolCallScope::SubagentRoot);
         app.insert_active_task("task-1".into());
         app.pending_interaction_ids.push("task-1".into());
         app.claim_focus_target(FocusTarget::Permission);
@@ -2620,7 +2790,7 @@ mod tests {
         };
         assert_eq!(tc.status, model::ToolCallStatus::Failed);
         assert!(app.session_id.is_none());
-        assert_eq!(app.model_name, "Connecting...");
+        assert!(app.current_model.is_none());
         assert!(app.mode.is_none());
         assert_eq!(app.fast_mode_state, model::FastModeState::Off);
     }
@@ -2629,7 +2799,7 @@ mod tests {
     fn logout_completed_clears_session_runtime_identity_caches() {
         let mut app = make_test_app();
         app.session_id = Some(model::SessionId::new("session-x"));
-        app.model_name = "claude-old".into();
+        app.current_model = Some(test_current_model("claude-old"));
         app.mode = Some(crate::app::ModeState {
             current_mode_id: "plan".into(),
             current_mode_name: "Plan".into(),
@@ -2640,7 +2810,7 @@ mod tests {
         handle_client_event(&mut app, ClientEvent::LogoutCompleted);
 
         assert!(app.session_id.is_none());
-        assert_eq!(app.model_name, "Connecting...");
+        assert!(app.current_model.is_none());
         assert!(app.mode.is_none());
         assert_eq!(app.fast_mode_state, model::FastModeState::Off);
     }
@@ -2668,7 +2838,7 @@ mod tests {
             model::ToolCallStatus::InProgress,
         )))]));
         app.bind_active_turn_assistant(0);
-        app.register_tool_call_scope("task-1".into(), ToolCallScope::Task);
+        app.register_tool_call_scope("task-1".into(), ToolCallScope::SubagentRoot);
         app.insert_active_task("task-1".into());
 
         handle_client_event(&mut app, ClientEvent::ConnectionFailed("bridge down".into()));
@@ -2690,7 +2860,7 @@ mod tests {
             model::ToolCallStatus::InProgress,
         )))]));
         app.bind_active_turn_assistant(0);
-        app.register_tool_call_scope("task-1".into(), ToolCallScope::Task);
+        app.register_tool_call_scope("task-1".into(), ToolCallScope::SubagentRoot);
         app.insert_active_task("task-1".into());
 
         handle_client_event(
@@ -2853,6 +3023,7 @@ mod tests {
             ClientEvent::TurnErrorClassified {
                 message: "HTTP 429 Too Many Requests".to_owned(),
                 class: TurnErrorClass::PlanLimit,
+                terminal_reason: None,
             },
         );
 
@@ -2892,6 +3063,7 @@ mod tests {
             ClientEvent::TurnErrorClassified {
                 message: "HTTP 429 Too Many Requests".to_owned(),
                 class: TurnErrorClass::PlanLimit,
+                terminal_reason: None,
             },
         );
         assert_eq!(app.messages.len(), 2);
@@ -2960,7 +3132,7 @@ mod tests {
         );
 
         assert_eq!(app.turn_notice_refs.len(), 1);
-        handle_client_event(&mut app, ClientEvent::TurnComplete);
+        handle_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
         assert!(app.turn_notice_refs.is_empty());
 
         app.status = AppStatus::Thinking;
@@ -2990,7 +3162,7 @@ mod tests {
             ClientEvent::Connected {
                 session_id: model::SessionId::new("new-session"),
                 cwd: "/test".into(),
-                model_name: "claude".into(),
+                current_model: test_current_model("claude"),
                 available_models: Vec::new(),
                 mode: None,
                 history_updates: Vec::new(),
@@ -3009,7 +3181,10 @@ mod tests {
 
         handle_client_event(
             &mut app,
-            ClientEvent::TurnError("Error: Request was aborted.\n    at stack line".into()),
+            ClientEvent::TurnError {
+                message: "Error: Request was aborted.\n    at stack line".into(),
+                terminal_reason: None,
+            },
         );
 
         assert!(!app.cancelled_turn_pending_hint);
@@ -3037,7 +3212,10 @@ mod tests {
 
         handle_client_event(
             &mut app,
-            ClientEvent::TurnError("Error: Request was aborted.\n    at stack line".into()),
+            ClientEvent::TurnError {
+                message: "Error: Request was aborted.\n    at stack line".into(),
+                terminal_reason: None,
+            },
         );
 
         assert!(matches!(app.status, AppStatus::Ready));
@@ -3089,7 +3267,7 @@ mod tests {
             MessageBlock::ToolCall(Box::new(tool_call("tc2", model::ToolCallStatus::Pending))),
         ]));
 
-        handle_client_event(&mut app, ClientEvent::TurnComplete);
+        handle_client_event(&mut app, ClientEvent::TurnComplete { terminal_reason: None });
 
         let Some(last) = app.messages.last() else {
             panic!("missing assistant message");
@@ -3475,8 +3653,13 @@ mod tests {
     ) -> oneshot::Receiver<model::RequestPermissionResponse> {
         let (response_tx, response_rx) = oneshot::channel();
         let mut tc = tool_call(tool_id, model::ToolCallStatus::InProgress);
-        tc.pending_permission =
-            Some(InlinePermission { options, response_tx, selected_index: 0, focused });
+        tc.pending_permission = Some(InlinePermission {
+            options,
+            display: None,
+            response_tx,
+            selected_index: 0,
+            focused,
+        });
         app.messages.push(assistant_msg(vec![MessageBlock::ToolCall(Box::new(tc))]));
         let msg_idx = app.messages.len().saturating_sub(1);
         app.index_tool_call(tool_id.into(), msg_idx, 0);
@@ -4256,28 +4439,6 @@ mod tests {
     }
 
     #[test]
-    fn matching_event_paste_is_suppressed_after_clipboard_fallback() {
-        let mut app = make_test_app();
-        app.pending_clipboard_paste_dedupe = Some("pasted".to_owned());
-
-        handle_terminal_event(&mut app, Event::Paste("pasted".into()));
-
-        assert!(app.pending_paste_text.is_empty());
-        assert!(app.pending_clipboard_paste_dedupe.is_none());
-    }
-
-    #[test]
-    fn non_matching_event_paste_is_not_suppressed() {
-        let mut app = make_test_app();
-        app.pending_clipboard_paste_dedupe = Some("clipboard".to_owned());
-
-        handle_terminal_event(&mut app, Event::Paste("terminal".into()));
-
-        assert_eq!(app.pending_paste_text, "terminal");
-        assert!(app.pending_clipboard_paste_dedupe.is_none());
-    }
-
-    #[test]
     fn settings_view_ignores_mouse_events() {
         let mut app = make_test_app();
         app.active_view = ActiveView::Config;
@@ -4429,6 +4590,113 @@ mod tests {
 
         assert_eq!(app.viewport.scroll_target, 4);
         assert!(app.selection.is_some());
+    }
+
+    #[test]
+    fn api_retry_updates_single_warning_notice() {
+        let mut app = make_test_app();
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::ApiRetryUpdate {
+                attempt: 1,
+                max_retries: 4,
+                retry_delay_ms: 1000,
+                error_status: None,
+                error: model::ApiRetryError::Unknown,
+            }),
+        );
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::ApiRetryUpdate {
+                attempt: 2,
+                max_retries: 4,
+                retry_delay_ms: 1500,
+                error_status: Some(529),
+                error: model::ApiRetryError::ServerError,
+            }),
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.turn_notice_refs.len(), 1);
+        let MessageBlock::Notice(notice) = &app.messages[0].blocks[0] else {
+            panic!("expected API retry notice");
+        };
+        assert_eq!(notice.severity, SystemSeverity::Warning);
+        assert_eq!(notice.text.text, "API retry 2/4 after server_error HTTP 529, retrying in 1.5s",);
+    }
+
+    #[test]
+    fn prompt_suggestion_tab_accepts_empty_input_only_after_todo_focus() {
+        let mut app = make_test_app();
+        app.prompt_suggestion = Some("Write focused tests".to_owned());
+
+        handle_normal_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.input.text(), "Write focused tests");
+        assert!(app.prompt_suggestion.is_none());
+    }
+
+    #[test]
+    fn prompt_suggestion_tab_does_not_steal_todo_focus_toggle() {
+        let mut app = make_test_app();
+        app.prompt_suggestion = Some("Write focused tests".to_owned());
+        app.show_todo_panel = true;
+        app.todos.push(TodoItem {
+            content: "todo".to_owned(),
+            status: TodoStatus::Pending,
+            active_form: String::new(),
+        });
+
+        handle_normal_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(app.focus_owner(), FocusOwner::TodoList);
+        assert!(app.input.is_empty());
+        assert_eq!(app.prompt_suggestion.as_deref(), Some("Write focused tests"));
+    }
+
+    #[test]
+    fn runtime_session_state_updates_status_with_guards() {
+        let mut app = make_test_app();
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::RuntimeSessionStateUpdate(
+                model::RuntimeSessionState::Running,
+            )),
+        );
+        assert_eq!(app.runtime_session_state, Some(model::RuntimeSessionState::Running));
+        assert!(matches!(app.status, AppStatus::Running));
+
+        app.status = AppStatus::Error;
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::RuntimeSessionStateUpdate(
+                model::RuntimeSessionState::Idle,
+            )),
+        );
+        assert!(matches!(app.status, AppStatus::Error));
+    }
+
+    #[test]
+    fn settings_parse_error_surfaces_system_error_message() {
+        let mut app = make_test_app();
+        handle_client_event(
+            &mut app,
+            ClientEvent::SessionUpdate(model::SessionUpdate::SettingsParseError {
+                file: Some("C:/work/.claude/settings.json".to_owned()),
+                path: "permissions.allow".to_owned(),
+                message: "Expected array".to_owned(),
+            }),
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(app.messages[0].role, MessageRole::System(Some(SystemSeverity::Error))));
+        let MessageBlock::Text(text) = &app.messages[0].blocks[0] else {
+            panic!("expected settings parse error text");
+        };
+        assert_eq!(
+            text.text,
+            "Settings parse error in C:/work/.claude/settings.json at permissions.allow: Expected array",
+        );
     }
 
     #[test]

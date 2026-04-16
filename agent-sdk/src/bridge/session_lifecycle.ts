@@ -2,9 +2,8 @@ import { randomUUID } from "node:crypto";
 import { spawn as spawnChild } from "node:child_process";
 import fs from "node:fs";
 import {
-  getSessionMessages,
-  listSessions,
   query,
+  type AccountInfo,
   type CanUseTool,
   type ModelInfo,
   type PermissionMode,
@@ -15,7 +14,7 @@ import {
   type SettingSource,
 } from "@anthropic-ai/claude-agent-sdk";
 import type {
-  AvailableCommand,
+  CurrentModel,
   AvailableModel,
   BridgeCommand,
   ElicitationAction,
@@ -23,6 +22,7 @@ import type {
   FastModeState,
   Json,
   PermissionOutcome,
+  PermissionDisplay,
   PermissionRequest,
   QuestionOutcome,
   SessionLaunchSettings,
@@ -35,15 +35,10 @@ import {
   permissionOptionsFromSuggestions,
   permissionResultFromOutcome,
 } from "./permissions.js";
-import { mapSessionMessagesToUpdates } from "./history.js";
 import {
-  writeEvent,
   failConnection,
-  slashError,
   emitSessionUpdate,
   emitConnectEvent,
-  emitSessionsList,
-  refreshSessionsList,
   emitPermissionRequestEvent,
   emitElicitationRequestEvent,
 } from "./events.js";
@@ -62,6 +57,22 @@ import { emitAuthRequired, emitFastModeUpdateIfChanged } from "./error_classific
 
 export type ConnectEventKind = "connected" | "session_replaced";
 
+function permissionDisplayFromCanUseOptions(
+  options: Parameters<CanUseTool>[2],
+): PermissionDisplay | undefined {
+  const title = typeof options.title === "string" ? options.title.trim() : "";
+  const displayName = typeof options.displayName === "string" ? options.displayName.trim() : "";
+  const description = typeof options.description === "string" ? options.description.trim() : "";
+  if (!title && !displayName && !description) {
+    return undefined;
+  }
+  return {
+    ...(title ? { title } : {}),
+    ...(displayName ? { display_name: displayName } : {}),
+    ...(description ? { description } : {}),
+  };
+}
+
 export type PendingPermission = {
   resolve?: (result: PermissionResult) => void;
   onOutcome?: (outcome: PermissionOutcome) => void;
@@ -79,7 +90,7 @@ export type PendingQuestion = {
 export type PendingElicitation = {
   resolve: (result: {
     action: ElicitationAction;
-    content?: Record<string, unknown>;
+    content?: Record<string, string | number | boolean | string[]>;
   }) => void;
   serverName: string;
   elicitationId?: string;
@@ -89,8 +100,14 @@ export type SessionState = {
   sessionId: string;
   cwd: string;
   model: string;
+  requestedModelId?: string;
+  resolvedRuntimeModelId?: string;
+  currentModel?: CurrentModel;
   availableModels: AvailableModel[];
   mode: PermissionMode | null;
+  supportedModeIds: PermissionMode[];
+  runtimeUnavailableModeIds: PermissionMode[];
+  supportsBypassPermissionsMode: boolean;
   fastModeState: FastModeState;
   query: Query;
   input: AsyncQueue<SDKUserMessage>;
@@ -110,10 +127,59 @@ export type SessionState = {
   resumeUpdates?: SessionUpdate[];
 };
 
+type QueryWithInternalControlHandling = Query & {
+  processControlRequest?: (
+    request: {
+      request_id: string;
+      request: Record<string, unknown>;
+    },
+    signal: AbortSignal,
+  ) => Promise<Record<string, unknown> | undefined>;
+  [requestUserDialogInterceptorInstalled]?: boolean;
+};
+
+const requestUserDialogInterceptorInstalled = Symbol("requestUserDialogInterceptorInstalled");
+
 export const sessions = new Map<string, SessionState>();
+
+function nonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+export function shouldEmitStartupAuthRequiredForAccount(account: AccountInfo): boolean {
+  const provider = account.apiProvider;
+  if (nonEmptyString(provider) && provider !== "firstParty") {
+    return false;
+  }
+  return !nonEmptyString(account.email) && !nonEmptyString(account.apiKeySource);
+}
 const DEFAULT_SETTING_SOURCES: SettingSource[] = ["user", "project", "local"];
 const DEFAULT_MODEL_NAME = "default";
 const DEFAULT_PERMISSION_MODE: PermissionMode = "default";
+
+function isSdkElicitationContentValue(value: Json): value is string | number | boolean | string[] {
+  return (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    (Array.isArray(value) && value.every((entry) => typeof entry === "string"))
+  );
+}
+
+function normalizeSdkElicitationContent(
+  content: Record<string, Json> | undefined,
+): Record<string, string | number | boolean | string[]> | undefined {
+  if (!content) {
+    return undefined;
+  }
+  const normalized: Record<string, string | number | boolean | string[]> = {};
+  for (const [key, value] of Object.entries(content)) {
+    if (isSdkElicitationContentValue(value)) {
+      normalized[key] = value;
+    }
+  }
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
 
 type CloseSessionOptions = {
   reason?: string;
@@ -124,6 +190,31 @@ function settingsObjectFromLaunchSettings(
   launchSettings: SessionLaunchSettings,
 ): Record<string, unknown> | undefined {
   return launchSettings.settings;
+}
+
+function normalizedSettingsFromLaunchSettings(
+  launchSettings: SessionLaunchSettings,
+): Record<string, unknown> | undefined {
+  const settings = settingsObjectFromLaunchSettings(launchSettings);
+  if (!settings) {
+    return undefined;
+  }
+
+  const sandbox =
+    settings.sandbox && typeof settings.sandbox === "object" && !Array.isArray(settings.sandbox)
+      ? (settings.sandbox as Record<string, unknown>)
+      : undefined;
+  if (sandbox?.enabled === true && sandbox.failIfUnavailable === undefined) {
+    return {
+      ...settings,
+      sandbox: {
+        ...sandbox,
+        failIfUnavailable: false,
+      },
+    };
+  }
+
+  return settings;
 }
 
 export function sessionById(sessionId: string): SessionState | null {
@@ -137,6 +228,97 @@ export function updateSessionId(session: SessionState, newSessionId: string): vo
   sessions.delete(session.sessionId);
   session.sessionId = newSessionId;
   sessions.set(newSessionId, session);
+}
+
+function isRequestUserDialogControlRequest(
+  value: unknown,
+): value is {
+  request_id: string;
+  request: {
+    subtype: "request_user_dialog";
+    dialog_kind: string;
+    payload: Record<string, unknown>;
+    tool_use_id?: string;
+  };
+} {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  const request = record.request;
+  if (!request || typeof request !== "object") {
+    return false;
+  }
+  const inner = request as Record<string, unknown>;
+  const payload = inner.payload;
+  return (
+    typeof record.request_id === "string" &&
+    inner.subtype === "request_user_dialog" &&
+    typeof inner.dialog_kind === "string" &&
+    Boolean(payload && typeof payload === "object" && !Array.isArray(payload))
+  );
+}
+
+export function attachRequestUserDialogInterceptor(
+  query: Query,
+  sessionIdForLogs: () => string,
+): boolean {
+  const internalQuery = query as QueryWithInternalControlHandling;
+  if (internalQuery[requestUserDialogInterceptorInstalled]) {
+    return true;
+  }
+  if (typeof internalQuery.processControlRequest !== "function") {
+    bridgeLogger.warn({
+      target: LOG_TARGETS.APP_SESSION,
+      eventName: "request_user_dialog_interceptor_unavailable",
+      message: "request_user_dialog interceptor could not be installed",
+      outcome: "failure",
+      sessionId: sessionIdForLogs(),
+    });
+    return false;
+  }
+
+  const originalProcessControlRequest = internalQuery.processControlRequest.bind(query);
+  internalQuery.processControlRequest = async (request, signal) => {
+    // SDK 0.2.104 also added cancel_async_message and seed_read_state control
+    // requests. Keep those delegated to the SDK internals: claude-rs does not
+    // own the SDK async-message queue or read-state cache, so TUI-level commands
+    // for them would add unsupported host behavior without user-visible value.
+    if (isRequestUserDialogControlRequest(request)) {
+      bridgeLogger.warn({
+        target: LOG_TARGETS.APP_SESSION,
+        eventName: "request_user_dialog_received",
+        message: "request_user_dialog control request received",
+        outcome: "failure",
+        sessionId: sessionIdForLogs(),
+        requestId: request.request_id,
+        ...(typeof request.request.tool_use_id === "string"
+          ? { toolCallId: request.request.tool_use_id }
+          : {}),
+        fields: {
+          dialog_kind: request.request.dialog_kind,
+          raw_payload: request.request.payload,
+          raw_request: request.request,
+        },
+      });
+      // TODO(request_user_dialog): Revisit this when a real claude-rs host flow needs it.
+      // For now we only log the full control request and reject it explicitly because
+      // normal TUI sessions do not appear to exercise these dialog kinds.
+      throw new Error(
+        `request_user_dialog is not supported by claude-rs yet (dialog_kind: ${request.request.dialog_kind})`,
+      );
+    }
+    return await originalProcessControlRequest(request, signal);
+  };
+  internalQuery[requestUserDialogInterceptorInstalled] = true;
+  bridgeLogger.info({
+    target: LOG_TARGETS.APP_SESSION,
+    eventName: "request_user_dialog_interceptor_installed",
+    message: "request_user_dialog interceptor installed",
+    outcome: "success",
+    sessionId: sessionIdForLogs(),
+  });
+  return true;
 }
 
 export async function closeSession(session: SessionState): Promise<void> {
@@ -208,6 +390,8 @@ export async function createSession(params: {
   const provisionalSessionId = params.resume ?? randomUUID();
   const initialModel = initialSessionModel(params.launchSettings);
   const initialMode = initialSessionMode(params.launchSettings);
+  const supportsBypassPermissionsMode =
+    startupPermissionModeOptions(params.launchSettings).allowDangerouslySkipPermissions === true;
   const historyUpdateCount = params.resumeUpdates?.length ?? 0;
   const staleSessionCount = params.sessionsToCloseAfterConnect?.length ?? 0;
 
@@ -230,9 +414,11 @@ export async function createSession(params: {
       );
     }
 
+    const display = permissionDisplayFromCanUseOptions(options);
     const request: PermissionRequest = {
       tool_call: existing,
       options: permissionOptionsFromSuggestions(options.suggestions),
+      ...(display ? { display } : {}),
     };
     bridgeLogger.info({
       target: LOG_TARGETS.BRIDGE_PERMISSION,
@@ -244,6 +430,7 @@ export async function createSession(params: {
       count: request.options.length,
       fields: {
         tool_name: toolName,
+        agent_id: options.agentID,
         blocked_path: options.blockedPath ?? "<none>",
         decision_reason: options.decisionReason ?? "<none>",
       },
@@ -301,6 +488,7 @@ export async function createSession(params: {
         sessionIdForLogs,
       }),
     });
+    attachRequestUserDialogInterceptor(queryHandle, sessionIdForLogs);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     bridgeLogger.error({
@@ -327,8 +515,12 @@ export async function createSession(params: {
     sessionId: provisionalSessionId,
     cwd: params.cwd,
     model: initialModel,
+    ...(initialModel ? { requestedModelId: initialModel } : {}),
     availableModels: [],
     mode: initialMode,
+    supportedModeIds: [],
+    runtimeUnavailableModeIds: [],
+    supportsBypassPermissionsMode,
     fastModeState: "off",
     query: queryHandle,
     input,
@@ -349,6 +541,9 @@ export async function createSession(params: {
       ? { sessionsToCloseAfterConnect: params.sessionsToCloseAfterConnect }
       : {}),
   };
+  refreshCurrentModel(session);
+  const { refreshSupportedModesForSession } = await import("./commands.js");
+  refreshSupportedModesForSession(session);
   sessions.set(provisionalSessionId, session);
   bridgeLogger.info({
     target: LOG_TARGETS.APP_SESSION,
@@ -382,7 +577,7 @@ export async function createSession(params: {
   // before the first user prompt.
   void session.query
     .initializationResult()
-    .then((result) => {
+    .then(async (result) => {
       bridgeLogger.info({
         target: LOG_TARGETS.APP_SESSION,
         eventName: "session_initialization_completed",
@@ -397,16 +592,25 @@ export async function createSession(params: {
         },
       });
       session.availableModels = mapAvailableModels(result.models);
+      const currentModelChanged = refreshCurrentModel(session);
+      const { buildModeState, refreshSupportedModesForSession } = await import("./commands.js");
+      refreshSupportedModesForSession(session);
       if (!session.connected) {
         emitConnectEvent(session);
+      } else {
+        if (currentModelChanged) {
+          emitCurrentModelUpdate(session);
+        }
+        if (session.mode) {
+          emitSessionUpdate(session.sessionId, {
+            type: "mode_state_update",
+            mode: buildModeState(session, session.mode),
+          });
+        }
       }
       // Proactively detect missing auth from account info so the UI can
       // show the login hint immediately, without waiting for the first prompt.
-      const acct = result.account;
-      const hasCredentials =
-        (typeof acct.email === "string" && acct.email.trim().length > 0) ||
-        (typeof acct.apiKeySource === "string" && acct.apiKeySource.trim().length > 0);
-      if (!hasCredentials) {
+      if (shouldEmitStartupAuthRequiredForAccount(result.account)) {
         emitAuthRequired(session);
       }
       emitFastModeUpdateIfChanged(session, result.fast_mode_state);
@@ -556,6 +760,7 @@ function permissionModeFromSettingsValue(rawMode: unknown): PermissionMode | und
   }
   switch (rawMode) {
     case "default":
+    case "auto":
     case "acceptEdits":
     case "bypassPermissions":
     case "plan":
@@ -641,12 +846,14 @@ export function buildQueryOptions(params: QueryOptionsBuilderParams) {
   const systemPrompt = systemPromptFromLaunchSettings(params.launchSettings);
   const modelOption = startupModelOption(params.launchSettings);
   const permissionModeOptions = startupPermissionModeOptions(params.launchSettings);
+  const settings = normalizedSettingsFromLaunchSettings(params.launchSettings);
   return {
     cwd: params.cwd,
     includePartialMessages: true,
+    promptSuggestions: true,
     executable: "node" as const,
     ...(params.resume ? {} : { sessionId: params.provisionalSessionId }),
-    ...(params.launchSettings.settings ? { settings: params.launchSettings.settings } : {}),
+    ...(settings ? { settings } : {}),
     ...modelOption,
     ...permissionModeOptions,
     toolConfig: { askUserQuestion: { previewFormat: "markdown" as const } },
@@ -754,7 +961,7 @@ export function buildQueryOptions(params: QueryOptionsBuilderParams) {
       emitElicitationRequestEvent(params.sessionIdForLogs(), normalized);
       return await new Promise<{
         action: ElicitationAction;
-        content?: Record<string, unknown>;
+        content?: Record<string, string | number | boolean | string[]>;
       }>((resolve) => {
         const currentSession = sessions.get(params.sessionIdForLogs());
         if (!currentSession) {
@@ -1042,6 +1249,286 @@ export function handleElicitationResponse(
   });
   pending.resolve({
     action: command.action,
-    ...(command.content ? { content: command.content } : {}),
+    ...(normalizeSdkElicitationContent(command.content) ? {
+      content: normalizeSdkElicitationContent(command.content),
+    } : {}),
   });
+}
+type NormalizedModelKey = {
+  original: string;
+  family: "opus" | "sonnet" | "haiku" | "unknown" | "default";
+  versionParts: number[];
+  variantParts: string[];
+  contextSuffix?: string;
+};
+
+function normalizeModelKey(id: string): NormalizedModelKey {
+  const original = id.trim();
+  if (!original || original === DEFAULT_MODEL_NAME) {
+    return { original, family: "default", versionParts: [], variantParts: [] };
+  }
+
+  const lower = original.toLowerCase();
+  const contextMatch = lower.match(/\[([^\]]+)\]$/);
+  const contextSuffix = contextMatch?.[1];
+  const withoutContext = contextMatch ? lower.slice(0, contextMatch.index) : lower;
+  const withoutPrefix = withoutContext.startsWith("claude-")
+    ? withoutContext.slice("claude-".length)
+    : withoutContext;
+  const parts = withoutPrefix.split("-").filter((part) => part.length > 0);
+  const familyPart = parts[0] ?? "";
+  const family =
+    familyPart === "opus" || familyPart === "sonnet" || familyPart === "haiku"
+      ? familyPart
+      : "unknown";
+  const versionParts =
+    family === "unknown"
+      ? []
+      : parts
+          .slice(1)
+          .filter((part) => /^\d+$/.test(part))
+          .map((part) => Number.parseInt(part, 10))
+          .filter((part) => Number.isFinite(part));
+  const variantParts =
+    family === "unknown"
+      ? []
+      : parts
+          .slice(1)
+          .filter((part) => !/^\d+$/.test(part));
+
+  return {
+    original,
+    family,
+    versionParts,
+    variantParts,
+    ...(contextSuffix ? { contextSuffix } : {}),
+  };
+}
+
+function modelKeysAreCompatible(leftId: string, rightId: string): boolean {
+  const left = normalizeModelKey(leftId);
+  const right = normalizeModelKey(rightId);
+  if (left.family === "default" || right.family === "default") {
+    return false;
+  }
+  if (left.family === "unknown" || right.family === "unknown") {
+    return left.original.toLowerCase() === right.original.toLowerCase();
+  }
+  if (left.family !== right.family) {
+    return false;
+  }
+  if (left.variantParts.join(".") !== right.variantParts.join(".")) {
+    return false;
+  }
+  if (left.versionParts.length === 0 || right.versionParts.length === 0) {
+    return true;
+  }
+  return left.versionParts.join(".") === right.versionParts.join(".");
+}
+
+function sameContextSuffix(leftId: string, rightId: string): boolean {
+  const left = normalizeModelKey(leftId);
+  const right = normalizeModelKey(rightId);
+  return (left.contextSuffix?.toLowerCase() ?? "") === (right.contextSuffix?.toLowerCase() ?? "");
+}
+
+function sameFamilyAndVersion(leftId: string, rightId: string): boolean {
+  const left = normalizeModelKey(leftId);
+  const right = normalizeModelKey(rightId);
+  if (left.family === "default" || right.family === "default") {
+    return false;
+  }
+  if (left.family === "unknown" || right.family === "unknown") {
+    return left.original.toLowerCase() === right.original.toLowerCase();
+  }
+  if (left.family !== right.family) {
+    return false;
+  }
+  if (left.versionParts.length === 0 || right.versionParts.length === 0) {
+    return left.versionParts.length === right.versionParts.length;
+  }
+  return left.versionParts.join(".") === right.versionParts.join(".");
+}
+
+function hasVariantSiblingConflict(
+  availableModels: AvailableModel[],
+  candidateId: string,
+  resolvedId: string,
+): boolean {
+  if (sameContextSuffix(candidateId, resolvedId)) {
+    return false;
+  }
+
+  const resolvedContext = normalizeModelKey(resolvedId).contextSuffix?.toLowerCase() ?? "";
+  if (!resolvedContext) {
+    return false;
+  }
+
+  return availableModels.some((entry) => {
+    if (entry.id === candidateId) {
+      return false;
+    }
+    if (!sameFamilyAndVersion(entry.id, resolvedId)) {
+      return false;
+    }
+    const entryContext = normalizeModelKey(entry.id).contextSuffix?.toLowerCase() ?? "";
+    return entryContext === resolvedContext;
+  });
+}
+
+function humanizeModelId(id: string): string {
+  const normalized = normalizeModelKey(id);
+  if (normalized.family === "default") {
+    return "Default";
+  }
+  if (normalized.family === "unknown") {
+    return id;
+  }
+
+  const familyLabel =
+    normalized.family === "opus"
+      ? "Opus"
+      : normalized.family === "sonnet"
+        ? "Sonnet"
+        : "Haiku";
+  const versionLabel =
+    normalized.versionParts.length > 0 ? ` ${normalized.versionParts.join(".")}` : "";
+  const contextLabel =
+    normalized.contextSuffix?.toLowerCase() === "1m"
+      ? " [1M]"
+      : normalized.contextSuffix
+        ? ` [${normalized.contextSuffix}]`
+        : "";
+  return `${familyLabel}${versionLabel}${contextLabel}`;
+}
+
+function shortDisplayNameForModelId(id: string): string {
+  const normalized = normalizeModelKey(id);
+  if (normalized.family === "default") {
+    return "Default";
+  }
+  if (normalized.family === "unknown") {
+    return id;
+  }
+  const familyLabel = normalized.family === "opus"
+    ? "Opus"
+    : normalized.family === "sonnet"
+      ? "Sonnet"
+      : "Haiku";
+  const contextLabel =
+    normalized.contextSuffix?.toLowerCase() === "1m"
+      ? " [1M]"
+      : normalized.contextSuffix
+        ? ` [${normalized.contextSuffix}]`
+        : "";
+  return `${familyLabel}${contextLabel}`;
+}
+
+function currentModelIsAuthoritative(
+  resolvedId: string,
+  requestedId: string | undefined,
+): boolean {
+  const resolved = resolvedId.trim();
+  if (!resolved || resolved === DEFAULT_MODEL_NAME || resolved === "Connecting...") {
+    return Boolean(requestedId?.trim() && requestedId.trim() !== DEFAULT_MODEL_NAME);
+  }
+  return true;
+}
+
+function resolveCatalogModel(
+  availableModels: AvailableModel[],
+  resolvedId: string,
+  requestedId: string | undefined,
+): AvailableModel | undefined {
+  const exactResolved = availableModels.find((entry) => entry.id === resolvedId);
+  if (exactResolved) {
+    return exactResolved;
+  }
+
+  if (requestedId) {
+    const exactRequested = availableModels.find((entry) => entry.id === requestedId);
+    if (
+      exactRequested &&
+      modelKeysAreCompatible(exactRequested.id, resolvedId) &&
+      !hasVariantSiblingConflict(availableModels, exactRequested.id, resolvedId)
+    ) {
+      return exactRequested;
+    }
+  }
+
+  const compatible = availableModels.filter(
+    (entry) =>
+      modelKeysAreCompatible(entry.id, resolvedId) &&
+      !hasVariantSiblingConflict(availableModels, entry.id, resolvedId),
+  );
+  return compatible.length === 1 ? compatible[0] : undefined;
+}
+
+export function resolveCurrentModel(session: SessionState): CurrentModel {
+  const requestedId = session.requestedModelId?.trim() || undefined;
+  const resolvedId =
+    session.resolvedRuntimeModelId?.trim() ||
+    session.model.trim() ||
+    requestedId ||
+    DEFAULT_MODEL_NAME;
+  const catalogModel = resolveCatalogModel(session.availableModels, resolvedId, requestedId);
+  const runtimeDisplayId = resolvedId || requestedId || DEFAULT_MODEL_NAME;
+  const displayNameShort = shortDisplayNameForModelId(runtimeDisplayId);
+  const displayNameLong = humanizeModelId(runtimeDisplayId);
+  const currentModel: CurrentModel = {
+    resolved_id: resolvedId,
+    display_name_short: displayNameShort,
+    display_name_long: displayNameLong,
+    supports_effort: catalogModel?.supports_effort === true,
+    supported_effort_levels: catalogModel?.supported_effort_levels ?? [],
+    is_authoritative: currentModelIsAuthoritative(resolvedId, requestedId),
+    ...(requestedId ? { requested_id: requestedId } : {}),
+    ...(catalogModel ? { catalog_id: catalogModel.id } : {}),
+    ...(catalogModel?.supports_fast_mode !== undefined
+      ? { supports_fast_mode: catalogModel.supports_fast_mode }
+      : {}),
+    ...(catalogModel?.supports_auto_mode !== undefined
+      ? { supports_auto_mode: catalogModel.supports_auto_mode }
+      : {}),
+    ...(catalogModel?.supports_adaptive_thinking !== undefined
+      ? { supports_adaptive_thinking: catalogModel.supports_adaptive_thinking }
+      : {}),
+  };
+  return currentModel;
+}
+
+export function shouldInvalidateResolvedRuntimeModel(
+  previousRequestedId: string | undefined,
+  previousSessionModel: string,
+  nextRequestedId: string,
+): boolean {
+  const previousRequested = previousRequestedId?.trim() || previousSessionModel.trim();
+  return previousRequested !== nextRequestedId.trim();
+}
+
+function currentModelsEqual(left: CurrentModel | undefined, right: CurrentModel): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+export function emitCurrentModelUpdate(session: SessionState): boolean {
+  if (!session.connected || !session.currentModel) {
+    return false;
+  }
+  emitSessionUpdate(session.sessionId, {
+    type: "current_model_update",
+    current_model: session.currentModel,
+  });
+  return true;
+}
+
+export function refreshCurrentModel(session: SessionState, emitUpdate = false): boolean {
+  const nextModel = resolveCurrentModel(session);
+  if (currentModelsEqual(session.currentModel, nextModel)) {
+    return false;
+  }
+  session.currentModel = nextModel;
+  if (emitUpdate) {
+    emitCurrentModelUpdate(session);
+  }
+  return true;
 }

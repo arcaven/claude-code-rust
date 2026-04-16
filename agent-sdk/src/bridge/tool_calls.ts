@@ -1,4 +1,4 @@
-import type { PlanEntry, ToolCall, ToolCallUpdateFields } from "../types.js";
+import type { PlanEntry, TaskMetadata, ToolCall, ToolCallUpdateFields } from "../types.js";
 import { emitSessionUpdate } from "./events.js";
 import { bridgeLogger, LOG_TARGETS } from "./logger.js";
 import type { SessionState } from "./session_lifecycle.js";
@@ -14,6 +14,7 @@ type ToolUpdateKind =
   | "finalize"
   | "task_started"
   | "task_progress"
+  | "task_updated"
   | "task_notification";
 
 function jsonSize(value: unknown): number | undefined {
@@ -73,6 +74,7 @@ function updateOutcome(status: ToolCall["status"] | undefined): string {
     case "completed":
       return "success";
     case "failed":
+    case "killed":
       return "failure";
     case "in_progress":
       return "partial";
@@ -81,6 +83,32 @@ function updateOutcome(status: ToolCall["status"] | undefined): string {
     default:
       return "partial";
   }
+}
+
+function parentToolUseIdFromMeta(meta: ToolCall["meta"] | undefined): string | null {
+  if (!meta || typeof meta !== "object") {
+    return null;
+  }
+  const claudeCode =
+    "claudeCode" in meta && meta.claudeCode && typeof meta.claudeCode === "object" ? meta.claudeCode : undefined;
+  const parentToolUseId =
+    claudeCode && "parentToolUseId" in claudeCode && typeof claudeCode.parentToolUseId === "string"
+      ? claudeCode.parentToolUseId
+      : null;
+  return parentToolUseId;
+}
+
+function mergeTaskMetadata(
+  current: ToolCall["task_metadata"] | undefined,
+  update: ToolCallUpdateFields["task_metadata"],
+): ToolCall["task_metadata"] {
+  if (update === undefined) {
+    return current;
+  }
+  return {
+    ...(current ?? {}),
+    ...update,
+  };
 }
 
 function applyFieldsToBase(base: ToolCall, fields: ToolCallUpdateFields): void {
@@ -104,6 +132,9 @@ function applyFieldsToBase(base: ToolCall, fields: ToolCallUpdateFields): void {
   }
   if (fields.output_metadata !== undefined) {
     base.output_metadata = fields.output_metadata;
+  }
+  if (fields.task_metadata !== undefined) {
+    base.task_metadata = mergeTaskMetadata(base.task_metadata, fields.task_metadata);
   }
   if (fields.meta !== undefined) {
     base.meta = fields.meta;
@@ -167,11 +198,12 @@ function logToolCallUpdateEmitted(
       location_count: fields.locations?.length,
       raw_output_chars: rawOutput?.length,
       has_output_metadata: fields.output_metadata !== undefined || base?.output_metadata !== undefined,
+      has_task_metadata: fields.task_metadata !== undefined || base?.task_metadata !== undefined,
       failure_kind: failureKind,
     },
   } as const;
 
-  if (nextStatus === "failed") {
+  if (nextStatus === "failed" || nextStatus === "killed") {
     bridgeLogger.warn(commonEvent);
     return;
   }
@@ -213,12 +245,19 @@ export function emitToolCallUpdate(
   }
 }
 
-export function emitToolCall(session: SessionState, toolUseId: string, name: string, input: Record<string, unknown>): void {
-  const toolCall = createToolCall(toolUseId, name, input);
+export function emitToolCall(
+  session: SessionState,
+  toolUseId: string,
+  name: string,
+  input: Record<string, unknown>,
+  parentToolUseId: string | null = null,
+): void {
+  const existing = session.toolCalls.get(toolUseId);
+  const resolvedParentToolUseId = parentToolUseId ?? parentToolUseIdFromMeta(existing?.meta);
+  const toolCall = createToolCall(toolUseId, name, input, resolvedParentToolUseId);
   const status: ToolCall["status"] = "in_progress";
   toolCall.status = status;
 
-  const existing = session.toolCalls.get(toolUseId);
   if (!existing) {
     emitInitialToolCall(session, toolCall);
     return;
@@ -243,12 +282,18 @@ export function ensureToolCallVisible(
   toolUseId: string,
   toolName: string,
   input: Record<string, unknown>,
+  parentToolUseId: string | null = null,
 ): ToolCall {
   const existing = session.toolCalls.get(toolUseId);
   if (existing) {
+    const existingParentToolUseId = parentToolUseIdFromMeta(existing.meta);
+    if (parentToolUseId && existingParentToolUseId !== parentToolUseId) {
+      const refreshed = createToolCall(toolUseId, toolName, input, parentToolUseId);
+      emitToolCallUpdate(session, toolUseId, { meta: refreshed.meta }, "refresh");
+    }
     return existing;
   }
-  const toolCall = createToolCall(toolUseId, toolName, input);
+  const toolCall = createToolCall(toolUseId, toolName, input, parentToolUseId);
   emitInitialToolCall(session, toolCall);
   return toolCall;
 }
@@ -306,7 +351,8 @@ export function emitToolProgressUpdate(session: SessionState, toolUseId: string,
   if (
     existing.status === "in_progress" ||
     existing.status === "completed" ||
-    existing.status === "failed"
+    existing.status === "failed" ||
+    existing.status === "killed"
   ) {
     return;
   }
@@ -320,7 +366,7 @@ export function emitToolSummaryUpdate(session: SessionState, toolUseId: string, 
     return;
   }
   const fields: ToolCallUpdateFields = {
-    status: base.status === "failed" ? "failed" : "completed",
+    status: base.status === "failed" || base.status === "killed" ? base.status : "completed",
     raw_output: summary,
     content: [{ type: "content", content: { type: "text", text: summary } }],
   };
@@ -330,7 +376,7 @@ export function emitToolSummaryUpdate(session: SessionState, toolUseId: string, 
 export function setToolCallStatus(
   session: SessionState,
   toolUseId: string,
-  status: "pending" | "in_progress" | "completed" | "failed",
+  status: "pending" | "in_progress" | "completed" | "failed" | "killed",
   message?: string,
 ): void {
   const base = session.toolCalls.get(toolUseId);
@@ -369,4 +415,69 @@ export function taskProgressText(msg: Record<string, unknown>): string {
     return `${description} (last tool: ${lastTool})`;
   }
   return description || lastTool;
+}
+
+function taskPatchStatus(value: unknown): "pending" | "in_progress" | "completed" | "failed" | "killed" | undefined {
+  switch (value) {
+    case "pending":
+      return "pending";
+    case "running":
+      return "in_progress";
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "killed":
+      return "killed";
+    default:
+      return undefined;
+  }
+}
+
+function buildTaskMetadata(patch: Record<string, unknown>): TaskMetadata | undefined {
+  const taskMetadata: TaskMetadata = {};
+  if (typeof patch.error === "string" && patch.error.length > 0) {
+    taskMetadata.error = patch.error;
+  }
+  if (typeof patch.is_backgrounded === "boolean") {
+    taskMetadata.is_backgrounded = patch.is_backgrounded;
+  }
+  if (typeof patch.end_time === "number" && Number.isFinite(patch.end_time) && patch.end_time >= 0) {
+    taskMetadata.end_time = Math.trunc(patch.end_time);
+  }
+  if (
+    typeof patch.total_paused_ms === "number" &&
+    Number.isFinite(patch.total_paused_ms) &&
+    patch.total_paused_ms >= 0
+  ) {
+    taskMetadata.total_paused_ms = Math.trunc(patch.total_paused_ms);
+  }
+  return Object.keys(taskMetadata).length > 0 ? taskMetadata : undefined;
+}
+
+export function taskUpdatedFields(msg: Record<string, unknown>): ToolCallUpdateFields {
+  const patch =
+    msg.patch && typeof msg.patch === "object" ? (msg.patch as Record<string, unknown>) : {};
+  const fields: ToolCallUpdateFields = {};
+  const status = taskPatchStatus(patch.status);
+  const description = typeof patch.description === "string" ? patch.description : "";
+  const error = typeof patch.error === "string" ? patch.error : "";
+
+  if (status) {
+    fields.status = status;
+  }
+  if (description) {
+    fields.raw_output = description;
+    fields.content = [{ type: "content", content: { type: "text", text: description } }];
+  } else if ((status === "failed" || status === "killed") && error) {
+    fields.raw_output = error;
+    fields.content = [{ type: "content", content: { type: "text", text: error } }];
+  }
+
+  const taskMetadata = buildTaskMetadata(patch);
+  if (taskMetadata) {
+    fields.task_metadata = taskMetadata;
+  }
+
+  return fields;
 }

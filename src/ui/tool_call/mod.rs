@@ -47,7 +47,9 @@ pub fn status_icon(status: model::ToolCallStatus, spinner_frame: usize) -> (&'st
             (s, theme::RUST_ORANGE)
         }
         model::ToolCallStatus::Completed => (theme::ICON_COMPLETED, theme::RUST_ORANGE),
-        model::ToolCallStatus::Failed => (theme::ICON_FAILED, theme::STATUS_ERROR),
+        model::ToolCallStatus::Failed | model::ToolCallStatus::Killed => {
+            (theme::ICON_FAILED, theme::STATUS_ERROR)
+        }
     }
 }
 
@@ -256,10 +258,10 @@ fn tool_output_badge_spans(tc: &ToolCallInfo) -> Vec<Span<'static>> {
         ));
     }
 
-    if tc.is_ultraplan() {
+    if tc.task_is_backgrounded() {
         badges.push(Span::styled(
-            "  [ultraplan]",
-            Style::default().fg(theme::RUST_ORANGE).add_modifier(Modifier::BOLD),
+            "  [backgrounded]",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -295,6 +297,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status,
             content: Vec::new(),
             hidden: false,
@@ -342,6 +345,13 @@ mod tests {
     #[test]
     fn status_icon_failed() {
         let (icon, color) = status_icon(model::ToolCallStatus::Failed, 0);
+        assert_eq!(icon, theme::ICON_FAILED);
+        assert_eq!(color, theme::STATUS_ERROR);
+    }
+
+    #[test]
+    fn status_icon_killed() {
+        let (icon, color) = status_icon(model::ToolCallStatus::Killed, 0);
         assert_eq!(icon, theme::ICON_FAILED);
         assert_eq!(color, theme::STATUS_ERROR);
     }
@@ -401,6 +411,17 @@ mod tests {
     }
 
     #[test]
+    fn render_tool_call_title_shows_backgrounded_badge() {
+        let mut tc = test_tool_call("tc-bg", "Agent", model::ToolCallStatus::InProgress);
+        tc.task_metadata = Some(model::TaskMetadata::new().backgrounded(Some(true)));
+
+        let line = standard::render_tool_call_title(&tc, 80, 0);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        assert!(rendered.contains("[backgrounded]"));
+    }
+
+    #[test]
     fn execute_top_border_does_not_wrap_for_long_title() {
         let tc = ToolCallInfo {
             id: "tc-1".into(),
@@ -410,6 +431,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status: model::ToolCallStatus::Pending,
             content: Vec::new(),
             hidden: false,
@@ -498,19 +520,6 @@ mod tests {
             measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 80, 0, 1, false);
         assert_eq!(recomputed_height, first_height);
         assert!(recompute_lines > 0);
-    }
-
-    #[test]
-    fn exit_plan_mode_title_renders_ultraplan_badge() {
-        let mut tc = test_tool_call("tc-plan", "ExitPlanMode", model::ToolCallStatus::Completed);
-        tc.output_metadata =
-            Some(model::ToolOutputMetadata::new().exit_plan_mode(Some(
-                model::ExitPlanModeOutputMetadata::new().ultraplan(Some(true)),
-            )));
-
-        let rendered = standard::render_tool_call_title(&tc, 80, 0);
-        let text: String = rendered.spans.iter().map(|span| span.content.as_ref()).collect();
-        assert!(text.contains("[ultraplan]"));
     }
 
     #[test]
@@ -692,6 +701,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status: model::ToolCallStatus::Completed,
             content: Vec::new(),
             hidden: false,
@@ -723,6 +733,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status: model::ToolCallStatus::Failed,
             content: Vec::new(),
             hidden: false,
@@ -754,6 +765,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status: model::ToolCallStatus::Failed,
             content: Vec::new(),
             hidden: false,
@@ -779,6 +791,26 @@ mod tests {
     }
 
     #[test]
+    fn content_summary_uses_higher_limit_for_in_progress_agent() {
+        let mut tc = test_tool_call("tc-agent", "Agent", model::ToolCallStatus::InProgress);
+        let long_line = "a".repeat(150);
+        tc.content = vec![model::ToolCallContent::from(long_line.clone())];
+
+        assert_eq!(content_summary(&tc), long_line);
+    }
+
+    #[test]
+    fn content_summary_keeps_normal_limit_for_completed_agent() {
+        let mut tc = test_tool_call("tc-agent-done", "Agent", model::ToolCallStatus::Completed);
+        let long_line = "a".repeat(150);
+        tc.content = vec![model::ToolCallContent::from(long_line)];
+
+        let summary = content_summary(&tc);
+        assert_eq!(summary.chars().count(), 60);
+        assert!(summary.ends_with("..."));
+    }
+
+    #[test]
     fn render_execute_content_failed_surfaces_summary_before_full_output() {
         let tc = ToolCallInfo {
             id: "tc-3".into(),
@@ -787,6 +819,7 @@ mod tests {
             raw_input: None,
             raw_input_bytes: 0,
             output_metadata: None,
+            task_metadata: None,
             status: model::ToolCallStatus::Failed,
             content: Vec::new(),
             hidden: false,

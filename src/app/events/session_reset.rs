@@ -10,13 +10,14 @@ use crate::agent::model;
 pub(super) fn reset_for_new_session(
     app: &mut App,
     session_id: model::SessionId,
-    model_name: String,
+    current_model: model::CurrentModel,
     mode: Option<super::super::ModeState>,
+    preserve_current_welcome_tip: bool,
 ) {
     crate::agent::events::kill_all_terminals(&app.terminals);
 
-    reset_session_identity_state(app, session_id, model_name, mode);
-    reset_messages_for_new_session(app);
+    reset_session_identity_state(app, session_id, current_model, mode);
+    reset_messages_for_new_session(app, preserve_current_welcome_tip);
     reset_input_state_for_new_session(app);
     reset_interaction_state_for_new_session(app);
     reset_render_state_for_new_session(app);
@@ -27,20 +28,23 @@ pub(super) fn reset_for_new_session(
 fn reset_session_identity_state(
     app: &mut App,
     session_id: model::SessionId,
-    model_name: String,
+    current_model: model::CurrentModel,
     mode: Option<super::super::ModeState>,
 ) {
     app.bump_session_scope_epoch();
     app.session_id = Some(session_id);
-    app.model_name = model_name;
+    app.current_model = Some(current_model.clone());
     app.mode = mode;
     app.config_options.clear();
-    app.config_options
-        .insert("model".to_owned(), serde_json::Value::String(app.model_name.clone()));
+    if let Some(requested_id) = current_model.requested_id {
+        app.config_options.insert("model".to_owned(), serde_json::Value::String(requested_id));
+    }
     app.login_hint = None;
     super::clear_compaction_state(app, false);
     app.session_usage = super::super::SessionUsageState::default();
     app.fast_mode_state = model::FastModeState::Off;
+    app.runtime_session_state = None;
+    app.prompt_suggestion = None;
     app.last_rate_limit_update = None;
     app.should_quit = false;
     app.files_accessed = 0;
@@ -50,16 +54,17 @@ fn reset_session_identity_state(
     app.account_info = None;
 }
 
-fn reset_messages_for_new_session(app: &mut App) {
+fn reset_messages_for_new_session(app: &mut App, preserve_current_welcome_tip: bool) {
+    let preserved_tip_seed =
+        preserve_current_welcome_tip.then(|| app.current_welcome_tip_seed()).flatten();
     app.clear_messages_tracked();
     app.history_retention_stats = super::super::state::HistoryRetentionStats::default();
-    app.welcome_model_resolved = false;
-    app.push_message_tracked(ChatMessage::welcome_with_recent(
-        app.model_display_name(),
-        &app.cwd,
-        &app.recent_sessions,
-    ));
-    app.update_welcome_model_once();
+    let mut welcome = app.build_welcome_message();
+    if let Some(tip_seed) = preserved_tip_seed {
+        App::apply_welcome_tip_seed(&mut welcome, tip_seed);
+    }
+    app.push_message_tracked(welcome);
+    app.sync_welcome_snapshot();
     app.viewport = super::super::ChatViewport::new();
 }
 
@@ -68,7 +73,6 @@ fn reset_input_state_for_new_session(app: &mut App) {
     app.help_open = false;
     app.pending_submit = None;
     app.pending_paste_text.clear();
-    app.pending_clipboard_paste_dedupe = None;
     app.pending_paste_session = None;
     app.active_paste_session = None;
     app.pending_images.clear();
@@ -160,18 +164,19 @@ fn append_resume_user_message_chunk(app: &mut App, chunk: &model::ContentChunk) 
 }
 
 pub(super) fn load_resume_history(app: &mut App, history_updates: &[model::SessionUpdate]) {
+    let preserved_tip_seed = app.current_welcome_tip_seed();
     app.clear_messages_tracked();
     app.history_retention_stats = super::super::state::HistoryRetentionStats::default();
-    app.welcome_model_resolved = false;
-    app.push_message_tracked(ChatMessage::welcome_with_recent(
-        app.model_display_name(),
-        &app.cwd,
-        &app.recent_sessions,
-    ));
-    app.update_welcome_model_once();
+    let mut welcome = app.build_welcome_message();
+    if let Some(tip_seed) = preserved_tip_seed {
+        App::apply_welcome_tip_seed(&mut welcome, tip_seed);
+    }
+    app.push_message_tracked(welcome);
+    app.sync_welcome_snapshot();
     for update in history_updates {
         match update {
             model::SessionUpdate::UserMessageChunk(chunk) => {
+                app.clear_active_turn_assistant();
                 append_resume_user_message_chunk(app, chunk);
             }
             _ => super::handle_session_update(app, update.clone()),

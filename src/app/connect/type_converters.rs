@@ -29,6 +29,18 @@ pub(super) fn map_rate_limit_update(update: types::RateLimitUpdate) -> model::Ra
     }
 }
 
+pub(super) fn map_api_retry_error(error: types::ApiRetryError) -> model::ApiRetryError {
+    match error {
+        types::ApiRetryError::AuthenticationFailed => model::ApiRetryError::AuthenticationFailed,
+        types::ApiRetryError::BillingError => model::ApiRetryError::BillingError,
+        types::ApiRetryError::RateLimit => model::ApiRetryError::RateLimit,
+        types::ApiRetryError::InvalidRequest => model::ApiRetryError::InvalidRequest,
+        types::ApiRetryError::ServerError => model::ApiRetryError::ServerError,
+        types::ApiRetryError::MaxOutputTokens => model::ApiRetryError::MaxOutputTokens,
+        types::ApiRetryError::Unknown => model::ApiRetryError::Unknown,
+    }
+}
+
 pub(super) fn map_available_commands_update(
     commands: Vec<types::AvailableCommand>,
 ) -> model::AvailableCommandsUpdate {
@@ -101,6 +113,37 @@ pub(super) fn map_available_models(
         .collect()
 }
 
+pub(super) fn convert_current_model(current_model: types::CurrentModel) -> model::CurrentModel {
+    let mut mapped = model::CurrentModel::new(
+        current_model.resolved_id,
+        current_model.display_name_short,
+        current_model.display_name_long,
+    )
+    .supports_effort(current_model.supports_effort)
+    .supported_effort_levels(
+        current_model
+            .supported_effort_levels
+            .into_iter()
+            .map(|level| match level {
+                types::EffortLevel::Low => model::EffortLevel::Low,
+                types::EffortLevel::Medium => model::EffortLevel::Medium,
+                types::EffortLevel::High => model::EffortLevel::High,
+            })
+            .collect(),
+    )
+    .supports_fast_mode(current_model.supports_fast_mode)
+    .supports_auto_mode(current_model.supports_auto_mode)
+    .supports_adaptive_thinking(current_model.supports_adaptive_thinking)
+    .authoritative(current_model.is_authoritative);
+    if let Some(requested_id) = current_model.requested_id {
+        mapped = mapped.requested_id(requested_id);
+    }
+    if let Some(catalog_id) = current_model.catalog_id {
+        mapped = mapped.catalog_id(catalog_id);
+    }
+    mapped
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn map_session_update(update: types::SessionUpdate) -> Option<model::SessionUpdate> {
     match update {
@@ -139,6 +182,11 @@ pub(super) fn map_session_update(update: types::SessionUpdate) -> Option<model::
                 model::SessionModeId::new(current_mode_id),
             )))
         }
+        types::SessionUpdate::CurrentModelUpdate { current_model } => {
+            Some(model::SessionUpdate::CurrentModelUpdate(model::CurrentModelUpdate::new(
+                convert_current_model(current_model),
+            )))
+        }
         types::SessionUpdate::ConfigOptionUpdate { option_id, value } => {
             Some(model::SessionUpdate::ConfigOptionUpdate(model::ConfigOptionUpdate {
                 option_id,
@@ -175,6 +223,34 @@ pub(super) fn map_session_update(update: types::SessionUpdate) -> Option<model::
                 surpassed_threshold,
             },
         ))),
+        types::SessionUpdate::ApiRetryUpdate {
+            attempt,
+            max_retries,
+            retry_delay_ms,
+            error_status,
+            error,
+        } => Some(model::SessionUpdate::ApiRetryUpdate {
+            attempt,
+            max_retries,
+            retry_delay_ms,
+            error_status,
+            error: map_api_retry_error(error),
+        }),
+        types::SessionUpdate::PromptSuggestionUpdate { suggestion } => {
+            Some(model::SessionUpdate::PromptSuggestionUpdate(suggestion))
+        }
+        types::SessionUpdate::RuntimeSessionStateUpdate { state } => {
+            Some(model::SessionUpdate::RuntimeSessionStateUpdate(match state {
+                types::RuntimeSessionState::Idle => model::RuntimeSessionState::Idle,
+                types::RuntimeSessionState::Running => model::RuntimeSessionState::Running,
+                types::RuntimeSessionState::RequiresAction => {
+                    model::RuntimeSessionState::RequiresAction
+                }
+            }))
+        }
+        types::SessionUpdate::SettingsParseError { file, path, message } => {
+            Some(model::SessionUpdate::SettingsParseError { file, path, message })
+        }
         types::SessionUpdate::SessionStatusUpdate { status } => {
             Some(model::SessionUpdate::SessionStatusUpdate(match status {
                 types::SessionStatus::Compacting => model::SessionStatus::Compacting,
@@ -236,6 +312,7 @@ pub(super) fn map_permission_request(
             model::SessionId::new(session_id),
             tool_call_update,
             options,
+            convert_permission_display(request.display),
         ),
         tool_call_id,
     )
@@ -312,6 +389,7 @@ pub(super) fn convert_tool_call(tool_call: types::ToolCall) -> model::ToolCall {
         raw_input,
         raw_output,
         output_metadata,
+        task_metadata,
         locations,
         meta,
     } = tool_call;
@@ -342,6 +420,9 @@ pub(super) fn convert_tool_call(tool_call: types::ToolCall) -> model::ToolCall {
     }
     if let Some(output_metadata) = output_metadata {
         tc = tc.output_metadata(convert_tool_output_metadata(output_metadata));
+    }
+    if let Some(task_metadata) = task_metadata {
+        tc = tc.task_metadata(convert_task_metadata(task_metadata));
     }
     if let Some(meta) = meta {
         tc = tc.meta(meta);
@@ -396,6 +477,9 @@ pub(super) fn convert_tool_call_to_fields(
     if let Some(output_metadata) = tool_call.output_metadata {
         fields = fields.output_metadata(convert_tool_output_metadata(output_metadata));
     }
+    if let Some(task_metadata) = tool_call.task_metadata {
+        fields = fields.task_metadata(convert_task_metadata(task_metadata));
+    }
 
     fields
 }
@@ -427,6 +511,9 @@ pub(super) fn convert_tool_call_update_fields(
     if let Some(output_metadata) = fields.output_metadata {
         out = out.output_metadata(convert_tool_output_metadata(output_metadata));
     }
+    if let Some(task_metadata) = fields.task_metadata {
+        out = out.task_metadata(convert_task_metadata(task_metadata));
+    }
     if let Some(locations) = fields.locations {
         out = out.locations(
             locations
@@ -452,15 +539,30 @@ fn convert_tool_output_metadata(
         .bash(output_metadata.bash.map(|bash| {
             model::BashOutputMetadata::new()
                 .assistant_auto_backgrounded(bash.assistant_auto_backgrounded)
-                .token_saver_active(bash.token_saver_active)
-        }))
-        .exit_plan_mode(output_metadata.exit_plan_mode.map(|exit_plan_mode| {
-            model::ExitPlanModeOutputMetadata::new().ultraplan(exit_plan_mode.is_ultraplan)
         }))
         .todo_write(output_metadata.todo_write.map(|todo_write| {
             model::TodoWriteOutputMetadata::new()
                 .verification_nudge_needed(todo_write.verification_nudge_needed)
         }))
+}
+
+fn convert_permission_display(
+    display: Option<types::PermissionDisplay>,
+) -> Option<model::PermissionDisplay> {
+    let display = display?;
+    let mapped = model::PermissionDisplay::new()
+        .title(display.title)
+        .display_name(display.display_name)
+        .description(display.description);
+    (!mapped.is_empty()).then_some(mapped)
+}
+
+fn convert_task_metadata(task_metadata: types::TaskMetadata) -> model::TaskMetadata {
+    model::TaskMetadata::new()
+        .end_time(task_metadata.end_time)
+        .total_paused_ms(task_metadata.total_paused_ms)
+        .error(task_metadata.error)
+        .backgrounded(task_metadata.is_backgrounded)
 }
 
 fn convert_tool_call_content(
@@ -507,6 +609,7 @@ pub(super) fn convert_tool_status(status: &str) -> model::ToolCallStatus {
         "in_progress" => model::ToolCallStatus::InProgress,
         "completed" => model::ToolCallStatus::Completed,
         "failed" => model::ToolCallStatus::Failed,
+        "killed" => model::ToolCallStatus::Killed,
         _ => model::ToolCallStatus::Pending,
     }
 }
@@ -534,7 +637,7 @@ pub(super) fn convert_mode_state(mode: types::ModeState) -> ModeState {
 mod tests {
     use super::{
         convert_tool_call, convert_tool_call_update_fields, map_available_models,
-        map_question_request,
+        map_permission_request, map_question_request, map_session_update,
     };
     use crate::agent::{model, types};
 
@@ -590,6 +693,84 @@ mod tests {
     }
 
     #[test]
+    fn map_lifecycle_updates_preserves_new_sdk_state() {
+        assert_eq!(
+            map_session_update(types::SessionUpdate::ApiRetryUpdate {
+                attempt: 2,
+                max_retries: 4,
+                retry_delay_ms: 1500,
+                error_status: Some(529),
+                error: types::ApiRetryError::ServerError,
+            }),
+            Some(model::SessionUpdate::ApiRetryUpdate {
+                attempt: 2,
+                max_retries: 4,
+                retry_delay_ms: 1500,
+                error_status: Some(529),
+                error: model::ApiRetryError::ServerError,
+            })
+        );
+        assert_eq!(
+            map_session_update(types::SessionUpdate::RuntimeSessionStateUpdate {
+                state: types::RuntimeSessionState::RequiresAction,
+            }),
+            Some(model::SessionUpdate::RuntimeSessionStateUpdate(
+                model::RuntimeSessionState::RequiresAction,
+            ))
+        );
+        assert_eq!(
+            map_session_update(types::SessionUpdate::PromptSuggestionUpdate {
+                suggestion: "Add tests".to_owned(),
+            }),
+            Some(model::SessionUpdate::PromptSuggestionUpdate("Add tests".to_owned()))
+        );
+    }
+
+    #[test]
+    fn map_permission_request_preserves_display_metadata() {
+        let (request, tool_call_id) = map_permission_request(
+            "session-1",
+            types::PermissionRequest {
+                tool_call: types::ToolCall {
+                    tool_call_id: "tool-1".to_owned(),
+                    title: "Bash npm test".to_owned(),
+                    kind: "execute".to_owned(),
+                    status: "in_progress".to_owned(),
+                    content: Vec::new(),
+                    raw_input: None,
+                    raw_output: None,
+                    output_metadata: None,
+                    task_metadata: None,
+                    locations: Vec::new(),
+                    meta: None,
+                },
+                options: vec![types::PermissionOption {
+                    option_id: "allow".to_owned(),
+                    name: "Allow".to_owned(),
+                    description: None,
+                    kind: "allow_once".to_owned(),
+                }],
+                display: Some(types::PermissionDisplay {
+                    title: Some("Claude wants to run tests".to_owned()),
+                    display_name: Some("Run tests".to_owned()),
+                    description: Some("This command reads project files".to_owned()),
+                }),
+            },
+        );
+
+        assert_eq!(tool_call_id, "tool-1");
+        assert_eq!(
+            request.display,
+            Some(
+                model::PermissionDisplay::new()
+                    .title(Some("Claude wants to run tests".to_owned()))
+                    .display_name(Some("Run tests".to_owned()))
+                    .description(Some("This command reads project files".to_owned())),
+            )
+        );
+    }
+
+    #[test]
     fn map_question_request_preserves_preview_and_annotation_shape() {
         let (request, tool_call_id) = map_question_request(
             "session-1",
@@ -603,6 +784,7 @@ mod tests {
                     raw_input: Some(serde_json::json!({ "source": "ask_user_question" })),
                     raw_output: None,
                     output_metadata: None,
+                    task_metadata: None,
                     locations: Vec::new(),
                     meta: Some(
                         serde_json::json!({ "claudeCode": { "toolName": "AskUserQuestion" } }),
@@ -672,13 +854,7 @@ mod tests {
         let fields = convert_tool_call_update_fields(types::ToolCallUpdateFields {
             status: Some("completed".to_owned()),
             output_metadata: Some(types::ToolOutputMetadata {
-                bash: Some(types::BashOutputMetadata {
-                    assistant_auto_backgrounded: Some(true),
-                    token_saver_active: Some(true),
-                }),
-                exit_plan_mode: Some(types::ExitPlanModeOutputMetadata {
-                    is_ultraplan: Some(true),
-                }),
+                bash: Some(types::BashOutputMetadata { assistant_auto_backgrounded: Some(true) }),
                 todo_write: Some(types::TodoWriteOutputMetadata {
                     verification_nudge_needed: Some(true),
                 }),
@@ -691,16 +867,74 @@ mod tests {
             Some(
                 model::ToolOutputMetadata::new()
                     .bash(Some(
-                        model::BashOutputMetadata::new()
-                            .assistant_auto_backgrounded(Some(true))
-                            .token_saver_active(Some(true)),
-                    ))
-                    .exit_plan_mode(Some(
-                        model::ExitPlanModeOutputMetadata::new().ultraplan(Some(true)),
+                        model::BashOutputMetadata::new().assistant_auto_backgrounded(Some(true)),
                     ))
                     .todo_write(Some(
                         model::TodoWriteOutputMetadata::new().verification_nudge_needed(Some(true)),
                     )),
+            )
+        );
+    }
+
+    #[test]
+    fn convert_tool_status_maps_killed() {
+        assert_eq!(super::convert_tool_status("killed"), model::ToolCallStatus::Killed);
+    }
+
+    #[test]
+    fn convert_tool_call_update_fields_preserves_task_metadata() {
+        let fields = convert_tool_call_update_fields(types::ToolCallUpdateFields {
+            task_metadata: Some(types::TaskMetadata {
+                end_time: Some(123),
+                total_paused_ms: Some(45),
+                error: Some("Task stopped".to_owned()),
+                is_backgrounded: Some(true),
+            }),
+            ..types::ToolCallUpdateFields::default()
+        });
+
+        assert_eq!(
+            fields.task_metadata,
+            Some(
+                model::TaskMetadata::new()
+                    .end_time(Some(123))
+                    .total_paused_ms(Some(45))
+                    .error(Some("Task stopped".to_owned()))
+                    .backgrounded(Some(true)),
+            )
+        );
+    }
+
+    #[test]
+    fn convert_tool_call_preserves_task_metadata() {
+        let tool_call = convert_tool_call(types::ToolCall {
+            tool_call_id: "tool-task".to_owned(),
+            title: "Agent task".to_owned(),
+            kind: "think".to_owned(),
+            status: "killed".to_owned(),
+            content: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            output_metadata: None,
+            task_metadata: Some(types::TaskMetadata {
+                end_time: Some(77),
+                total_paused_ms: Some(11),
+                error: Some("Task stopped".to_owned()),
+                is_backgrounded: Some(false),
+            }),
+            locations: Vec::new(),
+            meta: None,
+        });
+
+        assert_eq!(tool_call.status, model::ToolCallStatus::Killed);
+        assert_eq!(
+            tool_call.task_metadata,
+            Some(
+                model::TaskMetadata::new()
+                    .end_time(Some(77))
+                    .total_paused_ms(Some(11))
+                    .error(Some("Task stopped".to_owned()))
+                    .backgrounded(Some(false)),
             )
         );
     }
@@ -722,6 +956,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             output_metadata: None,
+            task_metadata: None,
             locations: Vec::new(),
             meta: None,
         });
@@ -755,6 +990,7 @@ mod tests {
             raw_input: None,
             raw_output: None,
             output_metadata: None,
+            task_metadata: None,
             locations: Vec::new(),
             meta: None,
         });
