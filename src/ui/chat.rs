@@ -23,6 +23,7 @@ const SCROLLBAR_TOP_EASE: f32 = 0.35;
 const SCROLLBAR_SIZE_EASE: f32 = 0.2;
 const SCROLLBAR_EASE_EPSILON: f32 = 0.01;
 const OVERSCROLL_CLAMP_EASE: f32 = 0.2;
+const CHAT_SCROLLBAR_WIDTH: u16 = 1;
 
 #[derive(Clone, Copy, Default)]
 struct HeightUpdateStats {
@@ -71,6 +72,19 @@ struct ScrolledRenderData {
     stats: CulledRenderStats,
     max_scroll: usize,
     scroll_offset: usize,
+}
+
+fn chat_content_area(area: Rect) -> Rect {
+    Rect { width: area.width.saturating_sub(CHAT_SCROLLBAR_WIDTH), ..area }
+}
+
+fn chat_scrollbar_area(area: Rect) -> Option<Rect> {
+    (area.width > 0).then(|| Rect {
+        x: area.right().saturating_sub(CHAT_SCROLLBAR_WIDTH),
+        y: area.y,
+        width: CHAT_SCROLLBAR_WIDTH.min(area.width),
+        height: area.height,
+    })
 }
 /// Build a `SpinnerState` for a specific message index.
 fn msg_spinner(
@@ -240,6 +254,7 @@ fn measure_message_height_at(
     let (h, rendered_lines) = measure_message_height(
         &mut app.messages[idx],
         &sp,
+        app.mode.as_ref().map(|mode| mode.current_mode_id.as_str()),
         width,
         app.viewport.layout_generation,
         app.tools_collapsed,
@@ -263,6 +278,7 @@ fn measure_message_height_at(
 fn measure_message_height(
     msg: &mut crate::app::ChatMessage,
     spinner: &SpinnerState,
+    current_mode_id: Option<&str>,
     width: u16,
     layout_generation: u64,
     tools_collapsed: bool,
@@ -270,9 +286,10 @@ fn measure_message_height(
 ) -> (usize, usize) {
     let _t = crate::perf::start_with("chat::measure_msg", "blocks", msg.blocks.len());
     let (h, wrapped_lines) =
-        message::measure_message_height_cached_with_tools_collapsed_and_separator(
+        message::measure_message_height_cached_with_tools_collapsed_and_separator_and_mode(
             msg,
             spinner,
+            current_mode_id,
             width,
             layout_generation,
             tools_collapsed,
@@ -635,15 +652,18 @@ fn render_culled_messages(
         let before = out.len();
         let message_height = app.viewport.message_height(i);
         if structural_skip > 0 {
-            let remaining_skip = message::render_message_from_offset_internal(
+            let remaining_skip = message::render_message_from_offset_internal_with_mode(
                 &mut app.messages[i],
                 &sp,
-                width,
-                app.viewport.layout_generation,
-                message::MessageRenderOptions {
-                    tools_collapsed: app.tools_collapsed,
-                    include_trailing_separator: i + 1 != msg_count,
-                },
+                message::MessageRenderContext::new(
+                    app.mode.as_ref().map(|mode| mode.current_mode_id.as_str()),
+                    width,
+                    app.viewport.layout_generation,
+                    message::MessageRenderOptions {
+                        tools_collapsed: app.tools_collapsed,
+                        include_trailing_separator: i + 1 != msg_count,
+                    },
+                ),
                 structural_skip,
                 out,
             );
@@ -653,13 +673,18 @@ fn render_culled_messages(
             local_scroll = remaining_skip;
             structural_skip = 0;
         } else {
-            message::render_message_with_tools_collapsed_and_separator_and_layout_generation(
+            message::render_message_with_tools_collapsed_and_separator_and_layout_generation_with_mode(
                 &mut app.messages[i],
                 &sp,
-                width,
-                app.viewport.layout_generation,
-                app.tools_collapsed,
-                i + 1 != msg_count,
+                message::MessageRenderContext::new(
+                    app.mode.as_ref().map(|mode| mode.current_mode_id.as_str()),
+                    width,
+                    app.viewport.layout_generation,
+                    message::MessageRenderOptions {
+                        tools_collapsed: app.tools_collapsed,
+                        include_trailing_separator: i + 1 != msg_count,
+                    },
+                ),
                 out,
             );
             rendered_rows = rendered_rows.saturating_add(message_height);
@@ -688,10 +713,11 @@ fn render_culled_messages(
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let _t = app.perf.as_ref().map(|p| p.start("chat::render"));
     crate::perf::mark_with("chat::message_count", "msgs", app.messages.len());
-    let width = area.width;
-    let viewport_height = area.height as usize;
+    let content_area = chat_content_area(area);
+    let width = content_area.width;
+    let viewport_height = content_area.height as usize;
     let base_spinner = build_base_spinner(app);
-    let content_height = sync_chat_layout(app, area, base_spinner);
+    let content_height = sync_chat_layout(app, content_area, base_spinner);
 
     if content_height <= viewport_height {
         crate::perf::mark_with("chat::path_short", "active", 1);
@@ -699,7 +725,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         crate::perf::mark_with("chat::path_scrolled", "active", 1);
     }
 
-    render_scrolled(frame, area, app, base_spinner, width, content_height, viewport_height);
+    render_scrolled(frame, content_area, app, base_spinner, width, content_height, viewport_height);
 
     if let Some(sel) = app.selection
         && sel.kind == SelectionKind::Chat
@@ -707,14 +733,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         frame.render_widget(SelectionOverlay { selection: sel }, app.rendered_chat_area);
     }
 
-    render_scrollbar_overlay(
-        frame,
-        &mut app.viewport,
-        app.config.prefers_reduced_motion_effective(),
-        area,
-        content_height,
-        viewport_height,
-    );
+    if let Some(scrollbar_area) = chat_scrollbar_area(area) {
+        render_scrollbar_overlay(
+            frame,
+            &mut app.viewport,
+            app.config.prefers_reduced_motion_effective(),
+            scrollbar_area,
+            content_height,
+            viewport_height,
+        );
+    }
 
     enforce_and_emit_cache_metrics(app);
 }
@@ -921,9 +949,9 @@ fn render_lines_from_paragraph(
 #[cfg(test)]
 mod tests {
     use super::{
-        SCROLLBAR_MIN_THUMB_HEIGHT, clamp_scroll_to_content, paragraph_scroll_offset,
-        render_culled_messages, render_lines_from_paragraph, render_scrolled,
-        smooth_scrollbar_geometry, update_visual_heights,
+        SCROLLBAR_MIN_THUMB_HEIGHT, chat_content_area, clamp_scroll_to_content,
+        paragraph_scroll_offset, render_culled_messages, render_lines_from_paragraph,
+        render_scrolled, smooth_scrollbar_geometry, update_visual_heights,
     };
     use crate::app::{
         App, AppStatus, ChatMessage, ChatViewport, InvalidationLevel, MessageBlock, MessageRole,
@@ -977,17 +1005,23 @@ mod tests {
         terminal
             .draw(|frame| {
                 let spinner = idle_spinner();
-                let _ = app.viewport.on_frame(width, height);
-                update_visual_heights(app, spinner, width, usize::from(height));
+                let content_area = chat_content_area(Rect::new(0, 0, width, height));
+                let _ = app.viewport.on_frame(content_area.width, content_area.height);
+                update_visual_heights(
+                    app,
+                    spinner,
+                    content_area.width,
+                    usize::from(content_area.height),
+                );
                 app.viewport.rebuild_prefix_sums();
                 render_scrolled(
                     frame,
-                    Rect::new(0, 0, width, height),
+                    content_area,
                     app,
                     spinner,
-                    width,
+                    content_area.width,
                     app.viewport.total_message_height(),
-                    usize::from(height),
+                    usize::from(content_area.height),
                 );
             })
             .expect("draw");
@@ -1056,6 +1090,12 @@ mod tests {
                 max_scroll: 9_990,
             })
         );
+    }
+
+    #[test]
+    fn chat_content_area_reserves_one_column_for_scrollbar() {
+        assert_eq!(chat_content_area(Rect::new(0, 0, 20, 10)), Rect::new(0, 0, 19, 10));
+        assert_eq!(chat_content_area(Rect::new(3, 4, 1, 5)), Rect::new(3, 4, 0, 5));
     }
 
     #[test]

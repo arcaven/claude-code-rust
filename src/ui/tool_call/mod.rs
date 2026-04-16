@@ -14,6 +14,8 @@ mod execute;
 mod interactions;
 mod standard;
 
+use std::borrow::Cow;
+
 use crate::agent::model;
 use crate::app::ToolCallInfo;
 use crate::ui::markdown;
@@ -38,6 +40,11 @@ const SPINNER_STRS: &[&str] = &[
     "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280F}",
 ];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolCallRenderContext<'a> {
+    pub current_mode_id: Option<&'a str>,
+}
 
 pub fn status_icon(status: model::ToolCallStatus, spinner_frame: usize) -> (&'static str, Color) {
     match status {
@@ -69,6 +76,7 @@ pub fn status_icon(status: model::ToolCallStatus, spinner_frame: usize) -> (&'st
 /// every completed tool-call cache.
 pub fn render_tool_call_cached_with_tools_collapsed(
     tc: &mut ToolCallInfo,
+    render_context: ToolCallRenderContext<'_>,
     width: u16,
     spinner_frame: usize,
     tools_collapsed: bool,
@@ -87,13 +95,19 @@ pub fn render_tool_call_cached_with_tools_collapsed(
             crate::perf::mark("tc::cache_hit_execute");
         }
         if let Some(content) = tc.cache.get() {
-            let bordered = execute::render_execute_with_borders(tc, content, width, spinner_frame);
+            let bordered = execute::render_execute_with_borders(
+                tc,
+                render_context,
+                content,
+                width,
+                spinner_frame,
+            );
             out.extend(bordered);
         }
         return;
     }
 
-    let title = standard::render_tool_call_title(tc, width, spinner_frame);
+    let title = standard::render_tool_call_title(tc, render_context, width, spinner_frame);
     out.push(title);
 
     let has_body = !(tc.content.is_empty()
@@ -108,16 +122,26 @@ pub fn render_tool_call_cached_with_tools_collapsed(
         return;
     }
 
+    let body_depends_on_width = standard::tool_call_body_depends_on_width(tc);
+
     // Expanded body: use cache if valid, otherwise render and cache.
-    if let Some(cached_body) = tc.cache.get() {
+    let cached_body =
+        if body_depends_on_width { tc.cache.get_for_width(width) } else { tc.cache.get() };
+    if let Some(cached_body) = cached_body {
         crate::perf::mark_with("tc::cache_hit_body", "lines", cached_body.len());
         out.extend_from_slice(cached_body);
     } else {
         crate::perf::mark("tc::cache_miss_body");
         let _t = crate::perf::start("tc::render_body");
-        let body = standard::render_tool_call_body(tc);
-        tc.cache.store(body);
-        if let Some(stored) = tc.cache.get() {
+        let body = standard::render_tool_call_body(tc, width);
+        if body_depends_on_width {
+            tc.cache.store_for_width(body, width);
+        } else {
+            tc.cache.store(body);
+        }
+        let stored =
+            if body_depends_on_width { tc.cache.get_for_width(width) } else { tc.cache.get() };
+        if let Some(stored) = stored {
             out.extend_from_slice(stored);
         }
     }
@@ -127,6 +151,7 @@ pub fn render_tool_call_cached_with_tools_collapsed(
 /// Returns `(height, lines_wrapped_for_measurement)`.
 pub fn measure_tool_call_height_cached_with_tools_collapsed(
     tc: &mut ToolCallInfo,
+    render_context: ToolCallRenderContext<'_>,
     width: u16,
     spinner_frame: usize,
     layout_generation: u64,
@@ -145,7 +170,13 @@ pub fn measure_tool_call_height_cached_with_tools_collapsed(
             tc.cache.store(content);
         }
         if let Some(content) = tc.cache.get() {
-            let bordered = execute::render_execute_with_borders(tc, content, width, spinner_frame);
+            let bordered = execute::render_execute_with_borders(
+                tc,
+                render_context,
+                content,
+                width,
+                spinner_frame,
+            );
             let h = Paragraph::new(Text::from(bordered.clone()))
                 .wrap(Wrap { trim: false })
                 .line_count(width);
@@ -157,7 +188,7 @@ pub fn measure_tool_call_height_cached_with_tools_collapsed(
         return (0, 0);
     }
 
-    let title = standard::render_tool_call_title(tc, width, spinner_frame);
+    let title = standard::render_tool_call_title(tc, render_context, width, spinner_frame);
     let title_h =
         Paragraph::new(Text::from(vec![title])).wrap(Wrap { trim: false }).line_count(width);
     let has_body = !(tc.content.is_empty()
@@ -180,25 +211,44 @@ pub fn measure_tool_call_height_cached_with_tools_collapsed(
         return (total, 1 + summary.len());
     }
 
-    if let Some(body_h) = tc.cache.height_at(width) {
-        let total = title_h + body_h;
-        tc.record_measured_height(width, total, layout_generation);
-        return (total, 1);
-    }
-    if let Some(body_h) = tc.cache.measure_and_set_height(width) {
-        let total = title_h + body_h;
-        tc.record_measured_height(width, total, layout_generation);
-        return (total, tc.cache.get().map_or(1, |b| b.len() + 1));
+    let body_depends_on_width = standard::tool_call_body_depends_on_width(tc);
+    let cached_body =
+        if body_depends_on_width { tc.cache.get_for_width(width) } else { tc.cache.get() };
+    if cached_body.is_some() {
+        if let Some(body_h) = tc.cache.height_at(width) {
+            let total = title_h + body_h;
+            tc.record_measured_height(width, total, layout_generation);
+            return (total, 1);
+        }
+        if let Some(body_h) = tc.cache.measure_and_set_height(width) {
+            let total = title_h + body_h;
+            tc.record_measured_height(width, total, layout_generation);
+            let cached_len = if body_depends_on_width {
+                tc.cache.get_for_width(width).map_or(1, |body| body.len() + 1)
+            } else {
+                tc.cache.get().map_or(1, |body| body.len() + 1)
+            };
+            return (total, cached_len);
+        }
     }
 
-    let body = standard::render_tool_call_body(tc);
+    let body = standard::render_tool_call_body(tc, width);
     let body_h =
         Paragraph::new(Text::from(body.clone())).wrap(Wrap { trim: false }).line_count(width);
-    tc.cache.store(body);
+    if body_depends_on_width {
+        tc.cache.store_for_width(body, width);
+    } else {
+        tc.cache.store(body);
+    }
     tc.cache.set_height(body_h, width);
     let total = title_h + body_h;
     tc.record_measured_height(width, total, layout_generation);
-    (total, tc.cache.get().map_or(1, |b| b.len() + 1))
+    let cached_len = if body_depends_on_width {
+        tc.cache.get_for_width(width).map_or(1, |body| body.len() + 1)
+    } else {
+        tc.cache.get().map_or(1, |body| body.len() + 1)
+    };
+    (total, cached_len)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +323,21 @@ fn tool_output_badge_spans(tc: &ToolCallInfo) -> Vec<Span<'static>> {
     }
 
     badges
+}
+
+fn tool_display_title<'a>(
+    tc: &'a ToolCallInfo,
+    render_context: ToolCallRenderContext<'_>,
+) -> Cow<'a, str> {
+    if render_context.current_mode_id == Some("plan") {
+        match tc.sdk_tool_name.as_str() {
+            "Write" => return Cow::Borrowed("Create Plan"),
+            "Edit" | "MultiEdit" => return Cow::Borrowed("Update Plan"),
+            _ => {}
+        }
+    }
+
+    Cow::Borrowed(&tc.title)
 }
 
 // ---------------------------------------------------------------------------
@@ -415,10 +480,38 @@ mod tests {
         let mut tc = test_tool_call("tc-bg", "Agent", model::ToolCallStatus::InProgress);
         tc.task_metadata = Some(model::TaskMetadata::new().backgrounded(Some(true)));
 
-        let line = standard::render_tool_call_title(&tc, 80, 0);
+        let line = standard::render_tool_call_title(&tc, ToolCallRenderContext::default(), 80, 0);
         let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
 
         assert!(rendered.contains("[backgrounded]"));
+    }
+
+    #[test]
+    fn tool_display_title_uses_plan_aliases() {
+        let write = test_tool_call("tc-plan-write", "Write", model::ToolCallStatus::Completed);
+        let edit = test_tool_call("tc-plan-edit", "Edit", model::ToolCallStatus::Completed);
+        let read = test_tool_call("tc-plan-read", "Read", model::ToolCallStatus::Completed);
+        let plan = ToolCallRenderContext { current_mode_id: Some("plan") };
+
+        assert_eq!(tool_display_title(&write, plan), "Create Plan");
+        assert_eq!(tool_display_title(&edit, plan), "Update Plan");
+        assert_eq!(tool_display_title(&read, plan), "tc-plan-read");
+    }
+
+    #[test]
+    fn standard_title_uses_plan_alias_for_write() {
+        let tc = test_tool_call("Write notes/plan.md", "Write", model::ToolCallStatus::Completed);
+
+        let rendered = standard::render_tool_call_title(
+            &tc,
+            ToolCallRenderContext { current_mode_id: Some("plan") },
+            80,
+            0,
+        );
+        let text: String = rendered.spans.iter().map(|span| span.content.as_ref()).collect();
+
+        assert!(text.contains("Create Plan"));
+        assert!(!text.contains("Write notes/plan.md"));
     }
 
     #[test]
@@ -452,7 +545,8 @@ mod tests {
             pending_question: None,
         };
 
-        let rendered = execute::render_execute_with_borders(&tc, &[], 80, 0);
+        let rendered =
+            execute::render_execute_with_borders(&tc, ToolCallRenderContext::default(), &[], 80, 0);
         let top = rendered.first().expect("top border line");
         assert!(spans_width(&top.spans) <= 80);
     }
@@ -465,10 +559,35 @@ mod tests {
                 model::BashOutputMetadata::new().assistant_auto_backgrounded(Some(true)),
             )));
 
-        let rendered = execute::render_execute_with_borders(&tc, &[], 100, 0);
+        let rendered = execute::render_execute_with_borders(
+            &tc,
+            ToolCallRenderContext::default(),
+            &[],
+            100,
+            0,
+        );
         let top = rendered.first().expect("top border line");
         let text: String = top.spans.iter().map(|span| span.content.as_ref()).collect();
         assert!(text.contains("[assistant backgrounded]"));
+    }
+
+    #[test]
+    fn execute_title_preserves_bash_title_in_plan_mode() {
+        let mut tc = test_tool_call("echo hi", "Bash", model::ToolCallStatus::Completed);
+        tc.terminal_command = Some("echo hi".to_owned());
+
+        let rendered = execute::render_execute_with_borders(
+            &tc,
+            ToolCallRenderContext { current_mode_id: Some("plan") },
+            &[],
+            80,
+            0,
+        );
+        let top = rendered.first().expect("top border line");
+        let text: String = top.spans.iter().map(|span| span.content.as_ref()).collect();
+
+        assert!(text.contains("Bash"));
+        assert!(text.contains("echo hi"));
     }
 
     #[test]
@@ -477,13 +596,25 @@ mod tests {
         tc.terminal_command = Some("echo hi".to_owned());
         tc.terminal_output = Some("hello\nworld".to_owned());
 
-        let (h1, lines1) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 80, 0, 1, false);
+        let (h1, lines1) = measure_tool_call_height_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            0,
+            1,
+            false,
+        );
         assert!(h1 > 0);
         assert!(lines1 > 0);
 
-        let (h2, lines2) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 80, 4, 1, false);
+        let (h2, lines2) = measure_tool_call_height_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            4,
+            1,
+            false,
+        );
         assert_eq!(h2, h1);
         assert!(lines2 <= lines1);
     }
@@ -494,11 +625,23 @@ mod tests {
         tc.terminal_command = Some("echo hi".to_owned());
         tc.terminal_output = Some("hello".to_owned());
 
-        let (_, first_lines) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 80, 0, 1, false);
+        let (_, first_lines) = measure_tool_call_height_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            0,
+            1,
+            false,
+        );
         assert!(first_lines > 0);
-        let (_, second_lines) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 80, 0, 2, false);
+        let (_, second_lines) = measure_tool_call_height_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            0,
+            2,
+            false,
+        );
         assert!(second_lines > 0);
     }
 
@@ -507,17 +650,36 @@ mod tests {
         let mut tc = test_tool_call("tc-dirty", "Read", model::ToolCallStatus::Completed);
         tc.content = vec![model::ToolCallContent::from("one line")];
 
-        let (first_height, first_lines) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 80, 0, 1, false);
+        let (first_height, first_lines) = measure_tool_call_height_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            0,
+            1,
+            false,
+        );
         assert!(first_lines > 0);
-        let (cached_height, fast_lines) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 80, 0, 1, false);
+        let (cached_height, fast_lines) = measure_tool_call_height_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            0,
+            1,
+            false,
+        );
         assert_eq!(cached_height, first_height);
         assert!(fast_lines <= first_lines);
 
         tc.mark_tool_call_layout_dirty();
         let (recomputed_height, recompute_lines) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 80, 0, 1, false);
+            measure_tool_call_height_cached_with_tools_collapsed(
+                &mut tc,
+                ToolCallRenderContext::default(),
+                80,
+                0,
+                1,
+                false,
+            );
         assert_eq!(recomputed_height, first_height);
         assert!(recompute_lines > 0);
     }
@@ -529,7 +691,8 @@ mod tests {
             model::TodoWriteOutputMetadata::new().verification_nudge_needed(Some(true)),
         )));
 
-        let rendered = standard::render_tool_call_title(&tc, 80, 0);
+        let rendered =
+            standard::render_tool_call_title(&tc, ToolCallRenderContext::default(), 80, 0);
         let text: String = rendered.spans.iter().map(|span| span.content.as_ref()).collect();
         assert!(text.contains("[verification needed]"));
     }
@@ -545,7 +708,7 @@ mod tests {
                 .blob_saved_to(Some("C:\\tmp\\manual.pdf".to_owned())),
         )];
 
-        let body = standard::render_tool_call_body(&tc);
+        let body = standard::render_tool_call_body(&tc, 80);
         let rendered: Vec<String> = body
             .iter()
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
@@ -574,7 +737,7 @@ mod tests {
                 .blob_saved_to(Some("C:\\tmp\\manual.pdf".to_owned())),
         )];
 
-        let body = standard::render_tool_call_body(&tc);
+        let body = standard::render_tool_call_body(&tc, 80);
         let rendered: Vec<String> = body
             .iter()
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
@@ -592,7 +755,14 @@ mod tests {
         tc.content = vec![model::ToolCallContent::from("alpha\nbeta".to_owned())];
 
         let mut expanded = Vec::new();
-        render_tool_call_cached_with_tools_collapsed(&mut tc, 80, 0, false, &mut expanded);
+        render_tool_call_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            0,
+            false,
+            &mut expanded,
+        );
         let expanded_text: Vec<String> = expanded
             .iter()
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
@@ -601,7 +771,14 @@ mod tests {
         assert!(expanded_text.first().is_some_and(|line| line.contains("tc-collapse")));
 
         let mut collapsed = Vec::new();
-        render_tool_call_cached_with_tools_collapsed(&mut tc, 80, 0, true, &mut collapsed);
+        render_tool_call_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            0,
+            true,
+            &mut collapsed,
+        );
         let collapsed_text: Vec<String> = collapsed
             .iter()
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
@@ -618,10 +795,22 @@ mod tests {
             test_tool_call("tc-measure-collapse", "Read", model::ToolCallStatus::Completed);
         tc.content = vec![model::ToolCallContent::from("alpha\nbeta\ngamma\ndelta".to_owned())];
 
-        let (expanded_h, _) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 24, 0, 1, false);
-        let (collapsed_h, _) =
-            measure_tool_call_height_cached_with_tools_collapsed(&mut tc, 24, 0, 2, true);
+        let (expanded_h, _) = measure_tool_call_height_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            24,
+            0,
+            1,
+            false,
+        );
+        let (collapsed_h, _) = measure_tool_call_height_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            24,
+            0,
+            2,
+            true,
+        );
 
         assert!(collapsed_h < expanded_h);
     }
@@ -634,15 +823,50 @@ mod tests {
         )];
 
         let mut rendered = Vec::new();
-        render_tool_call_cached_with_tools_collapsed(&mut tc, 80, 0, true, &mut rendered);
+        render_tool_call_cached_with_tools_collapsed(
+            &mut tc,
+            ToolCallRenderContext::default(),
+            80,
+            0,
+            true,
+            &mut rendered,
+        );
         let text: Vec<String> = rendered
             .iter()
             .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
             .collect();
 
         assert!(!text.iter().any(|line| line.contains("expand")));
-        assert!(text.iter().any(|line| line.contains("main.rs")));
+        assert!(text.iter().any(|line| line.contains("lines ")));
+        assert!(text.iter().any(|line| line.contains("+  new")));
         assert!(text.len() > 2);
+    }
+
+    #[test]
+    fn plan_files_render_markdown_instead_of_diff() {
+        let mut tc = test_tool_call(
+            "Write .claude/plans/launch.md",
+            "Write",
+            model::ToolCallStatus::Completed,
+        );
+        tc.content = vec![model::ToolCallContent::Diff(
+            model::Diff::new(
+                ".claude/plans/launch.md",
+                "# Launch Plan\n\n- Ship aliases\n- Render plan markdown\n".to_owned(),
+            )
+            .old_text(Some("# Old Plan\n".to_owned())),
+        )];
+
+        let body = standard::render_tool_call_body(&tc, 80);
+        let rendered: Vec<String> = body
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+
+        assert!(rendered.iter().any(|line| line.contains("Launch Plan")));
+        assert!(rendered.iter().any(|line| line.contains("Render plan markdown")));
+        assert!(!rendered.iter().any(|line| line.contains("@@")));
+        assert!(!rendered.iter().any(|line| line.starts_with("+ ")));
     }
 
     #[test]

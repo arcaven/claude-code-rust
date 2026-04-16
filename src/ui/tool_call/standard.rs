@@ -18,7 +18,10 @@ use super::errors::{
     looks_like_internal_error, render_internal_failure_content, render_tool_use_error_content,
 };
 use super::interactions::{render_permission_lines, render_question_lines};
-use super::{markdown_inline_spans, status_icon, tool_output_badge_spans};
+use super::{
+    ToolCallRenderContext, markdown_inline_spans, status_icon, tool_display_title,
+    tool_output_badge_spans,
+};
 
 pub(super) const WRITE_DIFF_MAX_LINES: usize = 50;
 pub(super) const WRITE_DIFF_HEAD_LINES: usize = 10;
@@ -30,6 +33,7 @@ const IN_PROGRESS_SUBAGENT_COLLAPSED_TEXT_SUMMARY_LIMIT: usize = 180;
 /// Execute tool calls are handled separately via `render_execute_with_borders`.
 pub(super) fn render_tool_call_title(
     tc: &ToolCallInfo,
+    render_context: ToolCallRenderContext<'_>,
     _width: u16,
     spinner_frame: usize,
 ) -> Line<'static> {
@@ -44,7 +48,8 @@ pub(super) fn render_tool_call_title(
         ),
     ];
 
-    title_spans.extend(markdown_inline_spans(&tc.title));
+    let display_title = tool_display_title(tc, render_context);
+    title_spans.extend(markdown_inline_spans(display_title.as_ref()));
     title_spans.extend(tool_output_badge_spans(tc));
 
     Line::from(title_spans)
@@ -53,10 +58,15 @@ pub(super) fn render_tool_call_title(
 /// Render the body lines (everything after the title) for a non-Execute tool call.
 /// Used for in-progress tool calls where the body is cached separately from the title.
 /// Execute tool calls are handled separately via `render_execute_with_borders`.
-pub(super) fn render_tool_call_body(tc: &ToolCallInfo) -> Vec<Line<'static>> {
+pub(super) fn render_tool_call_body(tc: &ToolCallInfo, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    render_standard_body(tc, &mut lines);
+    render_standard_body(tc, width, &mut lines);
     lines
+}
+
+#[must_use]
+pub(super) fn tool_call_body_depends_on_width(tc: &ToolCallInfo) -> bool {
+    tc.content.iter().any(|content| matches!(content, model::ToolCallContent::Diff(_)))
 }
 
 #[must_use]
@@ -80,7 +90,7 @@ pub(super) fn render_collapsed_tool_call_summary(
 }
 
 /// Render the body (everything after the title line) of a standard (non-Execute) tool call.
-fn render_standard_body(tc: &ToolCallInfo, lines: &mut Vec<Line<'static>>) {
+fn render_standard_body(tc: &ToolCallInfo, width: u16, lines: &mut Vec<Line<'static>>) {
     let pipe_style = Style::default().fg(theme::DIM);
     let has_permission = tc.pending_permission.is_some();
     let has_question = tc.pending_question.is_some();
@@ -90,7 +100,7 @@ fn render_standard_body(tc: &ToolCallInfo, lines: &mut Vec<Line<'static>>) {
     }
 
     // Expanded: render full content with | prefix on each line
-    let mut content_lines = render_tool_content(tc);
+    let mut content_lines = render_tool_content(tc, width.saturating_sub(5));
 
     // Append inline permission controls if pending
     if let Some(ref perm) = tc.pending_permission {
@@ -208,7 +218,7 @@ fn truncate_summary_line(line: &str, max_chars: usize) -> String {
 }
 
 /// Render the full content of a tool call as lines.
-fn render_tool_content(tc: &ToolCallInfo) -> Vec<Line<'static>> {
+fn render_tool_content(tc: &ToolCallInfo, width: u16) -> Vec<Line<'static>> {
     let is_execute = tc.is_execute_tool();
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -236,11 +246,15 @@ fn render_tool_content(tc: &ToolCallInfo) -> Vec<Line<'static>> {
     for content in &tc.content {
         match content {
             model::ToolCallContent::Diff(diff) => {
-                let raw = render_diff(diff);
-                if tc.sdk_tool_name == "Write" && !is_plan_file_path(&diff.path) {
-                    lines.extend(cap_write_diff_lines(raw));
+                if is_plan_file_path(&diff.path) {
+                    lines.extend(render_plan_content(&diff.new_text));
                 } else {
-                    lines.extend(raw);
+                    let raw = render_diff(diff, width);
+                    if tc.sdk_tool_name == "Write" {
+                        lines.extend(cap_write_diff_lines(raw));
+                    } else {
+                        lines.extend(raw);
+                    }
                 }
             }
             model::ToolCallContent::McpResource(resource) => {
@@ -257,6 +271,21 @@ fn render_tool_content(tc: &ToolCallInfo) -> Vec<Line<'static>> {
 
     debug_failed_tool_render(tc);
     lines
+}
+
+fn render_plan_content(text: &str) -> Vec<Line<'static>> {
+    let md_source = strip_outer_code_fence(text);
+    markdown::render_markdown_safe(&md_source, None)
+        .into_iter()
+        .map(|line| {
+            let owned: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.into_owned(), span.style))
+                .collect();
+            Line::from(owned)
+        })
+        .collect()
 }
 
 fn render_text_content(tc: &ToolCallInfo, text: &str, lines: &mut Vec<Line<'static>>) {
@@ -319,7 +348,7 @@ fn render_mcp_resource_content(
 }
 
 /// Returns `true` for paths inside `.claude/plans/` (cross-platform).
-/// Write diffs for these files are never capped so the full plan is always visible.
+/// These files render as markdown plan content instead of unified diffs.
 fn is_plan_file_path(path: &std::path::Path) -> bool {
     path.components()
         .zip(path.components().skip(1))
